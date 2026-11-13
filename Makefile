@@ -25,9 +25,9 @@ INCLUDEDIR := $(PREFIX)/include/torrentinfo
 PROGRAM    := torrentinfo
 LIBRARY    := libtorrentinfo.a
 
-LIB_SOURCES := platform.c parser.c encoder.c http.c udp.c tracker.c
+LIB_SOURCES := platform.c parser.c encoder.c http.c udp.c tracker.c peer.c
 APP_SOURCES := main.c
-HEADERS     := queue.h platform.h parser.h encoder.h http.h udp.h tracker.h
+HEADERS     := queue.h platform.h parser.h encoder.h http.h udp.h tracker.h peer.h
 
 PKGS := libuv openssl
 

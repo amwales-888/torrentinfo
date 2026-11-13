@@ -4,6 +4,7 @@
  * Inspect:  ./torrentinfo file.torrent
  * Create:   ./torrentinfo -o out.torrent [options] file1 [file2 ...]
  * Announce: ./torrentinfo -t [-T seconds] [-C ca.pem] file.torrent
+ * Peers:    ./torrentinfo -P [-T seconds] [-C ca.pem] file.torrent
  *
  * Options come before the file names.
  *
@@ -24,6 +25,7 @@
 
 #include "encoder.h"
 #include "parser.h"
+#include "peer.h"
 #include "platform.h"
 #include "tracker.h"    /* includes <uv.h>, and on Windows <windows.h> */
 
@@ -36,6 +38,7 @@ static const uint32_t piecePreviewCount = 3u;
 static const uint32_t peerPreviewCount = 10u;
 static const uint32_t defaultAnnounceTimeout = 15u;
 static int            announceTag;  /* privateArg for tracker requests */
+static const uint32_t maxPeerAttempts = 200u;
 
 /* ------------------------------------------------------------------------ */
 /* Allocator hooks: wrap the C library and count live allocations so we can */
@@ -660,8 +663,218 @@ static uint32_t startAnnounces(const parserTorrent *torrent, const char **seen,
     return started;
 }
 
+/* ------------------------------------------------------------------------ */
+/* Peer mode: ./torrentinfo -P file.torrent                                 */
+/* ------------------------------------------------------------------------ */
+
+/* One handshake attempt; also the privateArg of its connection. */
+typedef struct peerAttempt {
+    trackerPeer     peer;
+    peerConnection *connection;
+    int32_t         status;
+} peerAttempt;
+
+/*
+ * Name the client from its peer id. Most clients use the Azureus style
+ * "-XXvvvv-" (two-letter client code, four version characters); BitTorrent
+ * mainline uses "Mx-y-z--". Anything else is shown as its printable prefix.
+ */
+static void describeClient(const uint8_t id[PEER_ID_LENGTH], char *out, size_t size)
+{
+    static const struct {
+        const char *code;
+        const char *name;
+    } clients[] = {
+        { "qB", "qBittorrent" }, { "TR", "Transmission" }, { "UT", "\xC2\xB5Torrent" },
+        { "UM", "\xC2\xB5Torrent Mac" }, { "UW", "\xC2\xB5Torrent Web" },
+        { "BT", "BitTorrent" }, { "BI", "BiglyBT" }, { "AZ", "Vuze" }, { "DE", "Deluge" },
+        { "LT", "libtorrent (Rasterbar)" }, { "lt", "libTorrent (rTorrent)" },
+        { "KT", "KTorrent" }, { "FD", "Free Download Manager" }, { "WW", "WebTorrent" },
+        { "WD", "WebTorrent Desktop" }, { "PI", "PicoTorrent" }, { "BC", "BitComet" },
+        { "XL", "Xunlei" }, { "SD", "Thunder" }, { "TI", "torrentinfo" }
+    };
+    char     text[16];
+    size_t   used = 0;
+    uint32_t i;
+
+    if (id[0] == '-' && id[7] == '-') {
+        const char *name = NULL;
+
+        for (i = 0; i < sizeof(clients) / sizeof(clients[0]); i++) {
+            if (memcmp(id + 1, clients[i].code, 2) == 0) {
+                name = clients[i].name;
+            }
+        }
+        if (name != NULL) {
+            snprintf(out, size, "%s %c.%c.%c.%c", name, id[3], id[4], id[5], id[6]);
+        } else {                                    /* keep the unknown code visible */
+            snprintf(out, size, "unknown client \"%c%c\" %c.%c.%c.%c",
+                     id[1], id[2], id[3], id[4], id[5], id[6]);
+        }
+        for (i = 0; out[i] != '\0'; i++) {         /* never print control bytes */
+            if ((unsigned char)out[i] < 0x20u) {
+                out[i] = '?';
+            }
+        }
+        return;
+    }
+    if (id[0] == 'M' && id[1] >= '0' && id[1] <= '9') {
+        for (i = 1; i < PEER_ID_LENGTH && used + 1u < sizeof(text) &&
+                    (id[i] == '-' || (id[i] >= '0' && id[i] <= '9')); i++) {
+            text[used++] = (char)((id[i] == '-') ? '.' : id[i]);
+        }
+        while (used > 0 && text[used - 1u] == '.') {
+            used--;
+        }
+        text[used] = '\0';
+        snprintf(out, size, "BitTorrent mainline %s", text);
+        return;
+    }
+    for (i = 0; i < 8u && id[i] >= 0x20u && id[i] < 0x7Fu; i++) {
+        text[used++] = (char)id[i];
+    }
+    text[used] = '\0';
+    snprintf(out, size, (used > 0) ? "unknown client \"%s\"" : "unknown client%s", text);
+}
+
+static void toSocketAddress(const trackerPeer *peer, struct sockaddr_storage *out)
+{
+    uint8_t *port;
+
+    memset(out, 0, sizeof(*out));
+    if (peer->family == TRACKER_FAMILY_IPV4) {
+        struct sockaddr_in *address = (struct sockaddr_in *)out;
+
+        address->sin_family = AF_INET;
+        memcpy(&address->sin_addr, peer->address, 4);
+        port = (uint8_t *)&address->sin_port;
+    } else {
+        struct sockaddr_in6 *address = (struct sockaddr_in6 *)out;
+
+        address->sin6_family = AF_INET6;
+        memcpy(&address->sin6_addr, peer->address, 16);
+        port = (uint8_t *)&address->sin6_port;
+    }
+    port[0] = (uint8_t)(peer->port >> 8);           /* network byte order */
+    port[1] = (uint8_t)(peer->port & 0xFFu);
+}
+
+/* Runs from the loop as each handshake completes or fails. */
+static void onHandshake(void *privateArg, peerConnection *connection,
+                        const peerHandshakeResult *result)
+{
+    peerAttempt *attempt = privateArg;
+    char         where[80];
+    char         client[64];
+
+    attempt->status = result->status;
+    formatPeer(&attempt->peer, where, sizeof(where));
+    if (result->status == PEER_OK) {
+        describeClient(result->peerId, client, sizeof(client));
+        printf("  %-46s %s", where, client);
+        if (result->extensions != 0) {
+            printf("  [%s%s%s ]",
+                   (result->extensions & PEER_EXTENSION_PROTOCOL) ? " extensions" : "",
+                   (result->extensions & PEER_EXTENSION_FAST) ? " fast" : "",
+                   (result->extensions & PEER_EXTENSION_DHT) ? " dht" : "");
+        }
+        putchar('\n');
+    } else {
+        printf("  %-46s %s\n", where, result->errorMessage);
+    }
+    fflush(stdout);
+
+    /* Step 1 only checks the handshake, so close straight away. */
+    peerClose(connection);
+    attempt->connection = NULL;
+}
+
+/* Add a peer unless it is already listed. Returns 0 if out of memory. */
+static int addPeer(const parserAllocator *allocator, peerAttempt **attempts,
+                   uint32_t *count, uint32_t *capacity, const trackerPeer *peer)
+{
+    peerAttempt *grown;
+    uint32_t     i;
+
+    for (i = 0; i < *count; i++) {
+        if (memcmp(&(*attempts)[i].peer, peer, sizeof(*peer)) == 0) {
+            return 1;
+        }
+    }
+    if (*count == *capacity) {
+        *capacity = (*capacity != 0) ? *capacity * 2u : 64u;
+        grown = allocator->realloc(*attempts, sizeof(**attempts) * *capacity);
+        if (grown == NULL) {
+            return 0;
+        }
+        *attempts = grown;
+    }
+    memset(&(*attempts)[*count], 0, sizeof(**attempts));
+    (*attempts)[*count].peer = *peer;
+    (*count)++;
+    return 1;
+}
+
+/* Handshake with every peer at once, then summarise by outcome. */
+static uint32_t handshakePeers(uv_loop_t *loop, peerAttempt *attempts, uint32_t count,
+                               const uint8_t infoHash[PARSER_SHA1_LENGTH],
+                               const uint8_t peerId[PEER_ID_LENGTH], uint32_t timeoutSeconds)
+{
+    static const int32_t outcomes[] = {
+        PEER_OK, PEER_ETIMEDOUT, PEER_ERROR, PEER_ECLOSED, PEER_EPROTO, PEER_EHASH,
+        PEER_ESELF, PEER_ENOMEM
+    };
+    struct sockaddr_storage address;
+    uint32_t                started = 0;
+    uint32_t                tally;
+    uint32_t                i;
+    uint32_t                j;
+    int32_t                 status;
+
+    if (count > maxPeerAttempts) {
+        printf("\n(Trying the first %" PRIu32 " of %" PRIu32 " peers.)\n", maxPeerAttempts, count);
+        count = maxPeerAttempts;
+    }
+    printf("\nHandshakes (%" PRIu32 " peers, timeout %" PRIu32 " s)\n", count, timeoutSeconds);
+
+    for (i = 0; i < count; i++) {
+        toSocketAddress(&attempts[i].peer, &address);
+        status = peerConnect((const struct sockaddr *)&address, infoHash, peerId,
+                             timeoutSeconds, onHandshake, &attempts[i], &attempts[i].connection);
+        attempts[i].status = status;
+        if (status == PEER_OK) {
+            started++;
+        } else {
+            char where[80];
+
+            formatPeer(&attempts[i].peer, where, sizeof(where));
+            printf("  %-46s %s (not started)\n", where, peerStatusString(status));
+        }
+    }
+    if (started > 0) {
+        uv_run(loop, UV_RUN_DEFAULT);               /* until every handshake is done */
+    }
+
+    printf("\nPeer summary\n");
+    for (j = 0; j < sizeof(outcomes) / sizeof(outcomes[0]); j++) {
+        tally = 0;
+        for (i = 0; i < count; i++) {
+            tally += (attempts[i].status == outcomes[j]) ? 1u : 0u;
+        }
+        if (tally > 0) {
+            printf("  %-28s %5" PRIu32 "\n", peerStatusString(outcomes[j]), tally);
+        }
+    }
+    tally = 0;
+    for (i = 0; i < count; i++) {
+        tally += (attempts[i].status == PEER_OK) ? 1u : 0u;
+    }
+    return tally;
+}
+
 static int announceTorrent(parserContext *context, const parserAllocator *allocator,
-                           const char *path, uint32_t timeoutSeconds, const char *caFile)
+                           const char *path, uint32_t timeoutSeconds, const char *caFile,
+                           uint8_t connectPeers)
 {
     static const char alphabet[] = "0123456789abcdefghijklmnopqrstuvwxyz";
     const parserTier *tier;
@@ -670,6 +883,11 @@ static int announceTorrent(parserContext *context, const parserAllocator *alloca
     trackerResult     result;
     uv_loop_t         loop;
     const char      **seen;
+    peerAttempt      *attempts = NULL;
+    uint8_t           infoHash[PARSER_SHA1_LENGTH];
+    uint32_t          attemptCount = 0;
+    uint32_t          attemptCapacity = 0;
+    uint32_t          handshakes = 0;
     uint32_t         *ids = NULL;
     uint8_t          *buffer = NULL;
     uint8_t           randomBytes[12];
@@ -678,6 +896,7 @@ static int announceTorrent(parserContext *context, const parserAllocator *alloca
     uint32_t          count = 0;
     uint32_t          succeeded = 0;
     uint32_t          i;
+    uint32_t          j;
     int32_t           status;
 
     if (readFile(allocator, path, &buffer, &length) != 0) {
@@ -727,6 +946,7 @@ static int announceTorrent(parserContext *context, const parserAllocator *alloca
         printf("\nNo trackers could be contacted.\n");
     }
     allocator->free((void *)seen);
+    memcpy(infoHash, torrent.infoHash, PARSER_SHA1_LENGTH);
     parserFree(context, &torrent);      /* trackerConnect() copied what it needs */
 
     uv_run(&loop, UV_RUN_DEFAULT);      /* returns when every announce is done */
@@ -746,14 +966,37 @@ static int announceTorrent(parserContext *context, const parserAllocator *alloca
             if (status == TRACKER_OK) {
                 succeeded++;
             }
+            /* For -P, gather each tracker's peers before closing its id. */
+            for (j = 0; connectPeers && status == TRACKER_OK && j < result.peerCount; j++) {
+                if (!addPeer(allocator, &attempts, &attemptCount, &attemptCapacity,
+                             &result.peers[j])) {
+                    fprintf(stderr, "out of memory\n");
+                    break;
+                }
+            }
             trackerClose(ids[i]);
         }
         allocator->free(ids);
     }
 
     trackerShutdown();
+
+    if (connectPeers) {
+        if (attemptCount == 0) {
+            printf("\nNo peers to connect to.\n");
+        } else if (peerInit(&loop, context) == PEER_OK) {
+            handshakes = handshakePeers(&loop, attempts, attemptCount, infoHash,
+                                        config.peerId, timeoutSeconds);
+            peerShutdown();
+        }
+        allocator->free(attempts);
+    }
+
     uv_run(&loop, UV_RUN_DEFAULT);      /* let any closing handles finish */
     uv_loop_close(&loop);
+    if (connectPeers) {
+        return (handshakes > 0) ? 0 : -1;
+    }
     return (succeeded > 0) ? 0 : -1;
 }
 
@@ -866,6 +1109,7 @@ static void usage(const char *program)
             "usage: %s <file.torrent>\n"
             "       %s -o <output.torrent> [options] <file>...\n"
             "       %s -t [-T seconds] [-C ca.pem] <file.torrent>\n"
+            "       %s -P [-T seconds] [-C ca.pem] <file.torrent>\n"
             "\n"
             "  -o file   create a torrent from the given files and write it to 'file'\n"
             "  -a url    tracker announce URL (repeat for more; one tier each)\n"
@@ -877,10 +1121,11 @@ static void usage(const char *program)
             "  -p        mark the torrent private\n"
             "\n"
             "  -t        announce to every tracker in the torrent and list the peers\n"
-            "  -T secs   announce timeout (default 15)\n"
+            "  -P        announce, then handshake with each peer found (up to 200)\n"
+            "  -T secs   announce and handshake timeout (default 15)\n"
             "  -C file   trust the CA certificates in this PEM file for HTTPS\n"
             "            trackers (default: the system's certificate store)\n",
-            program, program, program);
+            program, program, program, program);
 }
 
 int main(int argc, char **argv)
@@ -893,6 +1138,7 @@ int main(int argc, char **argv)
     const char     *outputPath = NULL;
     uint8_t         createOnly = 0;     /* an option that only makes sense with -o */
     uint8_t         announce = 0;
+    uint8_t         connectPeers = 0;
     uint8_t         announceOnly = 0;   /* -T or -C: only make sense with -t */
     const char     *caFile = NULL;
     uint32_t        timeoutSeconds = defaultAnnounceTimeout;
@@ -931,7 +1177,7 @@ int main(int argc, char **argv)
     options.trackers = (const char *const *)trackers;
     options.webSeeds = (const char *const *)webSeeds;
 
-    while ((option = nextOption(argc, argv, "o:a:w:c:n:l:ptT:C:h")) != -1) {
+    while ((option = nextOption(argc, argv, "o:a:w:c:n:l:ptPT:C:h")) != -1) {
         switch (option) {
         case 'o':
             outputPath = optionValue;
@@ -967,6 +1213,10 @@ int main(int argc, char **argv)
         case 't':
             announce = 1;
             break;
+        case 'P':
+            announce = 1;
+            connectPeers = 1;
+            break;
         case 'T':
             number = strtoul(optionValue, &end, 10);
             if (*optionValue < '0' || *optionValue > '9' || *end != '\0' || number == 0 || number > 3600u) {
@@ -1000,7 +1250,8 @@ int main(int argc, char **argv)
             usage(argv[0]);
             goto cleanup;
         }
-        status = announceTorrent(&context, &allocator, argv[optionIndex], timeoutSeconds, caFile);
+        status = announceTorrent(&context, &allocator, argv[optionIndex], timeoutSeconds, caFile,
+                                 connectPeers);
     } else if (outputPath != NULL) {
         if (optionIndex >= argc) {
             usage(argv[0]);

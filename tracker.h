@@ -8,10 +8,10 @@
  *     and host name verification
  *   - UDP trackers (BEP 15)
  *
- * TLS runs over libuv's TCP handles using OpenSSL memory BIOs: libuv does all
- * the socket I/O, OpenSSL only encrypts and decrypts in memory. OpenSSL
- * allocates through its own hook, CRYPTO_set_mem_functions(), which the
- * application may point at the same allocator if wanted.
+ * HTTP and HTTPS go through the http module (http.h), which trackerInit()
+ * sets up and trackerShutdown() releases. OpenSSL allocates through its own
+ * hook, CRYPTO_set_mem_functions(), which the application may point at the
+ * same allocator if wanted.
  *
  * Model:
  *   trackerConnect() starts an announce and returns at once with a unique
@@ -50,6 +50,7 @@
 #include <stdint.h>
 #include <uv.h>
 
+#include "http.h"
 #include "parser.h"
 
 #ifdef __cplusplus

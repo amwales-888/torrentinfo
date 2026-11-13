@@ -6,7 +6,7 @@
  * Announce: ./torrentinfo -t [-T seconds] [-C ca.pem] file.torrent
  *
  * Build:    cc -std=c99 -Wall -Wextra -O2 -o torrentinfo main.c parser.c encoder.c \
- *               tracker.c $(pkg-config --cflags --libs libuv openssl)
+ *               http.c tracker.c $(pkg-config --cflags --libs libuv openssl)
  */
 #define _POSIX_C_SOURCE 200809L
 

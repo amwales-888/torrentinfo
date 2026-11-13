@@ -39,6 +39,9 @@ extern "C" {
 /* ------------------------------------------------------------------------ */
 
 #define STORAGE_CHECK_EXISTING      0x01u   /* storageOpen(): hash existing data */
+#define STORAGE_READ_ONLY           0x02u   /* storageOpen(): only check what is
+                                               on disk: create, resize and write
+                                               nothing (implies CHECK_EXISTING) */
 #define STORAGE_ERROR_MESSAGE_LENGTH 320u
 
 /* Status codes */
@@ -54,6 +57,17 @@ extern "C" {
 
 /* Opaque handle. */
 typedef struct storage storage;
+
+/* One of the torrent's files, from storageGetFile(). */
+typedef struct storageFileState {
+    const char     *path;           /* on disk; valid until storageClose()  */
+    uint64_t        offset;         /* in the torrent's byte range          */
+    uint64_t        length;         /* the size the torrent says            */
+    uint64_t        sizeOnDisk;     /* when storageOpen() looked (0 if absent) */
+    uint8_t         existed;        /* had data when storageOpen() looked   */
+    uint8_t         notRegular;     /* the path is a directory or the like  */
+    uint8_t         isPadding;      /* BEP 47 padding: never on disk        */
+} storageFileState;
 
 /* storageOpen() has finished. errorMessage is NULL on success. */
 typedef void (*storageOpenCallback)(void *privateArg, storage *store, int32_t status,
@@ -91,6 +105,12 @@ int32_t storageWritePiece(storage *store, uint32_t pieceIndex, uint8_t *data,
 
 /* Pieces complete on disk, as a bitfield (messageBitfieldGet), and their count. */
 const uint8_t *storageHave(const storage *store, uint32_t *haveCount);
+
+/* The torrent's files, in torrent order (padding files included). */
+uint32_t storageFileCount(const storage *store);
+
+/* Describe file 'index' once the storage is open. */
+int32_t storageGetFile(const storage *store, uint32_t index, storageFileState *state);
 
 /* The download's top-level path: the file, or the directory of a multi-file torrent. */
 const char *storageRoot(const storage *store);

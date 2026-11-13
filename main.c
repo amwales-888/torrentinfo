@@ -1267,6 +1267,257 @@ static int downloadTorrent(uv_loop_t *loop, parserContext *context, const parser
     return run.result;
 }
 
+/* ------------------------------------------------------------------------ */
+/* Verify mode: ./torrentinfo -V [-O dir] file.torrent                      */
+/*                                                                          */
+/* Hash the data already on disk against the torrent, without changing      */
+/* anything, and report each file: complete, partial or missing, how many   */
+/* of its bytes are verified, and which pieces are missing.                 */
+/* ------------------------------------------------------------------------ */
+
+static const uint32_t verifyRangeLimit = 40u;   /* missing-piece ranges listed per line */
+
+typedef struct verifyRun {
+    int32_t status;
+    char    message[STORAGE_ERROR_MESSAGE_LENGTH];
+    uint8_t done;
+} verifyRun;
+
+static void onVerifyOpen(void *privateArg, storage *store, int32_t status, const char *errorMessage)
+{
+    verifyRun *run = privateArg;
+
+    (void)store;
+    run->status = status;
+    run->done = 1;
+    if (errorMessage != NULL) {
+        snprintf(run->message, sizeof(run->message), "%s", errorMessage);
+    }
+}
+
+static double percentOf(uint64_t part, uint64_t whole)
+{
+    return (whole == 0) ? 100.0 : 100.0 * (double)part / (double)whole;
+}
+
+/* Bytes of piece 'index' that fall inside [start, end). */
+static uint64_t pieceOverlap(const parserTorrent *torrent, uint32_t index, uint64_t start, uint64_t end)
+{
+    uint64_t pieceStart = (uint64_t)index * torrent->pieceLength;
+    uint64_t pieceEnd = pieceStart + torrent->pieceLength;
+
+    if (pieceEnd > torrent->totalLength) {
+        pieceEnd = torrent->totalLength;
+    }
+    if (pieceStart < start) {
+        pieceStart = start;
+    }
+    if (pieceEnd > end) {
+        pieceEnd = end;
+    }
+    return (pieceEnd > pieceStart) ? pieceEnd - pieceStart : 0;
+}
+
+/*
+ * Print the pieces in [first, last] that are not in 'have' as ranges
+ * ("3, 7-12, 40"), at most 'verifyRangeLimit' of them. Returns the number
+ * of missing pieces.
+ */
+static uint32_t printMissing(const uint8_t *have, uint32_t first, uint32_t last)
+{
+    uint32_t missing = 0;
+    uint32_t ranges = 0;
+    uint32_t hidden = 0;
+    uint32_t index = first;
+    uint32_t start;
+
+    while (index <= last) {
+        if (messageBitfieldGet(have, index)) {
+            if (index == last) {
+                break;
+            }
+            index++;
+            continue;
+        }
+        start = index;
+        while (index < last && !messageBitfieldGet(have, index + 1u)) {
+            index++;
+        }
+        missing += index - start + 1u;
+        if (ranges < verifyRangeLimit) {
+            printf("%s%" PRIu32, (ranges > 0) ? ", " : "", start);
+            if (index > start) {
+                printf("-%" PRIu32, index);
+            }
+        } else {
+            hidden++;
+        }
+        ranges++;
+        if (index == last) {
+            break;
+        }
+        index++;
+    }
+    if (hidden > 0) {
+        printf(", ... (%" PRIu32 " more range%s)", hidden, (hidden == 1u) ? "" : "s");
+    }
+    return missing;
+}
+
+static int verifyTorrent(parserContext *context, const parserAllocator *allocator,
+                         const char *path, const char *directory)
+{
+    const parserFile *file;
+    parserTorrent     torrent;
+    storageFileState  state;
+    verifyRun         run;
+    uv_loop_t         loop;
+    storage          *store = NULL;
+    const uint8_t    *have;
+    uint8_t          *buffer = NULL;
+    uint64_t          length = 0;
+    uint64_t          bytesDone = 0;
+    uint64_t          dataLength = 0;   /* excluding padding */
+    uint32_t          haveCount = 0;
+    uint32_t          fileIndex = 0;
+    uint32_t          shown = 0;
+    uint32_t          padding = 0;
+    uint32_t          filesComplete = 0;
+    uint32_t          i;
+    char              size[64];
+    char              total[64];
+    int               result = -1;
+    int32_t           status;
+
+    if (readFile(allocator, path, &buffer, &length) != 0) {
+        return -1;
+    }
+    status = parserParse(context, buffer, length, &torrent);
+    allocator->free(buffer);
+    if (status != PARSER_OK) {
+        fprintf(stderr, "%s: parse failed: %s\n", path, parserErrorString(status));
+        return -1;
+    }
+
+    printf("Verifying:  ");
+    printEscaped(torrent.name);
+    printf("\nInfo hash:  ");
+    printHex(torrent.infoHash, PARSER_SHA1_LENGTH);
+    formatSize(torrent.pieceLength, size, sizeof(size));
+    printf("\nPieces:     %" PRIu32 " of %s\n", torrent.pieceCount, size);
+    fflush(stdout);
+
+    memset(&run, 0, sizeof(run));
+    uv_loop_init(&loop);
+    status = storageOpen(&loop, context, &torrent, directory, STORAGE_READ_ONLY, onVerifyOpen,
+                         &run, &store);
+    if (status != STORAGE_OK) {
+        printf("Could not check the files: %s\n", storageStatusString(status));
+        goto done;
+    }
+    printf("Location:   %s\n\nHashing the data on disk...\n", storageRoot(store));
+    fflush(stdout);
+    uv_run(&loop, UV_RUN_DEFAULT);
+    if (run.status != STORAGE_OK) {
+        printf("Could not check the files: %s\n",
+               (run.message[0] != '\0') ? run.message : storageStatusString(run.status));
+        goto done;
+    }
+    have = storageHave(store, &haveCount);
+
+    /* Each file: the pieces it spans, and how many of its bytes they verify. */
+    printf("\nFiles\n");
+    TAILQ_FOREACH(file, &torrent.files, entries) {
+        uint64_t    end = file->offset + file->length;
+        uint64_t    verified = 0;
+        uint32_t    first = (uint32_t)(file->offset / torrent.pieceLength);
+        uint32_t    last = (file->length > 0) ? (uint32_t)((end - 1u) / torrent.pieceLength) : first;
+        uint32_t    piecesHad = 0;
+        const char *label;
+
+        if (storageGetFile(store, fileIndex++, &state) != STORAGE_OK) {
+            continue;
+        }
+        if (state.isPadding) {
+            padding++;
+            continue;
+        }
+        dataLength += file->length;
+        for (i = first; file->length > 0 && i <= last; i++) {
+            if (messageBitfieldGet(have, i)) {
+                verified += pieceOverlap(&torrent, i, file->offset, end);
+                piecesHad++;
+            }
+        }
+        bytesDone += verified;
+
+        if (state.notRegular) {
+            label = "NOT A FILE";
+        } else if (verified == file->length) {
+            label = "complete";
+            filesComplete++;
+        } else if (!state.existed) {
+            label = "MISSING";
+        } else {
+            label = "partial";
+        }
+        formatBytes(verified, size, sizeof(size));
+        formatBytes(file->length, total, sizeof(total));
+        if (state.notRegular) {
+            printf("  %-10s    --   ", label);
+        } else {
+            printf("  %-10s %5.1f%%  ", label, percentOf(verified, file->length));
+        }
+        printFilePath(&torrent, file);
+        printf("\n             %s of %s verified", size, total);
+        if (file->length > 0 && first == last) {
+            printf("; piece %" PRIu32 ": %s", first, (piecesHad == 1u) ? "good" : "missing");
+        } else if (file->length > 0) {
+            printf("; pieces %" PRIu32 "-%" PRIu32 ": %" PRIu32 " of %" PRIu32 " good",
+                   first, last, piecesHad, last - first + 1u);
+        }
+        printf("\n");
+        if (state.existed && !state.notRegular && state.sizeOnDisk != file->length) {
+            formatSize(state.sizeOnDisk, size, sizeof(size));
+            printf("             size on disk is %s, %s than the torrent says\n", size,
+                   (state.sizeOnDisk < file->length) ? "smaller" : "LARGER");
+        }
+        if (verified < file->length) {
+            printf("             missing pieces: ");
+            printMissing(have, first, last);
+            printf("\n");
+        }
+        shown++;
+    }
+    if (padding > 0) {
+        printf("  (%" PRIu32 " padding file%s not shown: never stored on disk)\n", padding,
+               (padding == 1u) ? "" : "s");
+    }
+
+    formatSize(bytesDone, size, sizeof(size));
+    formatSize(dataLength, total, sizeof(total));
+    printf("\nSummary\n");
+    printf("  Status:          %s\n", (haveCount == torrent.pieceCount) ? "COMPLETE" : "INCOMPLETE");
+    printf("  Files:           %" PRIu32 " of %" PRIu32 " complete\n", filesComplete, shown);
+    printf("  Pieces:          %" PRIu32 " of %" PRIu32 " verified (%.1f%%)\n", haveCount,
+           torrent.pieceCount, percentOf(haveCount, torrent.pieceCount));
+    printf("  Bytes:           %s of %s verified (%.1f%%)\n", size, total,
+           percentOf(bytesDone, dataLength));
+    if (haveCount < torrent.pieceCount) {
+        printf("  Missing pieces:  %" PRIu32 ": ", torrent.pieceCount - haveCount);
+        printMissing(have, 0, torrent.pieceCount - 1u);
+        printf("\n");
+    }
+    result = (haveCount == torrent.pieceCount) ? 0 : 2;
+
+done:
+    storageClose(store);
+    uv_run(&loop, UV_RUN_DEFAULT);
+    uv_loop_close(&loop);
+    parserFree(context, &torrent);
+    return result;
+}
+
 static int announceTorrent(parserContext *context, const parserAllocator *allocator,
                            const char *path, uint32_t timeoutSeconds, const char *caFile,
                            uint32_t mode, int64_t wanted, const char *outputDirectory)
@@ -1518,6 +1769,7 @@ static void usage(const char *program)
             "       %s -t [-T seconds] [-C ca.pem] <file.torrent>\n"
             "       %s -P [-T seconds] [-C ca.pem] <file.torrent>\n"
             "       %s -D [-O dir] [-i piece] [-T seconds] [-C ca.pem] <file.torrent>\n"
+            "       %s -V [-O dir] <file.torrent>\n"
             "\n"
             "  -o file   create a torrent from the given files and write it to 'file'\n"
             "  -a url    tracker announce URL (repeat for more; one tier each)\n"
@@ -1533,12 +1785,15 @@ static void usage(const char *program)
             "            send interested, report its pieces and whether it unchokes us\n"
             "  -D        announce, then download the torrent from all the peers found\n"
             "            at once (up to 50 connected); re-run to resume\n"
-            "  -O dir    with -D: where to save (default: the current directory)\n"
+            "  -V        verify downloaded data against the torrent (no network, changes\n"
+            "            nothing): each file's state, bytes verified, missing pieces;\n"
+            "            exit status 0 if complete, 2 if not, 1 on error\n"
+            "  -O dir    with -D or -V: where the files are (default: current directory)\n"
             "  -i piece  with -D: download only this piece\n"
             "  -T secs   announce and handshake timeout (default 15)\n"
             "  -C file   trust the CA certificates in this PEM file for HTTPS\n"
             "            trackers (default: the system's certificate store)\n",
-            program, program, program, program, program);
+            program, program, program, program, program, program);
 }
 
 int main(int argc, char **argv)
@@ -1551,6 +1806,8 @@ int main(int argc, char **argv)
     const char     *outputPath = NULL;
     uint8_t         createOnly = 0;     /* an option that only makes sense with -o */
     uint8_t         announce = 0;
+    uint8_t         verify = 0;         /* -V */
+    uint8_t         directoryGiven = 0; /* -O */
     uint32_t        mode = MODE_ANNOUNCE;
     int64_t         wanted = -1;            /* -i piece index */
     const char     *outputDirectory = "";   /* -O directory   */
@@ -1598,7 +1855,7 @@ int main(int argc, char **argv)
     options.trackers = (const char *const *)trackers;
     options.webSeeds = (const char *const *)webSeeds;
 
-    while ((option = nextOption(argc, argv, "o:a:w:c:n:l:ptPDO:i:T:C:h")) != -1) {
+    while ((option = nextOption(argc, argv, "o:a:w:c:n:l:ptPDVO:i:T:C:h")) != -1) {
         switch (option) {
         case 'o':
             outputPath = optionValue;
@@ -1642,9 +1899,12 @@ int main(int argc, char **argv)
             announce = 1;
             mode = MODE_DOWNLOAD;
             break;
+        case 'V':
+            verify = 1;
+            break;
         case 'O':
             outputDirectory = optionValue;
-            announceOnly = 1;
+            directoryGiven = 1;
             break;
         case 'i':
             number = strtoul(optionValue, &end, 10);
@@ -1678,12 +1938,18 @@ int main(int argc, char **argv)
         }
     }
 
-    if (announceOnly && !announce) {
+    if ((announceOnly && !announce) || (directoryGiven && !verify && mode != MODE_DOWNLOAD)) {
         usage(argv[0]);
         goto cleanup;
     }
 
-    if (announce) {
+    if (verify) {
+        if (announce || announceOnly || outputPath != NULL || createOnly || argc - optionIndex != 1) {
+            usage(argv[0]);
+            goto cleanup;
+        }
+        status = verifyTorrent(&context, &allocator, argv[optionIndex], outputDirectory);
+    } else if (announce) {
         if (outputPath != NULL || createOnly || argc - optionIndex != 1) {
             usage(argv[0]);
             goto cleanup;
@@ -1721,6 +1987,9 @@ cleanup:
     if (liveAllocations != 0) {
         fprintf(stderr, "warning: %" PRIu64 " allocation(s) not freed\n", liveAllocations);
         status = -1;
+    }
+    if (status == 2) {
+        return 2;                                   /* -V: verified, but incomplete */
     }
     return (status == 0) ? EXIT_SUCCESS : EXIT_FAILURE;
 }

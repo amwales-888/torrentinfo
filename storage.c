@@ -37,6 +37,8 @@ typedef struct storageFile {
     uint64_t    length;
     uint8_t     padding;        /* BEP 47: not on disk, all zeros            */
     uint8_t     existed;        /* had data before storageOpen()             */
+    uint8_t     notRegular;     /* the path is a directory or something else */
+    uint64_t    sizeOnDisk;     /* when opened (before any resizing)         */
 } storageFile;
 
 struct storage {
@@ -52,6 +54,7 @@ struct storage {
     uint8_t                *have;           /* bitfield                           */
     uint32_t                haveCount;
     uint8_t                 checkExisting;
+    uint8_t                 readOnly;       /* STORAGE_READ_ONLY: check only      */
 
     /* The open job */
     uv_work_t               openWork;
@@ -343,6 +346,15 @@ static void openWork(uv_work_t *work)
         if (entry->padding) {
             continue;
         }
+        if (store->readOnly) {
+            /* Look, do not touch: a missing or odd file just has no pieces. */
+            result = platformFileStat(entry->path, &size, &isRegular);
+            entry->notRegular = (uint8_t)(result == 0 && !isRegular);
+            entry->sizeOnDisk = (result == 0 && isRegular) ? size : 0;
+            entry->existed = (uint8_t)(result == 0 && isRegular && size > 0);
+            anyExisted = (uint8_t)(anyExisted | entry->existed);
+            continue;
+        }
         result = makeParents(entry->path, entry->parentLength);
         if (result != 0) {
             snprintf(store->openMessage, sizeof(store->openMessage),
@@ -359,6 +371,7 @@ static void openWork(uv_work_t *work)
             return;
         }
         entry->existed = (uint8_t)(result == 0 && size > 0);
+        entry->sizeOnDisk = (result == 0) ? size : 0;
         anyExisted = (uint8_t)(anyExisted | entry->existed);
 
         result = platformFileOpenReadWrite(entry->path, &file);
@@ -573,7 +586,8 @@ int32_t storageOpen(uv_loop_t *loop, parserContext *context, const parserTorrent
     store->pieceLength = torrent->pieceLength;
     store->totalLength = torrent->totalLength;
     store->pieceCount = torrent->pieceCount;
-    store->checkExisting = (uint8_t)((flags & STORAGE_CHECK_EXISTING) != 0);
+    store->readOnly = (uint8_t)((flags & STORAGE_READ_ONLY) != 0);
+    store->checkExisting = (uint8_t)((flags & (STORAGE_CHECK_EXISTING | STORAGE_READ_ONLY)) != 0);
     store->openCallback = callback;
     store->openArg = privateArg;
     store->fileCount = torrent->fileCount;
@@ -620,7 +634,7 @@ int32_t storageWritePiece(storage *store, uint32_t pieceIndex, uint8_t *data,
     if (store == NULL || data == NULL) {
         return STORAGE_EINVAL;                      /* nothing we can free safely */
     }
-    if (!store->opened || store->closed || pieceIndex >= store->pieceCount) {
+    if (!store->opened || store->closed || store->readOnly || pieceIndex >= store->pieceCount) {
         release(store->context, data);
         return STORAGE_EINVAL;
     }
@@ -651,6 +665,32 @@ const uint8_t *storageHave(const storage *store, uint32_t *haveCount)
         *haveCount = (store != NULL) ? store->haveCount : 0;
     }
     return (store != NULL) ? store->have : NULL;
+}
+
+uint32_t storageFileCount(const storage *store)
+{
+    return (store != NULL) ? store->fileCount : 0;
+}
+
+int32_t storageGetFile(const storage *store, uint32_t index, storageFileState *state)
+{
+    const storageFile *entry;
+
+    if (state != NULL) {
+        memset(state, 0, sizeof(*state));
+    }
+    if (store == NULL || state == NULL || !store->opened || index >= store->fileCount) {
+        return STORAGE_EINVAL;
+    }
+    entry = &store->files[index];
+    state->path = entry->path;
+    state->offset = entry->offset;
+    state->length = entry->length;
+    state->sizeOnDisk = entry->padding ? entry->length : entry->sizeOnDisk;
+    state->isPadding = entry->padding;
+    state->existed = (uint8_t)(entry->existed || entry->padding);
+    state->notRegular = entry->notRegular;
+    return STORAGE_OK;
 }
 
 const char *storageRoot(const storage *store)

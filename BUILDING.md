@@ -67,12 +67,23 @@ cd build\x64\Release
                                         # pieces each one has, and whether it unchokes us
 .\torrentinfo.exe -D -O C:\Downloads file.torrent   # download from all peers (re-run to resume)
 .\torrentinfo.exe -D -i 42 file.torrent              # ... only piece 42
+.\torrentinfo.exe -V -O C:\Downloads file.torrent   # check what is on disk (offline)
 ```
 
 To pass arguments when debugging in Visual Studio, use the `torrentinfo`
 project's *Properties > Debugging > Command Arguments*.
 
 ### Notes
+
+- **Verifying (`-V`)** hashes the data on disk against the torrent without
+  creating or changing anything, and needs no network. For each file it
+  shows complete / partial / MISSING / NOT A FILE, the bytes verified, the
+  piece range it spans and which of those pieces are missing (as ranges such
+  as `7, 50-53, 120`), and warns when the size on disk differs from the
+  torrent. A summary gives pieces and bytes verified and every missing piece.
+  Exit status: 0 if complete, 2 if incomplete, 1 on error. A piece that spans
+  two files counts against both, so a missing file can make its neighbour
+  "partial".
 
 - **Downloading (`-D`)** uses every peer the trackers return, up to 50
   connections at once. Pieces are chosen rarest-first; each peer keeps 16

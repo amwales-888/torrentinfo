@@ -1309,6 +1309,7 @@ static uint32_t        settingsUploadSlots;
 static uint64_t        maxDownloadRate;     /* -d, or max_download_rate; 0: none */
 static uint64_t        maxUploadRate;       /* -u, or max_upload_rate            */
 static uint8_t         encryptionMode = CONFIG_ENCRYPTION_PREFER;   /* -E, encryption */
+static uint8_t         useWebSeeds = 1;     /* -W, web_seeds                     */
 
 static int dataFilePath(const char *subdirectory, const char *name, char *path, size_t size)
 {
@@ -1488,6 +1489,13 @@ static void onProgressTick(uv_timer_t *timer)
                progress.peersIncoming, progress.peersEncrypted, progress.peersUnchoking,
                progress.peersDownloading,
                progress.peersUploading, progress.endgame ? "  [endgame]" : "");
+        if (progress.webSeeds > 0 || progress.bytesFromWeb > 0) {
+            char fromWeb[32];
+
+            formatBytes(progress.bytesFromWeb, fromWeb, sizeof(fromWeb));
+            printf("          web seeds: %" PRIu32 " in use, %" PRIu32 " fetching, %s received\n",
+                   progress.webSeeds, progress.webSeedsActive, fromWeb);
+        }
     }
     if (progress.peersBlocked != run->reportBlocked) {
         printf("  blocklist: %" PRIu32 " peer address%s refused so far\n", progress.peersBlocked,
@@ -1808,6 +1816,7 @@ static int downloadTorrent(uv_loop_t *loop, parserContext *context, const parser
     trackerConfig   trackerSettings = *config;
     downloadRun     run;
     uint8_t        *fileWanted = NULL;
+    httpConfig      httpSettings;
     int32_t         status;
 
     if (wanted >= (int64_t)torrent->pieceCount) {
@@ -1834,6 +1843,11 @@ static int downloadTorrent(uv_loop_t *loop, parserContext *context, const parser
     options.uploadSlots = settingsUploadSlots;
     options.maxDownloadRate = maxDownloadRate;
     options.maxUploadRate = maxUploadRate;
+    options.noWebSeeds = (uint8_t)!useWebSeeds;
+    memset(&httpSettings, 0, sizeof(httpSettings));
+    httpSettings.caFile = config->caFile;
+    httpSettings.binding = config->binding;
+    options.http = &httpSettings;
     if (selecting()) {
         fileWanted = context->allocator.realloc(NULL, torrent->fileCount);
         if (fileWanted == NULL || chooseFiles(torrent, fileWanted) != 0) {
@@ -3122,7 +3136,7 @@ static void usage(const char *program)
             "       %s -o <output.torrent> [options] <file>...\n"
             "       %s -t [-T seconds] [-C ca.pem] [-I interface] <file.torrent>\n"
             "       %s -P [-T seconds] [-C ca.pem] [-I interface] <file.torrent>\n"
-            "       %s -D [-S] [-L port] [-N] [-X] [-E mode] [-d rate] [-u rate] [-f list]\n"
+            "       %s -D [-S] [-L port] [-N] [-X] [-W] [-E mode] [-d rate] [-u rate] [-f list]\n"
             "            [-F glob]... [-O dir] [-i piece]\n"
             "            [-T seconds] [-C ca.pem] [-I interface] <file.torrent | magnet-link>\n"
             "       %s -V [-O dir] [-f list] [-F glob]... <file.torrent>\n"
@@ -3154,6 +3168,7 @@ static void usage(const char *program)
             "            listing shows: 1,3,5-7\n"
             "  -F glob   with -D or -V: only files whose path or name matches, like\n"
             "            '*.mkv' (any case; may be repeated, and combined with -f)\n"
+            "  -W        with -D: do not download from the torrent's web seeds\n"
             "  -E mode   with -D: protocol encryption: prefer (the default: fall back\n"
             "            to plain for peers without it), require, or off\n"
             "  -d rate   with -D: download no faster than this, in KiB/s or with a\n"
@@ -3197,6 +3212,7 @@ int main(int argc, char **argv)
     uint8_t         downRateGiven = 0;  /* -d */
     uint8_t         upRateGiven = 0;    /* -u */
     uint8_t         encryptionGiven = 0;    /* -E */
+    uint8_t         webSeedsGiven = 0;      /* -W */
     const char     *interfaceSpec = NULL;   /* -I */
     netBinding      binding;
     uint8_t         directoryGiven = 0; /* -O */
@@ -3247,7 +3263,7 @@ int main(int argc, char **argv)
     options.trackers = (const char *const *)trackers;
     options.webSeeds = (const char *const *)webSeeds;
 
-    while ((option = nextOption(argc, argv, "o:a:w:c:n:l:ptPDVSNXmL:O:i:T:C:I:d:u:f:F:E:h")) != -1) {
+    while ((option = nextOption(argc, argv, "o:a:w:c:n:l:ptPDVSNXWmL:O:i:T:C:I:d:u:f:F:E:h")) != -1) {
         switch (option) {
         case 'o':
             outputPath = optionValue;
@@ -3335,6 +3351,11 @@ int main(int argc, char **argv)
             break;
         case 'f':
             selectList = optionValue;
+            break;
+        case 'W':
+            useWebSeeds = 0;
+            webSeedsGiven = 1;
+            downloadOnly = 1;
             break;
         case 'E':
             if (!configParseEncryption(optionValue, &encryptionMode)) {
@@ -3451,6 +3472,9 @@ int main(int argc, char **argv)
         }
         if (!encryptionGiven && (settingsFile.set & CONFIG_SET_ENCRYPTION) != 0) {
             encryptionMode = settingsFile.encryption;
+        }
+        if (!webSeedsGiven && (settingsFile.set & CONFIG_SET_WEB_SEEDS) != 0) {
+            useWebSeeds = settingsFile.webSeeds;
         }
         /* CONFIG_ENCRYPTION_* and PEER_ENCRYPTION_* have the same values. */
         peerSetEncryption(encryptionMode);

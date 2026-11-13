@@ -2,31 +2,25 @@
  * net.c - Binding sockets to one network interface. See net.h.
  */
 #ifndef _WIN32
-#define _DEFAULT_SOURCE         /* if_nametoindex(), SO_BINDTODEVICE */
+#define _DEFAULT_SOURCE         /* if_nametoindex() */
 #endif
 
 #include <stdio.h>
 #include <string.h>
 
 #include "net.h"
+#include "platform.h"           /* tying sockets to an interface */
 
 #ifdef _WIN32
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <iphlpapi.h>           /* ConvertInterfaceAliasToLuid() */
 #include <netioapi.h>
-#ifndef IP_UNICAST_IF
-#define IP_UNICAST_IF           31
-#endif
-#ifndef IPV6_UNICAST_IF
-#define IPV6_UNICAST_IF         31
-#endif
 #else
-#include <errno.h>
+#include <sys/types.h>
 #include <net/if.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
-#include <unistd.h>
 #endif
 
 /* uv_fileno() gives a HANDLE on Windows; for sockets it holds the SOCKET. */
@@ -115,44 +109,34 @@ static uint32_t interfaceIndex(const char *name)
 }
 
 /*
- * Whether this process may tie sockets to the interface. Windows always
- * may (given an index). Linux before 5.7 needs CAP_NET_RAW for
- * SO_BINDTODEVICE, so try it on a scratch socket.
+ * Whether this process may tie sockets to the interface itself (see
+ * platformInterfaceTieCheck()); if not, say why. Sockets are then bound to
+ * the interface's address only.
  */
 static int deviceBindingAllowed(const netBinding *binding, char *message, size_t size)
 {
-#ifdef _WIN32
-    if (binding->index == 0) {
-        setMessage(message, size,
-                   "warning: could not find the interface index; sockets are bound to "
-                   "its address only");
-        return 0;
-    }
-    return 1;
-#else
-    int fd = socket(AF_INET, SOCK_DGRAM, 0);
-    int result;
-    int error;
-
-    if (fd < 0) {
-        fd = socket(AF_INET6, SOCK_DGRAM, 0);
-    }
-    if (fd < 0) {
-        return 1;                       /* cannot tell; the real sockets will say */
-    }
-    result = setsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE, binding->name,
-                        (socklen_t)strlen(binding->name));
-    error = errno;
-    close(fd);
-    if (result != 0 && (error == EPERM || error == EACCES)) {
+    switch (platformInterfaceTieCheck(binding->name, binding->index)) {
+    case 0:
+        return 1;
+    case UV_EPERM:
         setMessage(message, size,
                    "warning: not permitted to use SO_BINDTODEVICE (Linux before 5.7 needs "
                    "CAP_NET_RAW); sockets are bound to the interface's address only, so "
                    "traffic may still be routed out of another interface");
         return 0;
+    case UV_ENODEV:
+        setMessage(message, size,
+                   "warning: could not find the interface index; sockets are bound to "
+                   "its address only");
+        return 0;
+    default:
+        setMessage(message, size,
+                   "note: this system cannot tie sockets to an interface, so they are "
+                   "bound to its address only; traffic follows the routing table (on "
+                   "FreeBSD, give the VPN the default route, or use a separate FIB "
+                   "with setfib(1))");
+        return 0;
     }
-    return 1;
-#endif
 }
 
 /* ------------------------------------------------------------------------ */
@@ -322,30 +306,7 @@ static int tieToDevice(uv_os_sock_t sock, const netBinding *binding, int family)
     if (!binding->device) {
         return 0;
     }
-#ifdef _WIN32
-    {
-        DWORD value;
-        int   result;
-
-        if (family == AF_INET) {
-            value = htonl((u_long)binding->index);  /* network byte order for IPv4 */
-            result = setsockopt(sock, IPPROTO_IP, IP_UNICAST_IF, (const char *)&value,
-                                (int)sizeof(value));
-        } else {
-            value = (DWORD)binding->index;          /* host byte order for IPv6 */
-            result = setsockopt(sock, IPPROTO_IPV6, IPV6_UNICAST_IF, (const char *)&value,
-                                (int)sizeof(value));
-        }
-        return (result == 0) ? 0 : uv_translate_sys_error(WSAGetLastError());
-    }
-#else
-    (void)family;
-    if (setsockopt(sock, SOL_SOCKET, SO_BINDTODEVICE, binding->name,
-                   (socklen_t)strlen(binding->name)) != 0) {
-        return uv_translate_sys_error(errno);
-    }
-    return 0;
-#endif
+    return (int)platformInterfaceTie(sock, family, binding->name, binding->index);
 }
 
 static const struct sockaddr *localAddress(const netBinding *binding, int family)

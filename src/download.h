@@ -60,6 +60,7 @@
 #include <uv.h>
 
 #include "blocklist.h"
+#include "http.h"
 #include "parser.h"
 #include "peer.h"
 
@@ -124,6 +125,14 @@ typedef struct downloadOptions {
                                            none. Must outlive the download.    */
     uint64_t        maxDownloadRate;    /* bytes per second; 0 = no limit      */
     uint64_t        maxUploadRate;      /* bytes per second; 0 = no limit      */
+    /* Web seeds (BEP 19): the torrent's url-list is used unless noWebSeeds,
+     * plus these (e.g. a magnet link's ws=). 'http' configures HTTP (CA
+     * file, interface) if the http module is not started yet; NULL for
+     * defaults. Only read during downloadBegin(). */
+    const char *const *webSeeds;
+    uint32_t        webSeedCount;
+    uint8_t         noWebSeeds;
+    const httpConfig *http;
 } downloadOptions;
 
 typedef struct downloadProgress {
@@ -154,6 +163,9 @@ typedef struct downloadProgress {
     uint32_t        checkedPieces;      /* ...pieces checked so far            */
     uint32_t        checkTotal;         /* ...of these (0 until known)         */
     uint32_t        peersBlocked;       /* addresses refused by the blocklist  */
+    uint32_t        webSeeds;           /* web seeds still in use              */
+    uint32_t        webSeedsActive;     /* ...fetching right now               */
+    uint64_t        bytesFromWeb;       /* received from web seeds             */
     uint64_t        maxDownloadRate;    /* the limits in force (0: none)       */
     uint64_t        maxUploadRate;
 } downloadProgress;

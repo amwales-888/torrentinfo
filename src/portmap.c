@@ -22,6 +22,7 @@
 #include <string.h>
 
 #include "http.h"
+#include "platform.h"
 #include "portmap.h"
 
 #ifdef _WIN32
@@ -216,76 +217,32 @@ static const char *xmlValue(const char *text, const char *from, const char *tag,
 
 static int findGateway(portmap *pm)
 {
-#ifdef _WIN32
-    MIB_IPFORWARDTABLE *table = NULL;
-    ULONG               size = 0;
-    DWORD               bestMetric = (DWORD)-1;
-    DWORD               i;
-    int                 found = 0;
+    const char *name = pm->binding.active ? pm->binding.name : NULL;
+    uint32_t    index = pm->binding.active ? pm->binding.index : 0u;
+    uint32_t    gateway = 0;
+    size_t      size = 16384u;
+    void       *scratch = NULL;
+    int32_t     result = UV_ENOBUFS;
+    int         tries;
 
-    if (GetIpForwardTable(NULL, &size, TRUE) != ERROR_INSUFFICIENT_BUFFER) {
+    /* The routing table is read into memory of ours (platform.c allocates
+     * nothing); grow it if the table is larger. */
+    for (tries = 0; tries < 4 && result == UV_ENOBUFS; tries++) {
+        if (scratch != NULL) {
+            pm->context->allocator.free(scratch);
+        }
+        scratch = allocate(pm, size);
+        if (scratch == NULL) {
+            return 0;
+        }
+        result = platformDefaultGateway(name, index, scratch, &size, &gateway);
+    }
+    pm->context->allocator.free(scratch);
+    if (result != 0) {
         return 0;
     }
-    table = allocate(pm, size);
-    if (table == NULL) {
-        return 0;
-    }
-    if (GetIpForwardTable(table, &size, TRUE) == NO_ERROR) {
-        for (i = 0; i < table->dwNumEntries; i++) {
-            const MIB_IPFORWARDROW *row = &table->table[i];
-
-            if (row->dwForwardDest != 0 || row->dwForwardMask != 0 || row->dwForwardNextHop == 0) {
-                continue;
-            }
-            if (pm->binding.active && pm->binding.index != 0 &&
-                row->dwForwardIfIndex != pm->binding.index) {
-                continue;
-            }
-            if (!found || row->dwForwardMetric1 < bestMetric) {
-                bestMetric = row->dwForwardMetric1;
-                pm->gateway.sin_addr.s_addr = row->dwForwardNextHop;
-                found = 1;
-            }
-        }
-    }
-    pm->context->allocator.free(table);
-    return found;
-#else
-    FILE         *file = fopen("/proc/net/route", "r");
-    char          line[256];
-    unsigned long bestMetric = (unsigned long)-1;
-    int           found = 0;
-
-    if (file == NULL) {
-        return 0;
-    }
-    while (fgets(line, sizeof(line), file) != NULL) {
-        char          name[64];
-        unsigned long destination;
-        unsigned long gateway;
-        unsigned long flags;
-        unsigned long metric;
-        unsigned long mask;
-
-        if (sscanf(line, "%63s %lx %lx %lx %*d %*d %lu %lx", name, &destination, &gateway,
-                   &flags, &metric, &mask) != 6) {
-            continue;                               /* the header line */
-        }
-        if (destination != 0 || mask != 0 || !(flags & 0x2u) || gateway == 0) {
-            continue;                               /* not a default route via a router */
-        }
-        if (pm->binding.active && strcmp(name, pm->binding.name) != 0) {
-            continue;
-        }
-        if (!found || metric < bestMetric) {
-            bestMetric = metric;
-            pm->gateway.sin_addr.s_addr = (uint32_t)gateway;   /* already network order */
-            found = 1;
-        }
-    }
-    fclose(file);
-    return found;
-#endif
+    pm->gateway.sin_addr.s_addr = gateway;
+    return 1;
 }
 
 /* Our address as the router sees it (for UPnP's NewInternalClient). */

@@ -1,12 +1,19 @@
 /*
- * platform.h - The few things that differ between Linux and Windows.
+ * platform.h - The few things that differ between Linux, FreeBSD and Windows.
  *
  * Everything else in the library is portable C or goes through libuv.
  *
  *   - (Lists come from the bundled 4.4BSD queue.h on every platform.)
- *   - File access with UTF-8 paths: POSIX calls on Linux, the wide-character
- *     Win32 calls on Windows (so non-ASCII paths work without any code page
- *     settings).
+ *   - File access with UTF-8 paths: POSIX calls on Linux and FreeBSD, the
+ *     wide-character Win32 calls on Windows (so non-ASCII paths work without
+ *     any code page settings).
+ *   - Tying a socket to a network interface: SO_BINDTODEVICE on Linux,
+ *     IP_UNICAST_IF / IPV6_UNICAST_IF on Windows. FreeBSD has no such
+ *     option; sockets there can only be bound to the interface's address.
+ *   - Finding the default gateway (for NAT-PMP): /proc/net/route on Linux,
+ *     the routing sysctl (NET_RT_FLAGS) on FreeBSD, GetIpForwardTable() on
+ *     Windows.
+ *   - Where the system keeps its trusted CA certificates.
  *
  * The file functions never allocate memory and keep no shared state, so
  * they are safe to call from libuv's thread pool. They return 0 or a
@@ -19,7 +26,10 @@
 #ifndef PLATFORM_H
 #define PLATFORM_H
 
+#include <stddef.h>
 #include <stdint.h>
+
+#include <uv.h>     /* uv_os_sock_t; libuv error codes */
 
 #ifdef __cplusplus
 extern "C" {
@@ -71,7 +81,7 @@ int32_t platformMakeDirectory(const char *path);
 
 /*
  * The directory for the program's own lasting data, created if missing:
- * ~/.torrentinfo on Linux, %APPDATA%\\torrentinfo on Windows; with a
+ * ~/.torrentinfo on Linux and FreeBSD, %APPDATA%\\torrentinfo on Windows; with a
  * 'subdirectory' (or NULL), that directory inside it, created too. The
  * UTF-8 path goes to 'path'. Returns 0 or a libuv error code.
  */
@@ -88,6 +98,44 @@ int32_t platformFileReadAt(platformFile *file, uint64_t offset, void *buffer, ui
                            uint32_t *count);
 int32_t platformFileWriteAt(platformFile *file, uint64_t offset, const void *buffer,
                             uint32_t length, uint32_t *count);
+
+/* ------------------------------------------------------------------------ */
+/* Networking                                                               */
+/* ------------------------------------------------------------------------ */
+
+/*
+ * Can sockets be tied to the interface (name, or index on Windows)? 0 if
+ * so; UV_EPERM if the system refuses (Linux before 5.7 needs CAP_NET_RAW);
+ * UV_ENODEV if the interface's index is unknown (Windows); UV_ENOTSUP where
+ * there is no such option (FreeBSD, others). In every case but 0 the
+ * caller can still bind sockets to the interface's address.
+ */
+int32_t platformInterfaceTieCheck(const char *name, uint32_t index);
+
+/* Tie a socket of the given family (AF_INET or AF_INET6) to the interface.
+ * 0, or a libuv error (UV_ENOTSUP on FreeBSD). */
+int32_t platformInterfaceTie(uv_os_sock_t sock, int family, const char *name, uint32_t index);
+
+/*
+ * The IPv4 default gateway, in network byte order, into *gateway: the
+ * lowest-metric default route through a router, only through the given
+ * interface if 'name' (or, on Windows, 'index') is set.
+ *
+ * 'scratch' is working memory from the caller (the routing table is read
+ * into it on FreeBSD and Windows; Linux needs none), *size its length. If
+ * it is too small the call fails with UV_ENOBUFS and sets *size to what is
+ * needed; call again with that much. Returns 0, UV_ENOENT if there is no
+ * default route, or another libuv error.
+ */
+int32_t platformDefaultGateway(const char *name, uint32_t index, void *scratch, size_t *size,
+                               uint32_t *gateway);
+
+/*
+ * Files where the system may keep its trusted CA certificates (PEM), most
+ * likely first; NULL-terminated. Windows keeps them in its certificate
+ * store instead, so the list there is empty.
+ */
+const char *const *platformCertificateBundles(void);
 
 #ifdef __cplusplus
 }

@@ -30,6 +30,7 @@
  * headers, which then undefine the wincrypt macros that clash with OpenSSL
  * names (X509_NAME and others). */
 #include "http.h"
+#include "platform.h"
 #include "net.h"
 #ifdef _WIN32
 #include <wincrypt.h>
@@ -857,20 +858,14 @@ static int loadWindowsCertificates(SSL_CTX *tls)
  * Load the system's trusted CAs into memory, so that verifying a server
  * never has to read certificate files during a handshake (on the loop
  * thread). Order: $SSL_CERT_FILE; on Windows the system certificate store;
- * OpenSSL's built-in default file; then the bundle locations used by the
- * major Linux distributions. If none exists, fall back to OpenSSL's default
+ * OpenSSL's built-in default file; then the usual bundle locations for this
+ * system (platformCertificateBundles(): the major Linux distributions, or
+ * FreeBSD's base system and packages). If none exists, fall back to OpenSSL's default
  * paths, which may look up certificates on disk during handshakes.
  */
 static int loadSystemCertificates(SSL_CTX *tls)
 {
-    static const char *const bundles[] = {
-        "/etc/ssl/certs/ca-certificates.crt",                   /* Debian, Ubuntu, Arch */
-        "/etc/pki/tls/certs/ca-bundle.crt",                     /* Fedora, RHEL       */
-        "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem",    /* RHEL 7+            */
-        "/etc/ssl/ca-bundle.pem",                               /* openSUSE           */
-        "/etc/ssl/cert.pem",                                    /* Alpine, macOS      */
-        NULL
-    };
+    const char *const *bundles = platformCertificateBundles();     /* per system */
     const char *environment = getenv(X509_get_default_cert_file_env());
     const char *defaultFile = X509_get_default_cert_file();
     uint32_t    i;
@@ -1067,6 +1062,14 @@ int32_t httpGet(const char *url, uint32_t timeoutSeconds, uint64_t maxResponse,
 {
     return startRequest(url, "GET", NULL, NULL, NULL, 0, timeoutSeconds, maxResponse, callback,
                         privateArg, handle);
+}
+
+int32_t httpGetWithHeaders(const char *url, const char *extraHeaders, uint32_t timeoutSeconds,
+                           uint64_t maxResponse, httpCallback callback, void *privateArg,
+                           httpRequest **handle)
+{
+    return startRequest(url, "GET", NULL, extraHeaders, NULL, 0, timeoutSeconds, maxResponse,
+                        callback, privateArg, handle);
 }
 
 int32_t httpPost(const char *url, const char *contentType, const char *extraHeaders,

@@ -28,9 +28,11 @@
 
 #include "download.h"
 #include "extension.h"
+#include "http.h"
 #include "piece.h"
 #include "storage.h"
 #include "queue.h"
+#include "webseed.h"
 
 /* ------------------------------------------------------------------------ */
 /* Internal constants                                                       */
@@ -40,6 +42,18 @@
 #define DOWNLOAD_PIECE_ACTIVE       1u
 #define DOWNLOAD_PIECE_WRITING      2u
 #define DOWNLOAD_PIECE_DONE         3u      /* on disk, or not wanted */
+#define DOWNLOAD_PIECE_WEB          4u      /* being fetched from a web seed */
+
+/* Web seeds */
+#define DOWNLOAD_WEB_RUN_BYTES      (4u * 1024u * 1024u)    /* per HTTP fetch     */
+#ifndef DOWNLOAD_WEB_TIMEOUT_SECONDS
+#define DOWNLOAD_WEB_TIMEOUT_SECONDS 60u
+#endif
+#ifndef DOWNLOAD_WEB_RETRY_SECONDS
+#define DOWNLOAD_WEB_RETRY_SECONDS  15u     /* doubled after each failure        */
+#endif
+#define DOWNLOAD_WEB_MAX_FAILURES   5u      /* in a row: give the web seed up    */
+#define DOWNLOAD_WEB_MAX_BAD        2u      /* pieces failing their check        */
 
 #define DOWNLOAD_PEER_QUEUED        0u
 #define DOWNLOAD_PEER_CONNECTING    1u
@@ -85,6 +99,7 @@
 /* ------------------------------------------------------------------------ */
 
 struct downloadPeer;
+struct dlWebSeed;
 
 typedef struct activePiece {
     TAILQ_ENTRY(activePiece) entries;
@@ -100,7 +115,28 @@ typedef struct activePiece {
     uv_work_t               verifyWork;
     uint8_t                *failedData;     /* the copy that failed, kept to */
     struct downloadPeer   **failedBy;       /* find the culprit once it passes */
+    struct dlWebSeed       *fromWeb;        /* fetched whole from this web seed */
 } activePiece;
+
+/* A web seed (webseed.h) and the run of pieces it is fetching. */
+typedef struct dlWebSeed {
+    TAILQ_ENTRY(dlWebSeed)  entries;
+    struct download        *owner;
+    webSeed                *seed;
+    uint8_t                 busy;           /* a fetch is in progress          */
+    uint8_t                 disabled;       /* given up on                     */
+    uint8_t                 worked;         /* has delivered data              */
+    uint32_t                failures;       /* fetches failed in a row         */
+    uint32_t                badPieces;      /* pieces that failed their check  */
+    uint64_t                retryAt;        /* uv_now() of the next attempt    */
+    uint32_t                first;          /* the run: first piece,           */
+    uint32_t                count;          /* ...how many,                    */
+    uint64_t                runStart;       /* ...from this torrent offset     */
+    uint32_t                runLength;      /* ...this many bytes              */
+    uint8_t                *buffer;
+    uint32_t                cursor;         /* where to look for the next run  */
+    uint64_t                bytes;          /* delivered in total              */
+} dlWebSeed;
 
 typedef struct downloadRequest {
     activePiece    *piece;
@@ -208,6 +244,9 @@ struct download {
     uint32_t                resumed;
     uint64_t                bytesReceived;
     uint64_t                bytesWasted;
+    TAILQ_HEAD(, dlWebSeed) webSeeds;
+    uint8_t                 httpUp;         /* we called httpInit()          */
+    uint64_t                bytesFromWeb;
     uint32_t                hashFailures;
     uint64_t                lastProgress;   /* uv_now() of the last block   */
     uint64_t                random;         /* xorshift state               */
@@ -352,7 +391,8 @@ static int pieceIsWanted(const download *dl, uint32_t index)
 {
     uint8_t state = dl->pieceState[index];
 
-    return state == DOWNLOAD_PIECE_NEEDED || state == DOWNLOAD_PIECE_ACTIVE;
+    return state == DOWNLOAD_PIECE_NEEDED || state == DOWNLOAD_PIECE_ACTIVE ||
+           state == DOWNLOAD_PIECE_WEB;
 }
 
 static uint32_t pieceLengthOf(const parserTorrent *torrent, uint32_t index)
@@ -1688,6 +1728,9 @@ static void verifyWork(uv_work_t *work)
 }
 
 static void pieceChecked(download *dl, activePiece *piece, int32_t result);
+static void webPieceFailed(download *dl, struct dlWebSeed *web, uint32_t index);
+static int webSeedsUsable(const download *dl);
+static void webStopAll(download *dl);
 
 static void verifyDone(uv_work_t *work, int status)
 {
@@ -1759,6 +1802,18 @@ static void pieceChecked(download *dl, activePiece *piece, int32_t result)
     /* Corrupt. Work out who sent it. */
     dl->hashFailures++;
     dl->bytesWasted += piece->piece.length;
+    if (piece->fromWeb != NULL) {
+        emit(dl, "piece %u failed its SHA-1 check; downloading it again", (unsigned)index);
+        webPieceFailed(dl, piece->fromWeb, index);
+        piece->fromWeb = NULL;
+        cancelPieceRequests(dl, piece);
+        pieceReset(&piece->piece);
+        memset(piece->requests, 0, piece->piece.blockCount);
+        piece->owner = NULL;
+        piece->exclusive = 1;
+        fillAll(dl);
+        return;
+    }
     for (block = 0; block < piece->piece.blockCount; block++) {
         int seen = 0;
 
@@ -2136,6 +2191,7 @@ static void finish(download *dl, int32_t status, const char *message)
     }
     dl->finished = 1;
     closeListeners(dl);
+    webStopAll(dl);
     TAILQ_FOREACH(peer, &dl->peers, entries) {
         peerClose(peer->connection);
         peer->connection = NULL;
@@ -2159,6 +2215,276 @@ static void finish(download *dl, int32_t status, const char *message)
     }
 }
 
+/* ------------------------------------------------------------------------ */
+/* Web seeds (BEP 19)                                                       */
+/* ------------------------------------------------------------------------ */
+
+static int webSeedsUsable(const download *dl)
+{
+    const dlWebSeed *web;
+
+    TAILQ_FOREACH(web, &dl->webSeeds, entries) {
+        if (!web->disabled) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void webAdd(download *dl, const char *url)
+{
+    dlWebSeed *web;
+    webSeed   *seed;
+    uint32_t   count = 0;
+
+    TAILQ_FOREACH(web, &dl->webSeeds, entries) {
+        if (strcmp(webSeedUrl(web->seed), url) == 0) {
+            return;                                 /* listed twice */
+        }
+        count++;
+    }
+    if (webSeedBegin(dl->context, dl->torrent, url, &seed) != WEBSEED_OK) {
+        emit(dl, "web seed %s: not usable (only http and https are)", url);
+        return;
+    }
+    web = allocate(dl, sizeof(*web));
+    if (web == NULL) {
+        webSeedEnd(seed);
+        return;
+    }
+    web->owner = dl;
+    web->seed = seed;
+    /* Each web seed starts in a different part of the torrent. */
+    web->cursor = (uint32_t)(((uint64_t)dl->torrent->pieceCount * (count % 4u)) / 4u);
+    TAILQ_INSERT_TAIL(&dl->webSeeds, web, entries);
+}
+
+/* Give the run's pieces back to the pool. */
+static void webReleaseRun(download *dl, dlWebSeed *web)
+{
+    uint32_t i;
+
+    for (i = 0; i < web->count; i++) {
+        if (dl->pieceState[web->first + i] == DOWNLOAD_PIECE_WEB) {
+            dl->pieceState[web->first + i] = DOWNLOAD_PIECE_NEEDED;
+            dl->neededCount++;
+        }
+    }
+    if (dl->neededCount > 0) {
+        dl->endgame = 0;
+    }
+    release(dl, web->buffer);
+    web->buffer = NULL;
+    web->count = 0;
+}
+
+/* Stop every fetch (the download is over). */
+static void webStopAll(download *dl)
+{
+    dlWebSeed *web;
+
+    TAILQ_FOREACH(web, &dl->webSeeds, entries) {
+        if (web->busy) {
+            webSeedCancel(web->seed);
+            web->busy = 0;
+        }
+        release(dl, web->buffer);
+        web->buffer = NULL;
+        web->count = 0;
+    }
+}
+
+static void webGiveUp(download *dl, dlWebSeed *web, const char *reason)
+{
+    web->disabled = 1;
+    emit(dl, "web seed %s: not used any more: %s", webSeedUrl(web->seed), reason);
+}
+
+/* A piece it sent failed the hash check. */
+static void webPieceFailed(download *dl, dlWebSeed *web, uint32_t index)
+{
+    emit(dl, "web seed %s: sent piece %u corrupt", webSeedUrl(web->seed), (unsigned)index);
+    if (++web->badPieces >= DOWNLOAD_WEB_MAX_BAD && !web->disabled) {
+        webGiveUp(dl, web, "it sent corrupt data");
+    }
+}
+
+/* A piece of a finished run: hand it to the usual check-and-write path. */
+static void webDeliver(download *dl, dlWebSeed *web, uint32_t index, const uint8_t *data)
+{
+    activePiece *piece = allocate(dl, sizeof(*piece));
+    messageFrame frame;
+    uint32_t     block;
+    int32_t      status = PIECE_OK;
+
+    if (piece == NULL || pieceBegin(&piece->piece, dl->context, dl->torrent, index) != PIECE_OK) {
+        release(dl, piece);
+        dl->pieceState[index] = DOWNLOAD_PIECE_NEEDED;      /* peers can have it */
+        dl->neededCount++;
+        return;
+    }
+    piece->requests = allocate(dl, piece->piece.blockCount);
+    piece->requestedAt = allocate(dl, sizeof(*piece->requestedAt) * piece->piece.blockCount);
+    piece->contributor = allocate(dl, sizeof(*piece->contributor) * piece->piece.blockCount);
+    if (piece->requests == NULL || piece->requestedAt == NULL || piece->contributor == NULL) {
+        freeActive(dl, piece);
+        dl->pieceState[index] = DOWNLOAD_PIECE_NEEDED;
+        dl->neededCount++;
+        return;
+    }
+    piece->fromWeb = web;
+    TAILQ_INSERT_TAIL(&dl->active, piece, entries);
+    dl->activeCount++;
+    dl->activeBytes += piece->piece.length;
+    dl->pieceState[index] = DOWNLOAD_PIECE_ACTIVE;
+    /* Each block as if requested and received (the assembler insists). */
+    for (block = 0; block < piece->piece.blockCount; block++) {
+        messageFrame request;
+
+        if (pieceNextRequest(&piece->piece, &request) != PIECE_OK) {
+            break;
+        }
+        memset(&frame, 0, sizeof(frame));
+        frame.id = MESSAGE_PIECE;
+        frame.index = index;
+        frame.begin = request.begin;
+        frame.payload = data + request.begin;
+        frame.payloadLength = request.length;
+        status = pieceReceive(&piece->piece, &frame);
+    }
+    if (status == PIECE_COMPLETE) {
+        completePiece(dl, piece);
+    }
+}
+
+static void webStart(download *dl, dlWebSeed *web);
+
+static void onWebFetched(void *privateArg, webSeed *seed, int32_t status, const char *message)
+{
+    dlWebSeed *web = privateArg;
+    download  *dl = web->owner;
+    uint64_t   now = uv_now(dl->loop);
+    uint32_t   i;
+
+    (void)seed;
+    web->busy = 0;
+    if (stopped(dl)) {
+        release(dl, web->buffer);
+        web->buffer = NULL;
+        return;
+    }
+    if (status != WEBSEED_OK) {
+        uint32_t wait = DOWNLOAD_WEB_RETRY_SECONDS << (web->failures < 6u ? web->failures : 6u);
+
+        webReleaseRun(dl, web);
+        web->failures++;
+        if (web->failures >= DOWNLOAD_WEB_MAX_FAILURES) {
+            webGiveUp(dl, web, message);
+        } else {
+            web->retryAt = now + (uint64_t)wait * 1000u;
+            emit(dl, "web seed %s; trying again in %u s", message, (unsigned)wait);
+        }
+        fillAll(dl);                                /* peers may take the pieces */
+        return;
+    }
+    if (!web->worked) {
+        web->worked = 1;
+        emit(dl, "web seed %s: downloading", webSeedUrl(web->seed));
+    }
+    web->failures = 0;
+    web->bytes += web->runLength;
+    dl->bytesFromWeb += web->runLength;
+    dl->bytesReceived += web->runLength;
+    dl->lastProgress = now;
+    for (i = 0; i < web->count && !stopped(dl); i++) {
+        uint32_t index = web->first + i;
+
+        webDeliver(dl, web, index,
+                   web->buffer + ((uint64_t)index * dl->torrent->pieceLength - web->runStart));
+    }
+    release(dl, web->buffer);
+    web->buffer = NULL;
+    web->count = 0;
+    if (!stopped(dl)) {
+        webStart(dl, web);                          /* straight on to the next run */
+    }
+}
+
+/* Choose a run of consecutive needed pieces and fetch it. */
+static void webStart(download *dl, dlWebSeed *web)
+{
+    uint32_t pieceCount = dl->torrent->pieceCount;
+    uint64_t maxBytes = DOWNLOAD_WEB_RUN_BYTES;
+    uint64_t length = 0;
+    uint32_t start;
+    uint32_t i;
+    int32_t  status;
+
+    if (stopped(dl) || !dl->ready || dl->store == NULL || dl->seeding || web->busy ||
+        web->disabled || dl->neededCount == 0 || uv_now(dl->loop) < web->retryAt ||
+        !rateAvailable(dl, &dl->downLimit)) {
+        return;
+    }
+    if (dl->downLimit.rate != 0 && dl->downLimit.rate < maxBytes) {
+        maxBytes = dl->downLimit.rate;              /* about a second's worth */
+    }
+    if ((uint64_t)dl->neededCount * dl->torrent->pieceLength < 4u * maxBytes ||
+        web->failures > 0) {
+        maxBytes = 1;           /* near the end, or after a failure: a piece at a time */
+    }
+    for (i = 0; i < pieceCount; i++) {
+        start = (web->cursor + i) % pieceCount;
+        if (dl->pieceState[start] == DOWNLOAD_PIECE_NEEDED) {
+            break;
+        }
+    }
+    if (i == pieceCount) {
+        return;
+    }
+    web->first = start;
+    web->count = 0;
+    while (start + web->count < pieceCount &&
+           dl->pieceState[start + web->count] == DOWNLOAD_PIECE_NEEDED &&
+           (web->count == 0 || length + pieceLengthOf(dl->torrent, start + web->count) <= maxBytes)) {
+        length += pieceLengthOf(dl->torrent, start + web->count);
+        dl->pieceState[start + web->count] = DOWNLOAD_PIECE_WEB;
+        dl->neededCount--;
+        web->count++;
+    }
+    web->runStart = (uint64_t)start * dl->torrent->pieceLength;
+    web->runLength = (uint32_t)length;
+    web->cursor = (start + web->count) % pieceCount;
+    if (dl->neededCount == 0 && !dl->endgame) {
+        dl->endgame = 1;
+        emit(dl, "endgame: every remaining piece is in progress");
+    }
+    web->buffer = dl->context->allocator.realloc(NULL, web->runLength);
+    if (web->buffer == NULL) {
+        webReleaseRun(dl, web);
+        return;
+    }
+    rateCharge(&dl->downLimit, web->runLength);
+    web->busy = 1;
+    status = webSeedFetch(web->seed, web->runStart, web->runLength, web->buffer,
+                          DOWNLOAD_WEB_TIMEOUT_SECONDS, onWebFetched, web);
+    if (status != WEBSEED_OK) {
+        web->busy = 0;
+        webReleaseRun(dl, web);
+    }
+}
+
+static void webStartAll(download *dl)
+{
+    dlWebSeed *web;
+
+    TAILQ_FOREACH(web, &dl->webSeeds, entries) {
+        if (stopped(dl)) {
+            return;
+        }
+        webStart(dl, web);
+    }
+}
+
 static void onTick(uv_timer_t *timer)
 {
     download     *dl = timer->data;
@@ -2172,6 +2498,10 @@ static void onTick(uv_timer_t *timer)
         return;
     }
     /* Every 100 ms: let through what the speed limits now allow. */
+    webStartAll(dl);
+    if (stopped(dl)) {
+        return;
+    }
     if (dl->upLimit.rate != 0) {
         pumpAll(dl);
     }
@@ -2199,7 +2529,7 @@ static void onTick(uv_timer_t *timer)
             known++;
         }
     }
-    if (known > 0 || dl->seeding) {
+    if (known > 0 || dl->seeding || webSeedsUsable(dl)) {
         dl->noPeersSince = 0;
     } else if (dl->noPeersSince == 0) {
         dl->noPeersSince = now;                     /* trackers or incoming may bring more */
@@ -2261,6 +2591,7 @@ static void releaseDownload(download *dl)
 {
     downloadPeer *peer;
     activePiece  *piece;
+    dlWebSeed    *web;
 
     while ((peer = TAILQ_FIRST(&dl->peers)) != NULL) {
         TAILQ_REMOVE(&dl->peers, peer, entries);
@@ -2274,6 +2605,15 @@ static void releaseDownload(download *dl)
     while ((piece = TAILQ_FIRST(&dl->active)) != NULL) {
         TAILQ_REMOVE(&dl->active, piece, entries);
         freeActive(dl, piece);
+    }
+    while ((web = TAILQ_FIRST(&dl->webSeeds)) != NULL) {
+        TAILQ_REMOVE(&dl->webSeeds, web, entries);
+        webSeedEnd(web->seed);
+        release(dl, web->buffer);
+        release(dl, web);
+    }
+    if (dl->httpUp) {
+        httpShutdown();
     }
     release(dl, dl->pieceState);
     release(dl, dl->availability);
@@ -2391,6 +2731,7 @@ int32_t downloadBegin(uv_loop_t *loop, parserContext *context, const parserTorre
     dl->uploadSlots = (options->uploadSlots != 0) ? options->uploadSlots
                                                   : DOWNLOAD_DEFAULT_UPLOAD_SLOTS;
     TAILQ_INIT(&dl->active);
+    TAILQ_INIT(&dl->webSeeds);
     TAILQ_INIT(&dl->peers);
 
     memcpy(dl->connectOptions.infoHash, torrent->infoHash, PARSER_SHA1_LENGTH);
@@ -2402,6 +2743,34 @@ int32_t downloadBegin(uv_loop_t *loop, parserContext *context, const parserTorre
     dl->info = options->infoDictionary;
     dl->infoLength = options->infoDictionaryLength;
     dl->blocklist = options->blocklist;
+    if (!options->noWebSeeds) {
+        const parserUrl *url;
+        httpConfig       defaults;
+        uint32_t         w;
+
+        TAILQ_FOREACH(url, &torrent->webSeeds, entries) {
+            webAdd(dl, url->url);
+        }
+        for (w = 0; w < options->webSeedCount; w++) {
+            if (options->webSeeds[w] != NULL) {
+                webAdd(dl, options->webSeeds[w]);
+            }
+        }
+        if (!TAILQ_EMPTY(&dl->webSeeds)) {
+            memset(&defaults, 0, sizeof(defaults));
+            dl->httpUp = (uint8_t)(httpInit(loop, context, (options->http != NULL)
+                                                               ? options->http : &defaults) ==
+                                   HTTP_OK);
+            if (!dl->httpUp) {
+                dlWebSeed *web;
+
+                TAILQ_FOREACH(web, &dl->webSeeds, entries) {
+                    web->disabled = 1;
+                }
+                emit(dl, "web seeds not used: HTTP could not be started");
+            }
+        }
+    }
     rateSet(&dl->downLimit, options->maxDownloadRate, uv_now(loop));
     rateSet(&dl->upLimit, options->maxUploadRate, uv_now(loop));
 
@@ -2566,6 +2935,15 @@ void downloadGetProgress(const download *dl, downloadProgress *progress)
     progress->listenPort = dl->listenPort;
     progress->peersFromPex = dl->pexLearned;
     progress->peersBlocked = dl->blocked;
+    progress->bytesFromWeb = dl->bytesFromWeb;
+    {
+        const dlWebSeed *web;
+
+        TAILQ_FOREACH(web, &dl->webSeeds, entries) {
+            progress->webSeeds += web->disabled ? 0u : 1u;
+            progress->webSeedsActive += web->busy ? 1u : 0u;
+        }
+    }
     progress->maxDownloadRate = dl->downLimit.rate;
     progress->maxUploadRate = dl->upLimit.rate;
     progress->checking = (uint8_t)(!dl->ready && !dl->finished);
@@ -2625,6 +3003,7 @@ void downloadEnd(download *dl)
     }
     dl->ended = 1;
     closeListeners(dl);
+    webStopAll(dl);
     TAILQ_FOREACH(peer, &dl->peers, entries) {
         peerClose(peer->connection);
         peer->connection = NULL;

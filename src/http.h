@@ -145,6 +145,12 @@ int32_t httpInit(uv_loop_t *loop, parserContext *context, const httpConfig *conf
 int32_t httpGet(const char *url, uint32_t timeoutSeconds, uint64_t maxResponse,
                 httpCallback callback, void *privateArg, httpRequest **request);
 
+/* httpGet() with extra request headers, each ending in CRLF (e.g.
+ * "Range: bytes=0-99\r\n"); NULL for none. */
+int32_t httpGetWithHeaders(const char *url, const char *extraHeaders, uint32_t timeoutSeconds,
+                           uint64_t maxResponse, httpCallback callback, void *privateArg,
+                           httpRequest **request);
+
 /* Stop a request that is still in progress; its callback will not run. */
 void httpCancel(httpRequest *request);
 

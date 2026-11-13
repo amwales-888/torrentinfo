@@ -21,6 +21,7 @@
  *   max_upload_rate    = 500k           0: no limit)
  *   encryption         = prefer         protocol encryption: prefer, require
  *                                       or off
+ *   web_seeds          = yes            download from web seeds (BEP 19)
  *
  * Booleans are yes/no, true/false, on/off or 1/0. Unknown keys and bad
  * values are reported (with their line number) and otherwise ignored, so an
@@ -59,6 +60,7 @@ extern "C" {
 #define CONFIG_SET_MAX_DOWNLOAD_RATE    0x100u
 #define CONFIG_SET_MAX_UPLOAD_RATE      0x200u
 #define CONFIG_SET_ENCRYPTION           0x400u
+#define CONFIG_SET_WEB_SEEDS            0x800u
 
 #define CONFIG_ENCRYPTION_OFF           0u      /* the values of 'encryption' */
 #define CONFIG_ENCRYPTION_PREFER        1u
@@ -77,6 +79,7 @@ typedef struct configSettings {
     uint64_t    maxDownloadRate;                /* bytes per second; 0: none */
     uint64_t    maxUploadRate;
     uint8_t     encryption;                     /* CONFIG_ENCRYPTION_*       */
+    uint8_t     webSeeds;
 } configSettings;
 
 /* Told about each line that is not understood. */

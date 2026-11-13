@@ -54,7 +54,11 @@ static const char configTemplate[] =
     "# Protocol encryption: \"prefer\" (try it, fall back to plain for peers\n"
     "# that do not support it), \"require\" (encrypted peers only) or \"off\".\n"
     "# Like -E.\n"
-    "#encryption = prefer\n";
+    "#encryption = prefer\n"
+    "\n"
+    "# Download from web seeds: HTTP servers that some torrents list as\n"
+    "# holding the files. \"no\" is like -W.\n"
+    "#web_seeds = yes\n";
 
 typedef struct lineContext {
     configWarningCallback warning;
@@ -326,14 +330,18 @@ static void parseSetting(lineContext *lc, configSettings *s, const char *key, si
         }
         s->listenPort = (uint16_t)number;
         s->set |= CONFIG_SET_LISTEN_PORT;
-    } else if (sameKey(key, keyLength, "port_forwarding") || sameKey(key, keyLength, "dht")) {
+    } else if (sameKey(key, keyLength, "port_forwarding") || sameKey(key, keyLength, "dht") ||
+               sameKey(key, keyLength, "web_seeds")) {
         uint8_t flag;
 
         if (!readBoolean(value, &flag)) {
             warn(lc, "%s: use yes or no, not %s", keyText, value);
             return;
         }
-        if (keyLength == 3u) {
+        if (keyLength == 9u) {
+            s->webSeeds = flag;
+            s->set |= CONFIG_SET_WEB_SEEDS;
+        } else if (keyLength == 3u) {
             s->dht = flag;
             s->set |= CONFIG_SET_DHT;
         } else {

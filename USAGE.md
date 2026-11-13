@@ -11,7 +11,7 @@ torrentinfo file.torrent | magnet-link
 torrentinfo -o new.torrent [-a url]... [-w url]... [-c text] [-n name] [-l size] [-p] file...
 torrentinfo -t [-T seconds] [-C certs.pem] [-I interface] file.torrent
 torrentinfo -P [-T seconds] [-C certs.pem] [-I interface] file.torrent
-torrentinfo -D [-S] [-L port] [-N] [-X] [-E mode] [-d speed] [-u speed] [-f list] [-F pattern]...
+torrentinfo -D [-S] [-L port] [-N] [-X] [-W] [-E mode] [-d speed] [-u speed] [-f list] [-F pattern]...
                [-O folder] [-i piece] [-T seconds] [-C certs.pem] [-I interface]
                file.torrent | magnet-link
 torrentinfo -V [-O folder] [-f list] [-F pattern]... file.torrent
@@ -161,6 +161,9 @@ The program works in one of six ways, chosen by the first option.
   shell does not expand it. With a magnet link, use `-F`: the file numbers
   are not known until the torrent has been fetched.
 
+`-W`
+: Do not download from web seeds (see "Web seeds" under NOTES).
+
 `-E mode`
 : Protocol encryption. `prefer` (the default) encrypts connections with
   peers that support it and falls back to an ordinary connection with
@@ -189,11 +192,15 @@ The program works in one of six ways, chosen by the first option.
 
 `-I interface`
 : Send all traffic through one network connection, for example a VPN. Give
-  the connection's name (such as `tun0` or `wg0` on Linux, or the name shown
-  in Windows' *Network Connections*, such as `"Ethernet 2"`), or its IP
-  address. Nothing is sent any other way; if that connection goes down, the
-  program cannot reach anyone until it comes back. Looking up a tracker's
-  name (DNS) still uses your normal connection.
+  the connection's name (such as `tun0` or `wg0` on Linux and FreeBSD, or
+  the name shown in Windows' *Network Connections*, such as
+  `"Ethernet 2"`), or its IP address. Nothing is sent any other way; if that
+  connection goes down, the program cannot reach anyone until it comes
+  back. Looking up a tracker's name (DNS) still uses your normal
+  connection. On FreeBSD the program can only use the connection's
+  address, and the system's routes decide which way traffic goes; it says
+  `[address only]` when it starts (see *BUILDING.md* for how to route
+  everything through a VPN there).
 
 `-C certs.pem`
 : For trackers whose address starts with `https://`, trust the
@@ -248,6 +255,17 @@ from people who connect to you, and from the peers themselves, which tell
 each other about the other peers they know ("peer exchange"). Private
 torrents only use their trackers.
 
+**Web seeds.** Some torrents (and magnet links, with `ws=`) list web
+servers that hold the same files, such as a project's download mirror or
+the Internet Archive. The program downloads from them as well as from
+peers: they never go away, so a torrent with few peers can still download
+at full speed. Everything they send is checked like data from peers. A
+server that fails is tried again after a while (15 seconds, then longer),
+and given up after five failures in a row or two corrupt pieces. The
+progress shows a `web seeds:` line with how many are in use and how much
+they have sent. `-d` limits peers and web seeds together. The torrent's
+listing shows its web seeds.
+
 **Encryption.** BitTorrent's protocol encryption scrambles the
 connection between you and a peer so that it does not look like
 BitTorrent. Some internet providers slow down or cut BitTorrent traffic
@@ -296,7 +314,8 @@ minute, so that newcomers get a chance.
 ## FILES
 
 The program keeps a little data between runs, in `~/.torrentinfo` on Linux
-and in `%APPDATA%\torrentinfo` on Windows (made when first needed):
+and FreeBSD and in `%APPDATA%\torrentinfo` on Windows (made when first
+needed):
 
 `config`
 : Your settings, one `name = value` per line. The first time the program
@@ -336,6 +355,9 @@ and in `%APPDATA%\torrentinfo` on Windows (made when first needed):
 
   `encryption = prefer`
   : Like `-E`: `prefer`, `require` or `off`.
+
+  `web_seeds = yes`
+  : `no` is like `-W`.
 
 `blocklist.txt`
 : Addresses never to talk to (see "Blocking addresses" under NOTES). Used
@@ -465,7 +487,8 @@ torrentinfo -o photos.torrent -n "Summer photos" -c "From the trip" \
 ```
 
 Block a range of addresses and download to your Downloads folder by
-default (Linux; on Windows edit the same files in `%APPDATA%\torrentinfo`):
+default (Linux and FreeBSD; on Windows edit the same files in
+`%APPDATA%\torrentinfo`):
 
 ```
 echo "198.51.100.0/24" >> ~/.torrentinfo/blocklist.txt
@@ -487,4 +510,5 @@ torrentinfo -D -S -O . photos.torrent
 
 ## SEE ALSO
 
-*BUILDING.md*, which explains how to build the program on Linux and Windows.
+*BUILDING.md*, which explains how to build the program on Linux, FreeBSD
+and Windows.

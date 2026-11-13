@@ -104,6 +104,7 @@
     <ClCompile Include="src\blocklist.c" />
     <ClCompile Include="src\config.c" />
     <ClCompile Include="src\crypto.c" />
+    <ClCompile Include="src\webseed.c" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="src\queue.h" />
@@ -128,6 +129,7 @@
     <ClInclude Include="src\blocklist.h" />
     <ClInclude Include="src\config.h" />
     <ClInclude Include="src\crypto.h" />
+    <ClInclude Include="src\webseed.h" />
   </ItemGroup>
   <ItemGroup>
     <None Include="vcpkg.json" />

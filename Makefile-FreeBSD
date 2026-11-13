@@ -1,0 +1,157 @@
+# Makefile-FreeBSD - torrentinfo for FreeBSD (the system's make)
+#
+#   make -f Makefile-FreeBSD             build the library and the torrentinfo program
+#   make -f Makefile-FreeBSD debug       build with AddressSanitizer and UBSan in
+#                                        build/freebsd/debug
+#   make -f Makefile-FreeBSD lib         build only libtorrentinfo.a
+#   make -f Makefile-FreeBSD install     install program, library and headers under
+#                                        ${PREFIX} (as root, or with DESTDIR)
+#   make -f Makefile-FreeBSD uninstall   remove what 'install' installed
+#   make -f Makefile-FreeBSD clean       remove the FreeBSD build output
+#                                        (build/freebsd); Linux or Windows builds
+#                                        elsewhere in build/ are left alone
+#
+# Needs:  pkg install libuv pkgconf
+# OpenSSL comes with the base system; to use the one from packages instead:
+#         make -f Makefile-FreeBSD OPENSSLBASE=/usr/local
+#
+# Variables you can override:  CC, CFLAGS, PREFIX, DESTDIR, LOCALBASE,
+# OPENSSLBASE, V=1 (show full commands). This file is written for FreeBSD's
+# make (bmake); GNU make users can use 'gmake -f Makefile-Linux' instead,
+# which works on FreeBSD too given the same packages.
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+PREFIX?=        /usr/local
+DESTDIR?=
+LOCALBASE?=     /usr/local
+OPENSSLBASE?=
+PKG_CONFIG?=    pkgconf
+
+BINDIR=         ${PREFIX}/bin
+LIBDIR=         ${PREFIX}/lib
+INCLUDEDIR=     ${PREFIX}/include/torrentinfo
+
+PROGRAM=        torrentinfo
+LIBRARY=        libtorrentinfo.a
+SRCDIR=         src
+
+LIB_SOURCES=    platform.c net.c extension.c parser.c encoder.c http.c udp.c \
+                tracker.c message.c peer.c piece.c storage.c download.c \
+                announce.c portmap.c magnet.c metadata.c dht.c blocklist.c \
+                config.c crypto.c webseed.c
+APP_SOURCES=    main.c
+HEADERS=        queue.h platform.h net.h extension.h parser.h encoder.h http.h \
+                udp.h tracker.h message.h peer.h piece.h storage.h download.h \
+                announce.h portmap.h magnet.h metadata.h dht.h blocklist.h \
+                config.h crypto.h webseed.h
+
+# Release builds in build/freebsd/release, debug builds in build/freebsd/debug.
+BUILDROOT=      build/freebsd
+.if make(debug)
+BUILD=          ${BUILDROOT}/debug
+.else
+BUILD=          ${BUILDROOT}/release
+.endif
+
+# libuv from packages: pkgconf if it knows it, else ${LOCALBASE}.
+.if !make(clean) && !make(uninstall)
+.  if !exists(${LOCALBASE}/include/uv.h)
+.    error libuv is not installed (${LOCALBASE}/include/uv.h is missing): pkg install libuv pkgconf
+.  endif
+UV_CFLAGS!=     ${PKG_CONFIG} --cflags libuv 2>/dev/null || echo -I${LOCALBASE}/include
+UV_LIBS!=       ${PKG_CONFIG} --libs libuv 2>/dev/null || echo -L${LOCALBASE}/lib -luv
+.endif
+
+.if !empty(OPENSSLBASE)
+SSL_CFLAGS=     -I${OPENSSLBASE}/include
+SSL_LIBS=       -L${OPENSSLBASE}/lib -Wl,-rpath,${OPENSSLBASE}/lib -lssl -lcrypto
+.else
+SSL_CFLAGS=
+SSL_LIBS=       -lssl -lcrypto
+.endif
+
+# No global _POSIX_C_SOURCE here (unlike Makefile-Linux): on FreeBSD it would
+# hide the BSD interfaces the system headers themselves rely on. The sources
+# that need it define it; FreeBSD's default environment has the rest.
+CFLAGS?=        -O2 -pipe
+CFLAGS+=        -g -std=c99 -Wall -Wextra -Wpedantic -Wshadow -Wconversion
+# OpenSSL first, so that OPENSSLBASE wins over any copy under LOCALBASE.
+CFLAGS+=        ${SSL_CFLAGS} ${UV_CFLAGS}
+LDLIBS+=        ${UV_LIBS} ${SSL_LIBS} -lpthread
+
+.if make(debug)
+CFLAGS+=        -O1 -fno-omit-frame-pointer -fsanitize=address,undefined
+LDFLAGS+=       -fsanitize=address,undefined
+.endif
+
+# Quiet output; 'make V=1' shows full commands.
+.if defined(V) && ${V} == "1"
+Q=
+.else
+Q=              @
+.endif
+
+# ---------------------------------------------------------------------------
+# Targets
+# ---------------------------------------------------------------------------
+
+.MAIN: all
+.PHONY: all debug lib install uninstall clean
+
+LIB_OBJECTS=
+APP_OBJECTS=
+DEPEND_HEADERS= ${HEADERS:S,^,${SRCDIR}/,}
+
+# One rule per source file; every object depends on every header, which is
+# simple and always right (a full build takes seconds).
+.for source in ${LIB_SOURCES}
+LIB_OBJECTS+=   ${BUILD}/${source:R}.o
+${BUILD}/${source:R}.o: ${SRCDIR}/${source} ${DEPEND_HEADERS}
+	@mkdir -p ${BUILD}
+	@echo "  CC     ${SRCDIR}/${source}"
+	${Q}${CC} ${CPPFLAGS} ${CFLAGS} -c -o ${.TARGET} ${SRCDIR}/${source}
+.endfor
+.for source in ${APP_SOURCES}
+APP_OBJECTS+=   ${BUILD}/${source:R}.o
+${BUILD}/${source:R}.o: ${SRCDIR}/${source} ${DEPEND_HEADERS}
+	@mkdir -p ${BUILD}
+	@echo "  CC     ${SRCDIR}/${source}"
+	${Q}${CC} ${CPPFLAGS} ${CFLAGS} -c -o ${.TARGET} ${SRCDIR}/${source}
+.endfor
+
+all: ${BUILD}/${PROGRAM}
+	${Q}ln -sf ${BUILD}/${PROGRAM} ${PROGRAM}
+
+debug: ${BUILD}/${PROGRAM}
+	@echo "Debug build: ${BUILD}/${PROGRAM}"
+
+lib: ${BUILD}/${LIBRARY}
+
+${BUILD}/${PROGRAM}: ${APP_OBJECTS} ${BUILD}/${LIBRARY}
+	@echo "  LINK   ${.TARGET}"
+	${Q}${CC} ${LDFLAGS} -o ${.TARGET} ${APP_OBJECTS} ${BUILD}/${LIBRARY} ${LDLIBS}
+
+${BUILD}/${LIBRARY}: ${LIB_OBJECTS}
+	@echo "  AR     ${.TARGET}"
+	${Q}rm -f ${.TARGET}
+	${Q}${AR} rcs ${.TARGET} ${LIB_OBJECTS}
+
+install: all
+	install -d ${DESTDIR}${BINDIR} ${DESTDIR}${LIBDIR} ${DESTDIR}${INCLUDEDIR}
+	install -m 755 ${BUILD}/${PROGRAM} ${DESTDIR}${BINDIR}/${PROGRAM}
+	install -m 644 ${BUILD}/${LIBRARY} ${DESTDIR}${LIBDIR}/${LIBRARY}
+	install -m 644 ${DEPEND_HEADERS} ${DESTDIR}${INCLUDEDIR}/
+
+uninstall:
+	rm -f ${DESTDIR}${BINDIR}/${PROGRAM}
+	rm -f ${DESTDIR}${LIBDIR}/${LIBRARY}
+	rm -f ${HEADERS:S,^,${DESTDIR}${INCLUDEDIR}/,}
+	-rmdir ${DESTDIR}${INCLUDEDIR} 2>/dev/null
+
+clean:
+	rm -rf ${BUILDROOT}
+	@if [ -L ${PROGRAM} ]; then rm -f ${PROGRAM}; fi
+	@rmdir build 2>/dev/null || true

@@ -1,12 +1,20 @@
 # Building torrentinfo
 
-The library and the `torrentinfo` program build on Linux and Windows from the
-same sources, which are all in `src/`; build output goes in `build/` (Linux in
-`build/linux`, Visual Studio in `build/x64` and `build/obj`, so both can sit
-side by side).
-Platform differences are confined to `src/platform.c` (file access),
-`src/net.c` (binding to a network interface), the certificate loading in
-`src/http.c`, and a few `#ifdef _WIN32` lines in `src/main.c`. Lists use the bundled 4.4BSD `queue.h` on every platform.
+The library and the `torrentinfo` program build on Linux, FreeBSD and Windows
+from the same sources, which are all in `src/`; build output goes in `build/`
+(Linux in `build/linux`, FreeBSD in `build/freebsd`, Visual Studio in
+`build/x64` and `build/obj`, so they can sit side by side, for example on a
+shared disk).
+
+There is one makefile per system: `Makefile-Linux` (GNU make) and
+`Makefile-FreeBSD` (FreeBSD's own make), so give it with `-f`. Visual
+Studio uses `torrentinfo.sln`.
+
+Platform differences are confined to `src/platform.c` (file access; tying
+sockets to a network interface; finding the default gateway; where the
+trusted CA certificates are), `src/net.c` (choosing the interface), the
+Windows certificate store in `src/http.c`, and a few `#ifdef _WIN32` lines
+in `src/main.c`. Lists use the bundled 4.4BSD `queue.h` on every platform.
 
 Dependencies: **libuv** and **OpenSSL 3**.
 
@@ -14,13 +22,73 @@ Dependencies: **libuv** and **OpenSSL 3**.
 
 ```sh
 sudo apt install build-essential pkg-config libuv1-dev libssl-dev   # Debian/Ubuntu
-make                 # build/linux/release/torrentinfo (and ./torrentinfo link)
-make debug           # AddressSanitizer + UBSan build in build/linux/debug
-make install PREFIX=$HOME/.local
+make -f Makefile-Linux            # build/linux/release/torrentinfo (and ./torrentinfo link)
+make -f Makefile-Linux debug      # AddressSanitizer + UBSan build in build/linux/debug
+make -f Makefile-Linux install PREFIX=$HOME/.local
+make -f Makefile-Linux clean      # removes build/linux only
 ```
 
 Usage is the same as on Windows (below), for example
 `./torrentinfo -D -O ~/Downloads file.torrent`.
+
+## FreeBSD (the system's make)
+
+FreeBSD 13 or later, on amd64 or arm64. OpenSSL 3 comes with the base
+system (FreeBSD 14 and later; on 13, add `pkg install openssl` and see
+below); libuv comes from packages. The compiler is the system's `cc`
+(clang).
+
+```sh
+pkg install libuv pkgconf                 # as root
+make -f Makefile-FreeBSD                  # build/freebsd/release/torrentinfo (and ./torrentinfo link)
+make -f Makefile-FreeBSD debug            # AddressSanitizer + UBSan build in build/freebsd/debug
+make -f Makefile-FreeBSD install          # as root: /usr/local/bin, /usr/local/lib, /usr/local/include/torrentinfo
+make -f Makefile-FreeBSD install PREFIX=$HOME/.local
+make -f Makefile-FreeBSD clean            # removes build/freebsd only
+```
+
+Variables: `CC`, `CFLAGS`, `PREFIX`, `DESTDIR`, `V=1` (show the full
+commands), `LOCALBASE` (where packages are, `/usr/local`), and
+`OPENSSLBASE` to build against OpenSSL from packages instead of the base
+system (`make -f Makefile-FreeBSD OPENSSLBASE=/usr/local`; the program then
+finds those libraries at run time through an rpath). Makefile-FreeBSD is
+written for FreeBSD's make (bmake); if you prefer GNU make,
+`pkg install gmake` and `gmake -f Makefile-Linux` also works, as that file
+only needs pkg-config to find libuv and OpenSSL.
+
+Unlike Makefile-Linux, Makefile-FreeBSD does not define `_POSIX_C_SOURCE`
+for every file: on FreeBSD that hides the BSD interfaces that the system's
+own network headers rely on. The sources that need it define it
+themselves.
+
+What is different on FreeBSD:
+
+- **Choosing a network interface (`-I`)** binds each socket to the
+  interface's address, but FreeBSD has no option to tie a socket to the
+  interface itself (Linux's `SO_BINDTODEVICE`), so the routing table decides
+  which way packets leave. The program says so at start-up (`[address
+  only]` in the `Interface:` line). For a VPN, either give it the default
+  route, or run the program in a routing table of its own: create one
+  (`net.fibs` in `/boot/loader.conf`), route it through the VPN, and start
+  the program with `setfib 1 torrentinfo -D ...`.
+- **The default gateway** (for NAT-PMP port forwarding) is read from the
+  kernel's routing table with `sysctl` (`NET_RT_FLAGS`, `RTF_GATEWAY`)
+  rather than Linux's `/proc/net/route`; with `-I`, only a default route
+  through that interface is used.
+- **Trusted certificates for HTTPS** are looked for in `/etc/ssl/cert.pem`
+  (the base system, kept by `certctl`), `/usr/local/share/certs/ca-root-nss.crt`
+  (`pkg install ca_root_nss`), then `/usr/local/etc/ssl/cert.pem` and
+  `/usr/local/openssl/cert.pem` (OpenSSL from packages), after
+  `SSL_CERT_FILE` and OpenSSL's own default.
+- **Data directory:** `~/.torrentinfo`, as on Linux.
+- Everything else (files, sockets through libuv's kqueue backend,
+  threads) needs nothing special.
+
+The sources were compiled against FreeBSD's own headers, from its source
+tree, for amd64 and arm64 (with `-Wall -Wextra -Wpedantic -Wconversion
+-Wshadow`, no warnings), and Makefile-FreeBSD was run with bmake and
+FreeBSD's `sys.mk`; the program has not yet been run on a FreeBSD
+machine.
 
 ## Windows (Visual Studio 2026)
 
@@ -87,7 +155,8 @@ project's *Properties > Debugging > Command Arguments*.
   Connections* such as `Ethernet 2` on Windows, in quotes if it has spaces)
   or one of its IP addresses. Each socket is bound to the interface's
   address and tied to the interface itself (`SO_BINDTODEVICE` on Linux,
-  `IP_UNICAST_IF` on Windows), so nothing leaves another way; if the
+  `IP_UNICAST_IF` on Windows; FreeBSD cannot, see above), so nothing leaves
+  another way; if the
   interface goes down, connections fail rather than falling back. Peers of
   an address family the interface lacks (IPv6 on an IPv4-only VPN) are
   skipped. DNS lookups for tracker host names still go through the system's
@@ -147,7 +216,7 @@ project's *Properties > Debugging > Command Arguments*.
   transfer).
 
 - **Data directory.** Lasting data is kept in `~/.torrentinfo` on Linux and
-  `%APPDATA%\torrentinfo` on Windows (created when first needed): `dht.dat`,
+  FreeBSD and `%APPDATA%\torrentinfo` on Windows (created when first needed): `dht.dat`,
   the DHT routing table, `torrents\`, the torrents fetched for magnet
   links, `config`, the settings, and `blocklist.txt`.
 
@@ -173,6 +242,27 @@ project's *Properties > Debugging > Command Arguments*.
   peers from every source, incoming connections, DHT nodes (neither stored,
   asked nor answered) and incoming DHT messages; the refusals are counted
   in `peersBlocked` / `dhtStatus.blocked`.
+
+- **Web seeds (webseed.c, download.c; BEP 19, `-W`, `web_seeds`).**
+  `webSeedFetch()` reads any byte range of the torrent's data from one
+  server into a buffer: one `Range` request per file the range touches
+  (`httpGetWithHeaders()`), padding files as zeros, URLs built as BEP 19
+  says (single-file: the URL, plus the name if it ends in `/`; multi-file:
+  URL/name/path with each component percent-encoded), up to 5 redirects
+  followed (Location may be absolute, `//host...`, `/path` or relative),
+  206 replies checked against Content-Range and length, and a 200 reply
+  (no range support) accepted for files up to 16 MiB. In download.c each
+  web seed takes a run of consecutive NEEDED pieces (up to 4 MiB; one
+  piece near the end, after a failure, or about one second's worth under
+  `-d`), marks them `DOWNLOAD_PIECE_WEB` so peers leave them alone, and
+  on success hands each piece to the ordinary check-and-write path as an
+  `activePiece` with `fromWeb` set. A failed fetch returns the pieces to
+  the pool and retries after 15 s, doubling, up to 5 failures in a row;
+  two corrupt pieces and the seed is dropped. Web seeds count as a source
+  for the "no peers left" check. The download starts its own user of the
+  http module (it is reference-counted), with the CA file and interface
+  from `downloadOptions.http`. Tested with a local server in normal,
+  redirecting, no-range, short-reply, corrupting and 404 modes.
 
 - **Protocol encryption (crypto.c, peer.c; `-E`, `encryption`).** Message
   Stream Encryption: Diffie-Hellman over the 768-bit MSE prime (generator 2,
@@ -242,7 +332,7 @@ project's *Properties > Debugging > Command Arguments*.
   uploaded, downloaded and left. New peers from re-announces join the
   download. A tracker that fails is retried after 1, 2, 4... minutes (up
   to 30). When the download completes the trackers are told "completed";
-  on Ctrl-C (or SIGTERM on Linux) they are told "stopped" (waiting at most
+  on Ctrl-C (or SIGTERM on Linux and FreeBSD) they are told "stopped" (waiting at most
   5 seconds; press Ctrl-C again not to wait).
 
 - **Uploading.** Peers are sent our bitfield and a "have" for each new
@@ -265,7 +355,10 @@ project's *Properties > Debugging > Command Arguments*.
   (discovery by multicast, then the router's control URL; a router that only
   allows permanent mappings is asked for one). The result is printed, the
   mapping is renewed before it expires, and it is removed when the program
-  ends. With `-I`, the gateway of that interface is used (some VPN services
+  ends. The gateway comes from the system's routing table
+  (`platformDefaultGateway()`: `/proc/net/route` on Linux, the routing
+  sysctl on FreeBSD, `GetIpForwardTable()` on Windows). With `-I`, the
+  gateway of that interface is used (some VPN services
   support NAT-PMP). `-N` turns this off. Many routers have UPnP switched off
   by default; then forward the port by hand in the router's settings.
 

@@ -1,15 +1,21 @@
 /*
- * platform.c - File access for Linux (POSIX) and Windows (Win32).
+ * platform.c - What differs between Linux, FreeBSD (POSIX) and Windows (Win32).
  *
  * See platform.h. Errors are converted to libuv error codes with
- * uv_translate_sys_error(), which takes errno on Linux and GetLastError()
- * values on Windows.
+ * uv_translate_sys_error(), which takes errno on Linux and FreeBSD and
+ * GetLastError() values on Windows.
  */
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(__FreeBSD__)
+/* On FreeBSD this would hide the routing sysctl and other BSD interfaces;
+ * its default environment already has everything POSIX. */
 #define _POSIX_C_SOURCE 200809L
+#define _DEFAULT_SOURCE             /* glibc: SO_BINDTODEVICE */
 #define _FILE_OFFSET_BITS 64        /* 64-bit off_t on 32-bit Linux too */
 #endif
 
+#ifndef _WIN32
+#include <sys/types.h>              /* first, for the BSD network headers */
+#endif
 #include <stdio.h>
 #include <string.h>
 
@@ -18,6 +24,13 @@
 #include "platform.h"
 
 #ifdef _WIN32
+#include <iphlpapi.h>               /* GetIpForwardTable() */
+#ifndef IP_UNICAST_IF
+#define IP_UNICAST_IF           31
+#endif
+#ifndef IPV6_UNICAST_IF
+#define IPV6_UNICAST_IF         31
+#endif
 /* ======================================================================== */
 /* Windows                                                                  */
 /* ======================================================================== */
@@ -227,15 +240,93 @@ int32_t platformFileWriteAt(platformFile *file, uint64_t offset, const void *buf
     return 0;
 }
 
+/* --- Networking ---------------------------------------------------------- */
+
+int32_t platformInterfaceTieCheck(const char *name, uint32_t index)
+{
+    (void)name;
+    return (index != 0) ? 0 : UV_ENODEV;
+}
+
+int32_t platformInterfaceTie(uv_os_sock_t sock, int family, const char *name, uint32_t index)
+{
+    DWORD value;
+    int   result;
+
+    (void)name;
+    if (family == AF_INET) {
+        value = htonl((u_long)index);               /* network byte order for IPv4 */
+        result = setsockopt(sock, IPPROTO_IP, IP_UNICAST_IF, (const char *)&value,
+                            (int)sizeof(value));
+    } else {
+        value = (DWORD)index;                       /* host byte order for IPv6 */
+        result = setsockopt(sock, IPPROTO_IPV6, IPV6_UNICAST_IF, (const char *)&value,
+                            (int)sizeof(value));
+    }
+    return (result == 0) ? 0 : (int32_t)uv_translate_sys_error(WSAGetLastError());
+}
+
+int32_t platformDefaultGateway(const char *name, uint32_t index, void *scratch, size_t *size,
+                               uint32_t *gateway)
+{
+    MIB_IPFORWARDTABLE *table = scratch;
+    ULONG               length = (ULONG)((*size > 0xFFFFFFFFu) ? 0xFFFFFFFFu : *size);
+    DWORD               bestMetric = (DWORD)-1;
+    DWORD               result;
+    DWORD               i;
+    int                 found = 0;
+
+    (void)name;
+    result = GetIpForwardTable((scratch != NULL) ? table : NULL, &length, TRUE);
+    if (result == ERROR_INSUFFICIENT_BUFFER || scratch == NULL) {
+        *size = (size_t)length + 4096u;             /* room for a route added meanwhile */
+        return UV_ENOBUFS;
+    }
+    if (result != NO_ERROR) {
+        return (int32_t)uv_translate_sys_error((int)result);
+    }
+    for (i = 0; i < table->dwNumEntries; i++) {
+        const MIB_IPFORWARDROW *row = &table->table[i];
+
+        if (row->dwForwardDest != 0 || row->dwForwardMask != 0 || row->dwForwardNextHop == 0) {
+            continue;
+        }
+        if (index != 0 && row->dwForwardIfIndex != index) {
+            continue;
+        }
+        if (!found || row->dwForwardMetric1 < bestMetric) {
+            bestMetric = row->dwForwardMetric1;
+            *gateway = row->dwForwardNextHop;       /* network byte order */
+            found = 1;
+        }
+    }
+    return found ? 0 : UV_ENOENT;
+}
+
+const char *const *platformCertificateBundles(void)
+{
+    static const char *const none[] = { NULL };     /* the certificate store instead */
+
+    return none;
+}
+
 #else
 /* ======================================================================== */
-/* Linux (POSIX)                                                            */
+/* Linux and FreeBSD (POSIX)                                                */
 /* ======================================================================== */
 
 #include <errno.h>
 #include <fcntl.h>
+#include <net/if.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#if defined(__FreeBSD__)
+#include <stddef.h>
+#include <sys/sysctl.h>
+#include <net/route.h>
+#endif
 
 static int32_t lastError(void)
 {
@@ -362,6 +453,240 @@ int32_t platformFileOpenReadWrite(const char *path, platformFile *file)
     }
     file->descriptor = open(path, O_RDWR | O_CREAT | O_CLOEXEC, 0644);
     return (file->descriptor < 0) ? lastError() : 0;
+}
+
+/* --- Networking ---------------------------------------------------------- */
+
+#if defined(__linux__)
+
+int32_t platformInterfaceTieCheck(const char *name, uint32_t index)
+{
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    int result;
+    int error;
+
+    (void)index;
+    if (fd < 0) {
+        fd = socket(AF_INET6, SOCK_DGRAM, 0);
+    }
+    if (fd < 0) {
+        return 0;                       /* cannot tell; the real sockets will say */
+    }
+    result = setsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE, name, (socklen_t)strlen(name));
+    error = errno;
+    close(fd);
+    return (result != 0 && (error == EPERM || error == EACCES)) ? UV_EPERM : 0;
+}
+
+int32_t platformInterfaceTie(uv_os_sock_t sock, int family, const char *name, uint32_t index)
+{
+    (void)family;
+    (void)index;
+    if (setsockopt(sock, SOL_SOCKET, SO_BINDTODEVICE, name, (socklen_t)strlen(name)) != 0) {
+        return lastError();
+    }
+    return 0;
+}
+
+int32_t platformDefaultGateway(const char *name, uint32_t index, void *scratch, size_t *size,
+                               uint32_t *gateway)
+{
+    FILE         *file = fopen("/proc/net/route", "r");
+    char          line[256];
+    unsigned long bestMetric = (unsigned long)-1;
+    int           found = 0;
+
+    (void)index;
+    (void)scratch;
+    (void)size;
+    if (file == NULL) {
+        return lastError();
+    }
+    while (fgets(line, sizeof(line), file) != NULL) {
+        char          interfaceName[64];
+        unsigned long destination;
+        unsigned long via;
+        unsigned long flags;
+        unsigned long metric;
+        unsigned long mask;
+
+        if (sscanf(line, "%63s %lx %lx %lx %*d %*d %lu %lx", interfaceName, &destination, &via,
+                   &flags, &metric, &mask) != 6) {
+            continue;                               /* the header line */
+        }
+        if (destination != 0 || mask != 0 || !(flags & 0x2u) || via == 0) {
+            continue;                               /* not a default route via a router */
+        }
+        if (name != NULL && name[0] != '\0' && strcmp(interfaceName, name) != 0) {
+            continue;
+        }
+        if (!found || metric < bestMetric) {
+            bestMetric = metric;
+            *gateway = (uint32_t)via;               /* already network byte order */
+            found = 1;
+        }
+    }
+    fclose(file);
+    return found ? 0 : UV_ENOENT;
+}
+
+#else   /* FreeBSD and other POSIX systems: no per-interface socket option */
+
+int32_t platformInterfaceTieCheck(const char *name, uint32_t index)
+{
+    (void)name;
+    (void)index;
+    return UV_ENOTSUP;
+}
+
+int32_t platformInterfaceTie(uv_os_sock_t sock, int family, const char *name, uint32_t index)
+{
+    (void)sock;
+    (void)family;
+    (void)name;
+    (void)index;
+    return UV_ENOTSUP;
+}
+
+#if defined(__FreeBSD__)
+
+/* Is the IPv4 netmask in the routing message all zeros (a default route)?
+ * It may be cut short (sa_len), the missing bytes being zero. */
+static int zeroMask(const struct sockaddr *mask)
+{
+    const uint8_t *bytes = (const uint8_t *)mask;
+    size_t         start = offsetof(struct sockaddr_in, sin_addr);
+    size_t         i;
+
+    if (mask == NULL) {
+        return 1;
+    }
+    for (i = start; i < start + 4u && i < mask->sa_len; i++) {
+        if (bytes[i] != 0) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+int32_t platformDefaultGateway(const char *name, uint32_t index, void *scratch, size_t *size,
+                               uint32_t *gateway)
+{
+    int                       mib[6] = { CTL_NET, PF_ROUTE, 0, AF_INET, NET_RT_FLAGS,
+                                         RTF_GATEWAY };
+    size_t                    needed = 0;
+    size_t                    length;
+    const char               *at;
+    const char               *end;
+    unsigned int              wantIndex = 0;
+
+    (void)index;
+    if (name != NULL && name[0] != '\0') {
+        wantIndex = if_nametoindex(name);
+        if (wantIndex == 0) {
+            return UV_ENODEV;
+        }
+    }
+    if (sysctl(mib, 6, NULL, &needed, NULL, 0) != 0) {
+        return lastError();
+    }
+    needed += needed / 4u + 1024u;                  /* routes may be added meanwhile */
+    if (scratch == NULL || *size < needed) {
+        *size = needed;
+        return UV_ENOBUFS;
+    }
+    length = *size;
+    if (sysctl(mib, 6, scratch, &length, NULL, 0) != 0) {
+        if (errno == ENOMEM) {
+            *size *= 2u;
+            return UV_ENOBUFS;
+        }
+        return lastError();
+    }
+    at = scratch;
+    end = at + length;
+    while (at + sizeof(struct rt_msghdr) <= end) {
+        const struct rt_msghdr *message = (const struct rt_msghdr *)(const void *)at;
+        const struct sockaddr  *address = (const struct sockaddr *)(const void *)(message + 1);
+        const struct sockaddr  *destination = NULL;
+        const struct sockaddr  *via = NULL;
+        const struct sockaddr  *mask = NULL;
+        int                     bit;
+
+        if (message->rtm_msglen == 0 || at + message->rtm_msglen > end) {
+            break;
+        }
+        at += message->rtm_msglen;
+        if (message->rtm_version != RTM_VERSION || !(message->rtm_flags & RTF_UP) ||
+            !(message->rtm_flags & RTF_GATEWAY) ||
+            (wantIndex != 0 && message->rtm_index != wantIndex)) {
+            continue;
+        }
+        /* The addresses follow the header, in RTAX_ order, each padded. */
+        for (bit = 0; bit < RTAX_MAX; bit++) {
+            if (!(message->rtm_addrs & (1 << bit))) {
+                continue;
+            }
+            if ((const char *)address >= at) {
+                break;
+            }
+            if (bit == RTAX_DST) {
+                destination = address;
+            } else if (bit == RTAX_GATEWAY) {
+                via = address;
+            } else if (bit == RTAX_NETMASK) {
+                mask = address;
+            }
+            address = (const struct sockaddr *)(const void *)((const char *)address +
+                                                               SA_SIZE(address));
+        }
+        if (destination == NULL || via == NULL || destination->sa_family != AF_INET ||
+            via->sa_family != AF_INET ||
+            ((const struct sockaddr_in *)(const void *)destination)->sin_addr.s_addr != 0 ||
+            !zeroMask(mask)) {
+            continue;
+        }
+        *gateway = ((const struct sockaddr_in *)(const void *)via)->sin_addr.s_addr;
+        return 0;
+    }
+    return UV_ENOENT;
+}
+
+#else
+
+int32_t platformDefaultGateway(const char *name, uint32_t index, void *scratch, size_t *size,
+                               uint32_t *gateway)
+{
+    (void)name;
+    (void)index;
+    (void)scratch;
+    (void)size;
+    (void)gateway;
+    return UV_ENOTSUP;
+}
+
+#endif
+#endif  /* networking */
+
+const char *const *platformCertificateBundles(void)
+{
+    static const char *const bundles[] = {
+#if defined(__FreeBSD__)
+        "/etc/ssl/cert.pem",                                    /* base system (certctl) */
+        "/usr/local/share/certs/ca-root-nss.crt",               /* ca_root_nss package   */
+        "/usr/local/etc/ssl/cert.pem",                          /* ports OpenSSL         */
+        "/usr/local/openssl/cert.pem",
+#else
+        "/etc/ssl/certs/ca-certificates.crt",                   /* Debian, Ubuntu, Arch */
+        "/etc/pki/tls/certs/ca-bundle.crt",                     /* Fedora, RHEL       */
+        "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem",    /* RHEL 7+            */
+        "/etc/ssl/ca-bundle.pem",                               /* openSUSE           */
+        "/etc/ssl/cert.pem",                                    /* Alpine, macOS      */
+#endif
+        NULL
+    };
+
+    return bundles;
 }
 
 int32_t platformFileSetSize(platformFile *file, uint64_t size)

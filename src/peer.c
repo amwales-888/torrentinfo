@@ -101,6 +101,7 @@ struct peerConnection {
     uint8_t                *have;           /* bitfield of pieceCount bits     */
     uint32_t                haveCount;
     uint32_t                messagesReceived;
+    uint32_t                coreMessages;   /* those the bitfield must precede */
     uint64_t                bytesReceived;
     uint64_t                bytesSent;
     uint64_t                lastReceive;    /* uv_now() milliseconds           */
@@ -381,7 +382,7 @@ static int32_t applyMessage(peerConnection *connection, const messageFrame *mess
         }
         break;
     case MESSAGE_BITFIELD:
-        if (connection->messagesReceived > 0) {
+        if (connection->coreMessages > 0) {
             setError(connection, "bitfield sent after other messages");
             return PEER_EPROTO;
         }
@@ -413,6 +414,13 @@ static int32_t applyMessage(peerConnection *connection, const messageFrame *mess
         break;
     default:                                        /* port, extension messages */
         break;
+    }
+    /* The bitfield must come before the other core messages (BEP 3), but
+     * the extended handshake (BEP 10), a DHT port message (BEP 5) or a
+     * keep-alive may come before it: clients send their extended
+     * handshake straight after the handshake. */
+    if (message->id != 20u && message->id != MESSAGE_PORT && message->id != MESSAGE_KEEP_ALIVE) {
+        connection->coreMessages++;
     }
     connection->messagesReceived++;
     return PEER_OK;

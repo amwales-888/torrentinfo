@@ -28,6 +28,7 @@
 #include <string.h>
 
 #include "http.h"   /* httpUrlParse() */
+#include "net.h"
 #include "udp.h"
 
 #define UDP_STATE_MAGIC         0x55445054u     /* "UDPT" */
@@ -86,6 +87,7 @@ static struct {
     uint32_t              users;            /* udpInit() calls outstanding */
     uint32_t              magic;
     struct udpRequestList requests;
+    netBinding                binding;      /* interface to use, if active  */
 } udpState;
 
 /* ======================================================================== */
@@ -421,7 +423,7 @@ static void start(udpRequest *request, const struct sockaddr *address)
 {
     int result;
 
-    result = uv_udp_init(udpState.loop, &request->udp);
+    result = netUdpInit(udpState.loop, &request->udp, &udpState.binding, address->sa_family);
     if (result < 0) {
         setError(request, "socket failed: %s", uv_strerror(result));
         finish(request, UDP_ERROR);
@@ -432,7 +434,10 @@ static void start(udpRequest *request, const struct sockaddr *address)
     request->pending++;
     request->ipv6 = (uint8_t)(address->sa_family == AF_INET6);
 
-    result = uv_udp_connect(&request->udp, address);
+    result = netUdpBind(&request->udp, &udpState.binding, address->sa_family);
+    if (result == 0) {
+        result = uv_udp_connect(&request->udp, address);
+    }
     if (result == 0) {
         result = uv_udp_recv_start(&request->udp, onAlloc, onRead);
     }
@@ -494,7 +499,7 @@ static void onResolved(uv_getaddrinfo_t *resolver, int status, struct addrinfo *
 /* Public API                                                               */
 /* ======================================================================== */
 
-int32_t udpInit(uv_loop_t *loop, parserContext *context)
+int32_t udpInit(uv_loop_t *loop, parserContext *context, const netBinding *binding)
 {
     if (loop == NULL || context == NULL || context->magic != PARSER_CONTEXT_MAGIC) {
         return UDP_EINVAL;
@@ -508,6 +513,11 @@ int32_t udpInit(uv_loop_t *loop, parserContext *context)
     }
     udpState.loop = loop;
     udpState.context = context;
+    if (binding != NULL) {
+        udpState.binding = *binding;
+    } else {
+        memset(&udpState.binding, 0, sizeof(udpState.binding));
+    }
     udpState.users = 1;
     TAILQ_INIT(&udpState.requests);
     udpState.magic = UDP_STATE_MAGIC;
@@ -567,7 +577,7 @@ int32_t udpAnnounce(const char *url, const udpAnnounceParams *params,
     }
 
     memset(&hints, 0, sizeof(hints));
-    hints.ai_family = AF_UNSPEC;
+    hints.ai_family = netResolveFamily(&udpState.binding);    /* only what we can reach */
     hints.ai_socktype = SOCK_DGRAM;
     snprintf(portText, sizeof(portText), "%u", (unsigned)parts.port);
 

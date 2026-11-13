@@ -706,11 +706,12 @@ int32_t trackerInit(uv_loop_t *loop, parserContext *context, const trackerConfig
     /* HTTP and HTTPS trackers go through the http module. */
     httpConfiguration.caFile = config->caFile;
     httpConfiguration.userAgent = NULL;
+    httpConfiguration.binding = config->binding;
     result = httpInit(loop, context, &httpConfiguration);
     if (result != HTTP_OK) {
         return fromHttpStatus(result);
     }
-    result = udpInit(loop, context);
+    result = udpInit(loop, context, config->binding);
     if (result != UDP_OK) {
         httpShutdown();
         return fromUdpStatus(result);

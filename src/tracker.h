@@ -55,6 +55,7 @@
 #include <uv.h>
 
 #include "http.h"
+#include "net.h"
 #include "parser.h"
 
 #ifdef __cplusplus
@@ -105,6 +106,8 @@ typedef struct trackerConfig {
     const char *caFile;     /* PEM file of trusted CA certificates for HTTPS,
                                or NULL for the system's CA bundle. Loaded into
                                memory during trackerInit().                  */
+    const netBinding *binding;  /* send announces through this interface
+                                   (net.h; copied), or NULL for any         */
 } trackerConfig;
 
 /* A peer returned by a tracker. */

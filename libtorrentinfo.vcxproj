@@ -84,6 +84,7 @@
 
   <ItemGroup>
     <ClCompile Include="src\platform.c" />
+    <ClCompile Include="src\net.c" />
     <ClCompile Include="src\parser.c" />
     <ClCompile Include="src\encoder.c" />
     <ClCompile Include="src\http.c" />
@@ -98,6 +99,7 @@
   <ItemGroup>
     <ClInclude Include="src\queue.h" />
     <ClInclude Include="src\platform.h" />
+    <ClInclude Include="src\net.h" />
     <ClInclude Include="src\parser.h" />
     <ClInclude Include="src\encoder.h" />
     <ClInclude Include="src\http.h" />

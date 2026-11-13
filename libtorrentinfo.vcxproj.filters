@@ -17,6 +17,9 @@
     <ClCompile Include="src\platform.c">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="src\net.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="src\parser.c">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -53,6 +56,9 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="src\platform.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\net.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="src\parser.h">

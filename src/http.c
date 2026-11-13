@@ -30,6 +30,7 @@
  * headers, which then undefine the wincrypt macros that clash with OpenSSL
  * names (X509_NAME and others). */
 #include "http.h"
+#include "net.h"
 #ifdef _WIN32
 #include <wincrypt.h>
 #endif
@@ -103,6 +104,7 @@ static struct {
     parserContext         *context;
     SSL_CTX               *tls;
     char                   userAgent[HTTP_USER_AGENT_LENGTH];
+    netBinding             binding;         /* interface to use, if active */
     uint32_t               users;           /* httpInit() calls outstanding */
     uint32_t               magic;
     struct httpRequestList requests;
@@ -690,6 +692,7 @@ static void onTcpConnect(uv_connect_t *connect, int status)
 static void tcpConnectNext(httpRequest *request)
 {
     int result;
+    int family;
 
     if (request->addressIndex >= request->addressCount) {
         setError(request, "could not connect to %s: %s", request->host,
@@ -698,7 +701,8 @@ static void tcpConnectNext(httpRequest *request)
         return;
     }
 
-    result = uv_tcp_init(httpState.loop, &request->tcp);
+    family = request->addresses[request->addressIndex].ss_family;
+    result = netTcpInit(httpState.loop, &request->tcp, &httpState.binding, family);
     if (result < 0) {
         setError(request, "socket failed: %s", uv_strerror(result));
         finish(request, HTTP_ERROR);
@@ -709,9 +713,12 @@ static void tcpConnectNext(httpRequest *request)
     request->pending++;
 
     request->connectRequest.data = request;
-    result = uv_tcp_connect(&request->connectRequest, &request->tcp,
-                            (const struct sockaddr *)&request->addresses[request->addressIndex],
-                            onTcpConnect);
+    result = netTcpBind(&request->tcp, &httpState.binding, family);
+    if (result == 0) {
+        result = uv_tcp_connect(&request->connectRequest, &request->tcp,
+                                (const struct sockaddr *)&request->addresses[request->addressIndex],
+                                onTcpConnect);
+    }
     if (result < 0) {
         request->lastError = uv_strerror(result);
         request->addressIndex++;
@@ -1018,6 +1025,11 @@ int32_t httpInit(uv_loop_t *loop, parserContext *context, const httpConfig *conf
     ERR_clear_error();
 
     snprintf(httpState.userAgent, sizeof(httpState.userAgent), "%s", userAgent);
+    if (config->binding != NULL) {
+        httpState.binding = *config->binding;
+    } else {
+        memset(&httpState.binding, 0, sizeof(httpState.binding));
+    }
     httpState.loop = loop;
     httpState.context = context;
     httpState.users = 1;
@@ -1077,7 +1089,7 @@ int32_t httpGet(const char *url, uint32_t timeoutSeconds, uint64_t maxResponse,
     }
 
     memset(&hints, 0, sizeof(hints));
-    hints.ai_family = AF_UNSPEC;
+    hints.ai_family = netResolveFamily(&httpState.binding);   /* only what we can reach */
     hints.ai_socktype = SOCK_STREAM;
     snprintf(portText, sizeof(portText), "%u", (unsigned)parts.port);
 

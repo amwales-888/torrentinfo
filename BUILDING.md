@@ -2,9 +2,9 @@
 
 The library and the `torrentinfo` program build on Linux and Windows from the
 same sources, which are all in `src/`; build output goes in `build/`.
-Platform differences are confined to `src/platform.c` (file access), the
-certificate loading in `src/http.c`, and a few `#ifdef _WIN32` lines in
-`src/main.c`. Lists use the bundled 4.4BSD `queue.h` on every platform.
+Platform differences are confined to `src/platform.c` (file access),
+`src/net.c` (binding to a network interface), the certificate loading in
+`src/http.c`, and a few `#ifdef _WIN32` lines in `src/main.c`. Lists use the bundled 4.4BSD `queue.h` on every platform.
 
 Dependencies: **libuv** and **OpenSSL 3**.
 
@@ -67,6 +67,7 @@ cd build\x64\Release
 .\torrentinfo.exe -P file.torrent      # announce, then contact the peers: handshake,
                                         # pieces each one has, and whether it unchokes us
 .\torrentinfo.exe -D -O C:\Downloads file.torrent   # download from all peers (re-run to resume)
+.\torrentinfo.exe -D -I "Ethernet 2" file.torrent   # ... only through that network interface
 .\torrentinfo.exe -D -i 42 file.torrent              # ... only piece 42
 .\torrentinfo.exe -V -O C:\Downloads file.torrent   # check what is on disk (offline)
 ```
@@ -75,6 +76,20 @@ To pass arguments when debugging in Visual Studio, use the `torrentinfo`
 project's *Properties > Debugging > Command Arguments*.
 
 ### Notes
+
+- **Choosing a network interface (`-I`)**, with `-t`, `-P` or `-D`, sends all
+  tracker and peer traffic through one interface, for example a VPN. Give
+  its name (`tun0`, `wg0`, `eth0` on Linux; the name shown in *Network
+  Connections* such as `Ethernet 2` on Windows, in quotes if it has spaces)
+  or one of its IP addresses. Each socket is bound to the interface's
+  address and tied to the interface itself (`SO_BINDTODEVICE` on Linux,
+  `IP_UNICAST_IF` on Windows), so nothing leaves another way; if the
+  interface goes down, connections fail rather than falling back. Peers of
+  an address family the interface lacks (IPv6 on an IPv4-only VPN) are
+  skipped. DNS lookups for tracker host names still go through the system's
+  resolver. On Linux kernels before 5.7, tying sockets to the interface
+  needs root or `CAP_NET_RAW`; without it a warning is printed and only the
+  address is bound, which Linux may route out of another interface.
 
 - **Verifying (`-V`)** hashes the data on disk against the torrent without
   creating or changing anything, and needs no network. For each file it

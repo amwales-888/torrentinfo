@@ -31,6 +31,7 @@
 #include <stdint.h>
 #include <uv.h>
 
+#include "net.h"
 #include "parser.h"
 
 #ifdef __cplusplus
@@ -112,7 +113,7 @@ typedef void (*udpCallback)(void *privateArg, const udpResponse *response);
  * udpInit() and udpShutdown(). Returns UDP_EINVAL if a later call passes a
  * different loop or context.
  */
-int32_t udpInit(uv_loop_t *loop, parserContext *context);
+int32_t udpInit(uv_loop_t *loop, parserContext *context, const netBinding *binding);
 
 /*
  * Start an announce to a udp:// URL (a port is required; any path is

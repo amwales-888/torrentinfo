@@ -35,6 +35,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "net.h"
 #include "peer.h"
 #include "queue.h"
 
@@ -109,6 +110,7 @@ static struct {
     uv_loop_t                *loop;
     parserContext            *context;
     uint32_t                  users;        /* peerInit() calls outstanding */
+    netBinding                binding;      /* interface to use, if active  */
     uint32_t                  magic;
     struct peerConnectionList connections;
 } peerModule;
@@ -641,7 +643,7 @@ static void onConnect(uv_connect_t *connect, int status)
 /* Public API                                                               */
 /* ======================================================================== */
 
-int32_t peerInit(uv_loop_t *loop, parserContext *context)
+int32_t peerInit(uv_loop_t *loop, parserContext *context, const netBinding *binding)
 {
     if (loop == NULL || context == NULL || context->magic != PARSER_CONTEXT_MAGIC) {
         return PEER_EINVAL;
@@ -655,6 +657,11 @@ int32_t peerInit(uv_loop_t *loop, parserContext *context)
     }
     peerModule.loop = loop;
     peerModule.context = context;
+    if (binding != NULL) {
+        peerModule.binding = *binding;
+    } else {
+        memset(&peerModule.binding, 0, sizeof(peerModule.binding));
+    }
     peerModule.users = 1;
     TAILQ_INIT(&peerModule.connections);
     peerModule.magic = PEER_STATE_MAGIC;
@@ -735,11 +742,16 @@ int32_t peerConnect(const struct sockaddr *address, const peerConnectOptions *op
                        (uint64_t)options->timeoutSeconds * 1000u, 0);
     }
 
-    result = uv_tcp_init(peerModule.loop, &connection->tcp);
+    result = netTcpInit(peerModule.loop, &connection->tcp, &peerModule.binding,
+                        connection->address.ss_family);
     if (result == 0) {
         connection->tcp.data = connection;
         connection->tcpOpen = 1;
         connection->pending++;
+        result = netTcpBind(&connection->tcp, &peerModule.binding,
+                            connection->address.ss_family);
+    }
+    if (result == 0) {
         connection->connectRequest.data = connection;
         result = uv_tcp_connect(&connection->connectRequest, &connection->tcp,
                                 (const struct sockaddr *)&connection->address, onConnect);

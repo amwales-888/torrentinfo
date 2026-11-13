@@ -26,6 +26,7 @@
 
 #include "download.h"
 #include "encoder.h"
+#include "net.h"
 #include "parser.h"
 #include "peer.h"
 #include "piece.h"
@@ -1520,7 +1521,8 @@ done:
 
 static int announceTorrent(parserContext *context, const parserAllocator *allocator,
                            const char *path, uint32_t timeoutSeconds, const char *caFile,
-                           uint32_t mode, int64_t wanted, const char *outputDirectory)
+                           uint32_t mode, int64_t wanted, const char *outputDirectory,
+                           const netBinding *binding)
 {
     static const char alphabet[] = "0123456789abcdefghijklmnopqrstuvwxyz";
     const parserTier *tier;
@@ -1568,6 +1570,7 @@ static int announceTorrent(parserContext *context, const parserAllocator *alloca
     }
     config.port = 6881;
     config.caFile = caFile;
+    config.binding = binding;
 
     uv_loop_init(&loop);
     status = trackerInit(&loop, context, &config);
@@ -1632,7 +1635,7 @@ static int announceTorrent(parserContext *context, const parserAllocator *alloca
     if (mode != MODE_ANNOUNCE) {
         if (attemptCount == 0) {
             printf("\nNo peers to connect to.\n");
-        } else if (peerInit(&loop, context) == PEER_OK) {
+        } else if (peerInit(&loop, context, binding) == PEER_OK) {
             if (mode == MODE_PEERS) {
                 handshakes = handshakePeers(&loop, attempts, attemptCount, infoHash,
                                             config.peerId, pieceCount, timeoutSeconds);
@@ -1766,9 +1769,10 @@ static void usage(const char *program)
     fprintf(stderr,
             "usage: %s <file.torrent>\n"
             "       %s -o <output.torrent> [options] <file>...\n"
-            "       %s -t [-T seconds] [-C ca.pem] <file.torrent>\n"
-            "       %s -P [-T seconds] [-C ca.pem] <file.torrent>\n"
-            "       %s -D [-O dir] [-i piece] [-T seconds] [-C ca.pem] <file.torrent>\n"
+            "       %s -t [-T seconds] [-C ca.pem] [-I interface] <file.torrent>\n"
+            "       %s -P [-T seconds] [-C ca.pem] [-I interface] <file.torrent>\n"
+            "       %s -D [-O dir] [-i piece] [-T seconds] [-C ca.pem] [-I interface]\n"
+            "            <file.torrent>\n"
             "       %s -V [-O dir] <file.torrent>\n"
             "\n"
             "  -o file   create a torrent from the given files and write it to 'file'\n"
@@ -1792,7 +1796,10 @@ static void usage(const char *program)
             "  -i piece  with -D: download only this piece\n"
             "  -T secs   announce and handshake timeout (default 15)\n"
             "  -C file   trust the CA certificates in this PEM file for HTTPS\n"
-            "            trackers (default: the system's certificate store)\n",
+            "            trackers (default: the system's certificate store)\n"
+            "  -I iface  with -t, -P or -D: send all tracker and peer traffic through\n"
+            "            this network interface, given by name (tun0, \"Ethernet 2\")\n"
+            "            or by one of its IP addresses; DNS lookups are not covered\n",
             program, program, program, program, program, program);
 }
 
@@ -1807,6 +1814,8 @@ int main(int argc, char **argv)
     uint8_t         createOnly = 0;     /* an option that only makes sense with -o */
     uint8_t         announce = 0;
     uint8_t         verify = 0;         /* -V */
+    const char     *interfaceSpec = NULL;   /* -I */
+    netBinding      binding;
     uint8_t         directoryGiven = 0; /* -O */
     uint32_t        mode = MODE_ANNOUNCE;
     int64_t         wanted = -1;            /* -i piece index */
@@ -1855,7 +1864,7 @@ int main(int argc, char **argv)
     options.trackers = (const char *const *)trackers;
     options.webSeeds = (const char *const *)webSeeds;
 
-    while ((option = nextOption(argc, argv, "o:a:w:c:n:l:ptPDVO:i:T:C:h")) != -1) {
+    while ((option = nextOption(argc, argv, "o:a:w:c:n:l:ptPDVO:i:T:C:I:h")) != -1) {
         switch (option) {
         case 'o':
             outputPath = optionValue;
@@ -1928,6 +1937,10 @@ int main(int argc, char **argv)
             caFile = optionValue;
             announceOnly = 1;
             break;
+        case 'I':
+            interfaceSpec = optionValue;
+            announceOnly = 1;
+            break;
         case 'h':
             usage(argv[0]);
             status = 0;
@@ -1958,8 +1971,24 @@ int main(int argc, char **argv)
             usage(argv[0]);
             goto cleanup;
         }
+        memset(&binding, 0, sizeof(binding));
+        if (interfaceSpec != NULL) {
+            char message[NET_MESSAGE_LENGTH];
+            char description[NET_DESCRIPTION_LENGTH];
+
+            if (netBindingResolve(interfaceSpec, &binding, message, sizeof(message)) != NET_OK) {
+                fprintf(stderr, "-I %s: %s\n", interfaceSpec, message);
+                goto cleanup;
+            }
+            netBindingDescribe(&binding, description, sizeof(description));
+            printf("Interface:  %s\n", description);
+            if (message[0] != '\0') {
+                printf("            %s\n", message);
+            }
+            printf("            (DNS lookups still use the system's resolver)\n");
+        }
         status = announceTorrent(&context, &allocator, argv[optionIndex], timeoutSeconds, caFile,
-                                 mode, wanted, outputDirectory);
+                                 mode, wanted, outputDirectory, &binding);
     } else if (outputPath != NULL) {
         if (optionIndex >= argc) {
             usage(argv[0]);

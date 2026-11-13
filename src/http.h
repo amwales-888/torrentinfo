@@ -37,6 +37,7 @@
 #include <stdint.h>
 #include <uv.h>
 
+#include "net.h"
 #include "parser.h"
 
 #ifdef __cplusplus
@@ -77,6 +78,8 @@ typedef struct httpConfig {
                                read from disk.                             */
     const char *userAgent;  /* NULL for HTTP_DEFAULT_USER_AGENT; at most 127
                                characters                                  */
+    const netBinding *binding;  /* interface to use (net.h; copied),
+                                           or NULL for any               */
 } httpConfig;
 
 /*

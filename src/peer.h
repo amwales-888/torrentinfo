@@ -57,6 +57,7 @@
 #include <uv.h>
 
 #include "message.h"
+#include "net.h"
 #include "parser.h"
 
 #ifdef __cplusplus
@@ -179,7 +180,7 @@ typedef struct peerCallbacks {
  * peerInit() and peerShutdown(). Returns PEER_EINVAL if a later call passes
  * a different loop or context.
  */
-int32_t peerInit(uv_loop_t *loop, parserContext *context);
+int32_t peerInit(uv_loop_t *loop, parserContext *context, const netBinding *binding);
 
 /*
  * Connect to 'address' (IPv4 or IPv6, port included) and exchange

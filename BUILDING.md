@@ -122,6 +122,16 @@ project's *Properties > Debugging > Command Arguments*.
   networking never waits for it. Files are kept open while the program runs
   (up to 64 at a time) instead of being opened for every block.
 
+- **Magnet links.** `-D` accepts a magnet link (`magnet:?xt=urn:btih:...`,
+  quoted in the shell) instead of a .torrent file. The torrent's info
+  dictionary is first fetched from peers (BEP 9: peers from the link's
+  trackers and `x.pe` addresses), checked against the info hash, and saved
+  as `<info hash>.torrent` in the download folder; running the same link
+  again uses that file. Our client also sends the metadata to peers that
+  ask for it. Without trackers or peer addresses in the link, a magnet link
+  needs DHT, which is not implemented yet. On its own (no option) a magnet
+  link is just shown.
+
 - **Peer exchange.** Peers that support the extension protocol (BEP 10;
   nearly all current clients do) are sent an extended handshake, and with
   peer exchange (BEP 11, "ut_pex") tell each other every minute which peers

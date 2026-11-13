@@ -110,8 +110,10 @@ typedef struct peerConnectOptions {
     uint8_t     infoHash[PARSER_SHA1_LENGTH];
     uint8_t     peerId[PEER_ID_LENGTH];     /* our peer id                       */
     uint32_t    pieceCount;                 /* the torrent's piece count: sizes
-                                               the peer's bitfield and bounds
-                                               piece indexes                    */
+                                               the bitfield checks; 0 when not
+                                               known yet (fetching a magnet
+                                               link's metadata): bitfield and
+                                               have messages are then ignored */
     uint32_t    timeoutSeconds;             /* for connecting and the handshake;
                                                0 means no limit                 */
     uint32_t    extensions;                 /* PEER_EXTENSION_* we advertise in

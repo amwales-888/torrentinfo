@@ -75,6 +75,15 @@ typedef void (*announceStoppedCallback)(void *privateArg);
 int32_t announceBegin(uv_loop_t *loop, parserContext *context, const parserTorrent *torrent,
                       const announceEvents *events, void *privateArg, announce **handle);
 
+/*
+ * As announceBegin(), for a list of tracker URLs and an info hash (a magnet
+ * link's). The URL strings must outlive the announce.
+ */
+int32_t announceBeginUrls(uv_loop_t *loop, parserContext *context,
+                          const uint8_t infoHash[PARSER_SHA1_LENGTH], char *const *urls,
+                          uint32_t count, const announceEvents *events, void *privateArg,
+                          announce **handle);
+
 /* The download has completed: send "completed" to the trackers now. */
 void announceCompleted(announce *handle);
 

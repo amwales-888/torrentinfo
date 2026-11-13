@@ -33,7 +33,7 @@ typedef struct announceTracker {
 struct announce {
     uv_loop_t              *loop;
     parserContext          *context;
-    const parserTorrent    *torrent;
+    uint8_t                 infoHash[PARSER_SHA1_LENGTH];
     announceEvents          events;
     void                   *privateArg;
     announceTracker        *trackers;
@@ -102,7 +102,7 @@ static void startAnnounce(announce *a, announceTracker *tracker, uint32_t event,
     params.downloaded = stats.downloaded;
     params.left = stats.left;
     tracker->lastAt = uv_now(a->loop);
-    status = trackerAnnounce(a->torrent->infoHash, tracker->url, &params, &tracker->id, timeout,
+    status = trackerAnnounce(a->infoHash, tracker->url, &params, &tracker->id, timeout,
                              onTrackerDone, tracker);
     if (status == TRACKER_OK) {
         tracker->event = event;
@@ -242,6 +242,45 @@ static void onTimerClosed(uv_handle_t *handle)
     a->context->allocator.free(a);
 }
 
+/* Allocate an announce for up to 'capacity' URLs (added by the caller). */
+static announce *create(uv_loop_t *loop, parserContext *context,
+                        const uint8_t infoHash[PARSER_SHA1_LENGTH], const announceEvents *events,
+                        void *privateArg, uint32_t capacity)
+{
+    announce *a = context->allocator.realloc(NULL, sizeof(*a));
+
+    if (a == NULL) {
+        return NULL;
+    }
+    memset(a, 0, sizeof(*a));
+    a->loop = loop;
+    a->context = context;
+    memcpy(a->infoHash, infoHash, PARSER_SHA1_LENGTH);
+    a->events = *events;
+    a->privateArg = privateArg;
+    a->trackers = allocate(a, sizeof(*a->trackers) * (capacity > 0 ? capacity : 1u));
+    if (a->trackers == NULL) {
+        context->allocator.free(a);
+        return NULL;
+    }
+    return a;
+}
+
+/* Start announcing to the trackers added, or fail if there are none. */
+static int32_t start(announce *a, announce **handle)
+{
+    if (a->trackerCount == 0) {
+        a->context->allocator.free(a->trackers);
+        a->context->allocator.free(a);
+        return ANNOUNCE_ENOTRACKERS;
+    }
+    uv_timer_init(a->loop, &a->timer);
+    a->timer.data = a;
+    uv_timer_start(&a->timer, onTick, 0, ANNOUNCE_TICK_MS);   /* first round now */
+    *handle = a;
+    return ANNOUNCE_OK;
+}
+
 int32_t announceBegin(uv_loop_t *loop, parserContext *context, const parserTorrent *torrent,
                       const announceEvents *events, void *privateArg, announce **handle)
 {
@@ -259,19 +298,8 @@ int32_t announceBegin(uv_loop_t *loop, parserContext *context, const parserTorre
     TAILQ_FOREACH(tier, &torrent->announceList, entries) {
         capacity += tier->urlCount;
     }
-    a = context->allocator.realloc(NULL, sizeof(*a));
+    a = create(loop, context, torrent->infoHash, events, privateArg, capacity);
     if (a == NULL) {
-        return ANNOUNCE_ENOMEM;
-    }
-    memset(a, 0, sizeof(*a));
-    a->loop = loop;
-    a->context = context;
-    a->torrent = torrent;
-    a->events = *events;
-    a->privateArg = privateArg;
-    a->trackers = allocate(a, sizeof(*a->trackers) * capacity);
-    if (a->trackers == NULL) {
-        context->allocator.free(a);
         return ANNOUNCE_ENOMEM;
     }
     /* BEP 12: announce-list replaces announce when present. */
@@ -283,16 +311,32 @@ int32_t announceBegin(uv_loop_t *loop, parserContext *context, const parserTorre
     if (a->trackerCount == 0) {
         addTracker(a, torrent->announce, capacity);
     }
-    if (a->trackerCount == 0) {
-        context->allocator.free(a->trackers);
-        context->allocator.free(a);
-        return ANNOUNCE_ENOTRACKERS;
+    return start(a, handle);
+}
+
+int32_t announceBeginUrls(uv_loop_t *loop, parserContext *context,
+                          const uint8_t infoHash[PARSER_SHA1_LENGTH], char *const *urls,
+                          uint32_t count, const announceEvents *events, void *privateArg,
+                          announce **handle)
+{
+    announce *a;
+    uint32_t  i;
+
+    if (handle != NULL) {
+        *handle = NULL;
     }
-    uv_timer_init(loop, &a->timer);
-    a->timer.data = a;
-    uv_timer_start(&a->timer, onTick, 0, ANNOUNCE_TICK_MS);   /* first round now */
-    *handle = a;
-    return ANNOUNCE_OK;
+    if (loop == NULL || context == NULL || infoHash == NULL || events == NULL || handle == NULL ||
+        (count > 0 && urls == NULL)) {
+        return ANNOUNCE_EINVAL;
+    }
+    a = create(loop, context, infoHash, events, privateArg, count);
+    if (a == NULL) {
+        return ANNOUNCE_ENOMEM;
+    }
+    for (i = 0; i < count; i++) {
+        addTracker(a, urls[i], count);
+    }
+    return start(a, handle);
 }
 
 void announceCompleted(announce *a)

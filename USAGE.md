@@ -7,12 +7,12 @@
 ## SYNOPSIS
 
 ```
-torrentinfo file.torrent
+torrentinfo file.torrent | magnet-link
 torrentinfo -o new.torrent [-a url]... [-w url]... [-c text] [-n name] [-l size] [-p] file...
 torrentinfo -t [-T seconds] [-C certs.pem] [-I interface] file.torrent
 torrentinfo -P [-T seconds] [-C certs.pem] [-I interface] file.torrent
 torrentinfo -D [-S] [-L port] [-N] [-O folder] [-i piece] [-T seconds] [-C certs.pem]
-               [-I interface] file.torrent
+               [-I interface] file.torrent | magnet-link
 torrentinfo -V [-O folder] file.torrent
 ```
 
@@ -32,7 +32,8 @@ The program works in one of six ways, chosen by the first option.
 
 **Show a torrent** (no option)
 : Prints what is inside a torrent file: its name, the files it contains
-  and their sizes, the trackers, the piece size and so on.
+  and their sizes, the trackers, the piece size and so on. Given a magnet
+  link, it shows what the link contains.
 
 **Create a torrent** (`-o`)
 : Makes a new torrent file from files on your computer, ready to share.
@@ -58,6 +59,15 @@ The program works in one of six ways, chosen by the first option.
 : A progress line appears every two seconds, showing how far along the
   download is, the download and upload speeds, and how many peers are
   connected.
+
+**Magnet links**
+: Instead of a torrent file, `-D` accepts a *magnet link*, the
+  `magnet:?xt=urn:btih:...` links websites offer. Put it in quotes. The
+  program first asks peers for the torrent's details (this usually takes a
+  few seconds), checks them, saves them in the download folder as a
+  *.torrent* file named after the link's long hexadecimal code, and then
+  downloads as usual. Running the same link again uses that saved file.
+  For now, the link must name a tracker (most do).
 
 **Check a download** (`-V`)
 : Checks the files on disk against the torrent, without using the network
@@ -189,7 +199,7 @@ fewer people.
 connect to you, and from the peers themselves, which tell each other about
 the other peers they know ("peer exchange"). Private torrents only use their
 trackers. The program does not yet use DHT, the tracker-less way of finding
-peers, nor magnet links: you need the *.torrent* file.
+peers, so a magnet link without a tracker cannot be used yet.
 
 **Bad data.** Every piece is checked when it arrives. A peer that sends
 damaged data is disconnected and not used again, and the piece is fetched
@@ -245,6 +255,12 @@ Download only through your VPN connection:
 ```
 torrentinfo -D -I tun0 -O ~/Downloads ubuntu.torrent
 torrentinfo.exe -D -I "NordLynx" -O C:\Downloads ubuntu.torrent
+```
+
+Download from a magnet link (keep the quotes):
+
+```
+torrentinfo -D -O ~/Downloads "magnet:?xt=urn:btih:3b245504cf5f11bbdbe1201cea6a6bf45aee1bc0&dn=ubuntu&tr=https://torrent.ubuntu.com/announce"
 ```
 
 Check whether a download is complete, and which pieces are missing:

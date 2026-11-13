@@ -371,6 +371,9 @@ static int32_t applyMessage(peerConnection *connection, const messageFrame *mess
         connection->peerInterested = 0;
         break;
     case MESSAGE_HAVE:
+        if (connection->pieceCount == 0) {
+            break;                                  /* size unknown yet (magnet link) */
+        }
         if (message->index >= connection->pieceCount) {
             setError(connection, "have for piece %" PRIu32 ", but the torrent has %" PRIu32
                      " pieces", message->index, connection->pieceCount);
@@ -385,6 +388,9 @@ static int32_t applyMessage(peerConnection *connection, const messageFrame *mess
         if (connection->coreMessages > 0) {
             setError(connection, "bitfield sent after other messages");
             return PEER_EPROTO;
+        }
+        if (connection->pieceCount == 0) {
+            break;                                  /* size unknown yet (magnet link) */
         }
         if (!messageBitfieldValid(message->payload, message->payloadLength,
                                   connection->pieceCount)) {

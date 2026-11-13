@@ -110,6 +110,11 @@ typedef struct downloadOptions {
                                            0: do not accept connections        */
     uint32_t        uploadSlots;        /* peers unchoked at once; 0 = default */
     uint8_t         seed;               /* keep serving peers once complete    */
+    const uint8_t  *infoDictionary;     /* the raw info dictionary, to send to
+                                           peers fetching a magnet link's
+                                           metadata (BEP 9); NULL: do not.
+                                           Must outlive the download.          */
+    uint32_t        infoDictionaryLength;
 } downloadOptions;
 
 typedef struct downloadProgress {

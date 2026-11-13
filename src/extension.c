@@ -111,15 +111,23 @@ int32_t extensionEncodeHandshake(const extensionHandshake *handshake, uint8_t *o
     if (handshake == NULL || out == NULL || length == NULL) {
         return EXTENSION_EINVAL;
     }
-    /* Keys in sorted order: m, p, reqq, v. */
+    /* Keys in sorted order: m, metadata_size, p, reqq, v. */
     putText(&w, "d");
     putKey(&w, "m");
     putText(&w, "d");
+    if (handshake->metadataId != 0) {
+        putKey(&w, "ut_metadata");
+        putInteger(&w, handshake->metadataId);
+    }
     if (handshake->pexId != 0) {
         putKey(&w, "ut_pex");
         putInteger(&w, handshake->pexId);
     }
     putText(&w, "e");
+    if (handshake->metadataSize != 0) {
+        putKey(&w, "metadata_size");
+        putInteger(&w, handshake->metadataSize);
+    }
     if (handshake->port != 0) {
         putKey(&w, "p");
         putInteger(&w, handshake->port);
@@ -186,16 +194,29 @@ int32_t extensionDecodeHandshake(const uint8_t *data, size_t length, extensionHa
                 if (parserReadString(&cursor, &key, &keyLength) != PARSER_OK) {
                     return EXTENSION_EPROTO;
                 }
-                if (keyIs(key, keyLength, "ut_pex") && parserCursorPeek(&cursor) == 'i') {
+                if ((keyIs(key, keyLength, "ut_pex") || keyIs(key, keyLength, "ut_metadata")) &&
+                    parserCursorPeek(&cursor) == 'i') {
+                    int pex = keyIs(key, keyLength, "ut_pex");
+
                     if (parserReadInteger(&cursor, &value) != PARSER_OK) {
                         return EXTENSION_EPROTO;
                     }
                     /* 0 means "disabled"; ids are one byte. */
-                    handshake->pexId = (value > 0 && value <= 255) ? (uint8_t)value : 0u;
+                    if (pex) {
+                        handshake->pexId = (value > 0 && value <= 255) ? (uint8_t)value : 0u;
+                    } else {
+                        handshake->metadataId = (value > 0 && value <= 255) ? (uint8_t)value : 0u;
+                    }
                 } else if (parserSkipValue(&cursor) != PARSER_OK) {
                     return EXTENSION_EPROTO;
                 }
             }
+        } else if (keyIs(key, keyLength, "metadata_size") && parserCursorPeek(&cursor) == 'i') {
+            if (parserReadInteger(&cursor, &value) != PARSER_OK) {
+                return EXTENSION_EPROTO;
+            }
+            handshake->metadataSize =
+                (value > 0 && value <= (int64_t)EXTENSION_MAX_METADATA) ? (uint32_t)value : 0u;
         } else if (keyIs(key, keyLength, "p") && parserCursorPeek(&cursor) == 'i') {
             if (parserReadInteger(&cursor, &value) != PARSER_OK) {
                 return EXTENSION_EPROTO;
@@ -330,5 +351,92 @@ int32_t extensionDecodePex(const uint8_t *data, size_t length, extensionPeerCall
     reportPeers(lists[2], lengths[2], lists[3], lengths[3], 6u, 1, callback, privateArg);
     reportPeers(lists[4], lengths[4], NULL, 0, 4u, 0, callback, privateArg);
     reportPeers(lists[5], lengths[5], NULL, 0, 6u, 0, callback, privateArg);
+    return EXTENSION_OK;
+}
+
+/* ------------------------------------------------------------------------ */
+/* Metadata exchange (BEP 9)                                                */
+/* ------------------------------------------------------------------------ */
+
+int32_t extensionEncodeMetadata(uint32_t type, uint32_t piece, uint32_t totalSize,
+                                uint8_t *out, size_t size, size_t *length)
+{
+    writer w = { out, size, 0, 0 };
+
+    if (out == NULL || length == NULL || type > EXTENSION_METADATA_REJECT) {
+        return EXTENSION_EINVAL;
+    }
+    /* Keys in sorted order: msg_type, piece, total_size. */
+    putText(&w, "d");
+    putKey(&w, "msg_type");
+    putInteger(&w, type);
+    putKey(&w, "piece");
+    putInteger(&w, piece);
+    if (type == EXTENSION_METADATA_DATA) {
+        putKey(&w, "total_size");
+        putInteger(&w, totalSize);
+    }
+    putText(&w, "e");
+    return finish(&w, length);
+}
+
+int32_t extensionDecodeMetadata(const uint8_t *data, size_t length, uint32_t *type,
+                                uint32_t *piece, uint32_t *totalSize, size_t *dataOffset)
+{
+    parserCursor   cursor;
+    const uint8_t *key;
+    uint64_t       keyLength;
+    int64_t        value;
+    uint8_t        more;
+    int            haveType = 0;
+    int            havePiece = 0;
+
+    if (data == NULL || type == NULL || piece == NULL || totalSize == NULL ||
+        dataOffset == NULL) {
+        return EXTENSION_EINVAL;
+    }
+    *type = 0;
+    *piece = 0;
+    *totalSize = 0;
+    memset(&cursor, 0, sizeof(cursor));
+    cursor.buffer = data;
+    cursor.length = length;
+    if (parserContainerBegin(&cursor, 'd') != PARSER_OK) {
+        return EXTENSION_EPROTO;
+    }
+    for (;;) {
+        if (parserContainerNext(&cursor, &more) != PARSER_OK) {
+            return EXTENSION_EPROTO;
+        }
+        if (!more) {
+            break;
+        }
+        if (parserReadString(&cursor, &key, &keyLength) != PARSER_OK) {
+            return EXTENSION_EPROTO;
+        }
+        if (parserCursorPeek(&cursor) == 'i' &&
+            (keyIs(key, keyLength, "msg_type") || keyIs(key, keyLength, "piece") ||
+             keyIs(key, keyLength, "total_size"))) {
+            if (parserReadInteger(&cursor, &value) != PARSER_OK || value < 0 ||
+                value > (int64_t)UINT32_MAX) {
+                return EXTENSION_EPROTO;
+            }
+            if (keyIs(key, keyLength, "msg_type")) {
+                *type = (uint32_t)value;
+                haveType = 1;
+            } else if (keyIs(key, keyLength, "piece")) {
+                *piece = (uint32_t)value;
+                havePiece = 1;
+            } else {
+                *totalSize = (uint32_t)value;
+            }
+        } else if (parserSkipValue(&cursor) != PARSER_OK) {
+            return EXTENSION_EPROTO;
+        }
+    }
+    if (!haveType || !havePiece) {
+        return EXTENSION_EPROTO;
+    }
+    *dataOffset = (size_t)cursor.position;          /* the piece's bytes follow */
     return EXTENSION_OK;
 }

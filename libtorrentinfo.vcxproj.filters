@@ -59,6 +59,12 @@
     <ClCompile Include="src\portmap.c">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="src\magnet.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\metadata.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="src\queue.h">
@@ -107,6 +113,12 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="src\portmap.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\magnet.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\metadata.h">
       <Filter>Header Files</Filter>
     </ClInclude>
   </ItemGroup>

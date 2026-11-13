@@ -30,6 +30,14 @@ extern "C" {
 #define EXTENSION_MESSAGE_ID        20u     /* the peer-wire message id          */
 #define EXTENSION_HANDSHAKE         0u      /* extended id of the handshake      */
 #define EXTENSION_PEX_ID            1u      /* the id we ask for ut_pex with     */
+#define EXTENSION_METADATA_ID       2u      /* ... and ut_metadata (BEP 9)       */
+#define EXTENSION_METADATA_PIECE    16384u  /* metadata travels in 16 KiB pieces */
+#define EXTENSION_MAX_METADATA      (32u * 1024u * 1024u)   /* refuse bigger     */
+
+/* ut_metadata message types */
+#define EXTENSION_METADATA_REQUEST  0u
+#define EXTENSION_METADATA_DATA     1u
+#define EXTENSION_METADATA_REJECT   2u
 #define EXTENSION_CLIENT_LENGTH     64u
 #define EXTENSION_MAX_PEX_PEERS     50u     /* added (or dropped) per message    */
 #define EXTENSION_PEX_BUFFER        2048u   /* enough for any message we encode  */
@@ -48,6 +56,9 @@ extern "C" {
 /* The extended handshake: what we send, or what a peer told us. */
 typedef struct extensionHandshake {
     uint8_t     pexId;              /* ut_pex message id; 0: not supported   */
+    uint8_t     metadataId;         /* ut_metadata message id; 0: none       */
+    uint32_t    metadataSize;       /* "metadata_size": info dict bytes; 0 if
+                                       not known (or not offered)            */
     uint16_t    port;               /* "p": the port it accepts on; 0 unknown */
     uint32_t    requestQueue;       /* "reqq": requests it queues; 0 unknown */
     char        client[EXTENSION_CLIENT_LENGTH];    /* "v", printable ASCII  */
@@ -88,6 +99,21 @@ int32_t extensionEncodePex(const extensionPeer *added, uint32_t addedCount,
 typedef void (*extensionPeerCallback)(void *privateArg, const extensionPeer *peer, int added);
 int32_t extensionDecodePex(const uint8_t *data, size_t length, extensionPeerCallback callback,
                            void *privateArg);
+
+/*
+ * BEP 9 (ut_metadata): fetching a torrent's info dictionary from peers, for
+ * magnet links. The dictionary is sent in 16 KiB pieces; a data message is
+ * a bencoded header followed by the piece's bytes.
+ */
+int32_t extensionEncodeMetadata(uint32_t type, uint32_t piece, uint32_t totalSize,
+                                uint8_t *out, size_t size, size_t *length);
+
+/*
+ * Decode a ut_metadata message: *type, *piece, *totalSize (data messages
+ * only, else 0), and *dataOffset, where a data message's bytes start.
+ */
+int32_t extensionDecodeMetadata(const uint8_t *data, size_t length, uint32_t *type,
+                                uint32_t *piece, uint32_t *totalSize, size_t *dataOffset);
 
 #ifdef __cplusplus
 }

@@ -152,6 +152,7 @@ typedef struct downloadPeer {
     /* Extension protocol and peer exchange */
     uint8_t                 extended;       /* both support BEP 10          */
     uint8_t                 pexId;          /* its id for ut_pex; 0: none   */
+    uint8_t                 metadataId;     /* its id for ut_metadata       */
     uint16_t                remotePort;     /* the port it accepts on, if told */
     uint64_t                nextPex;        /* uv_now() of our next PEX to it */
     uint64_t                lastPexIn;      /* uv_now() of its last PEX to us */
@@ -214,6 +215,8 @@ struct download {
     uint64_t                lastOptimistic;
     uint64_t                noPeersSince;   /* 0 while there are peers      */
     uint8_t                 pexEnabled;     /* not for private torrents     */
+    const uint8_t          *info;           /* raw info dictionary, or NULL */
+    uint32_t                infoLength;
     uint32_t                pexLearned;     /* new peers heard of by PEX    */
 
     uint32_t                verifyJobs;     /* piece checks on the thread pool */
@@ -999,6 +1002,10 @@ static void sendExtendedHandshake(download *dl, downloadPeer *peer)
 
     memset(&handshake, 0, sizeof(handshake));
     handshake.pexId = dl->pexEnabled ? (uint8_t)EXTENSION_PEX_ID : 0u;
+    if (dl->info != NULL) {
+        handshake.metadataId = (uint8_t)EXTENSION_METADATA_ID;
+        handshake.metadataSize = dl->infoLength;
+    }
     handshake.port = dl->listenPort;
     handshake.requestQueue = DOWNLOAD_UPLOAD_QUEUE;
     snprintf(handshake.client, sizeof(handshake.client), "%s", DOWNLOAD_CLIENT_NAME);
@@ -1130,6 +1137,43 @@ static void onPexPeer(void *privateArg, const extensionPeer *peer, int added)
     }
 }
 
+/* A peer asks for a piece of the info dictionary (it has a magnet link). */
+static void sendMetadata(download *dl, downloadPeer *peer, const uint8_t *data, size_t length)
+{
+    uint8_t  buffer[1 + 64 + EXTENSION_METADATA_PIECE];
+    uint32_t type;
+    uint32_t piece;
+    uint32_t totalSize;
+    uint32_t begin;
+    uint32_t size;
+    size_t   offset;
+    size_t   header;
+
+    if (peer->metadataId == 0 ||
+        extensionDecodeMetadata(data, length, &type, &piece, &totalSize, &offset) !=
+            EXTENSION_OK ||
+        type != EXTENSION_METADATA_REQUEST) {
+        return;
+    }
+    buffer[0] = peer->metadataId;
+    begin = piece * EXTENSION_METADATA_PIECE;
+    if (dl->info == NULL || piece >= (dl->infoLength + EXTENSION_METADATA_PIECE - 1u) /
+                                         EXTENSION_METADATA_PIECE) {
+        if (extensionEncodeMetadata(EXTENSION_METADATA_REJECT, piece, 0, buffer + 1, 64,
+                                    &header) == EXTENSION_OK) {
+            sendExtended(peer, buffer, 1u + header);
+        }
+        return;
+    }
+    size = (dl->infoLength - begin < EXTENSION_METADATA_PIECE) ? dl->infoLength - begin
+                                                                : EXTENSION_METADATA_PIECE;
+    if (extensionEncodeMetadata(EXTENSION_METADATA_DATA, piece, dl->infoLength, buffer + 1, 64,
+                                &header) == EXTENSION_OK) {
+        memcpy(buffer + 1 + header, dl->info + begin, size);
+        sendExtended(peer, buffer, 1u + header + size);
+    }
+}
+
 static void receiveExtended(download *dl, downloadPeer *peer, const messageFrame *message)
 {
     extensionHandshake handshake;
@@ -1143,9 +1187,14 @@ static void receiveExtended(download *dl, downloadPeer *peer, const messageFrame
         if (extensionDecodeHandshake(message->payload + 1, message->payloadLength - 1u,
                                      &handshake) == EXTENSION_OK) {
             peer->pexId = dl->pexEnabled ? handshake.pexId : 0u;
+            peer->metadataId = handshake.metadataId;
             peer->remotePort = handshake.port;
             snprintf(peer->client, sizeof(peer->client), "%s", handshake.client);
         }
+        return;
+    }
+    if (message->payload[0] == EXTENSION_METADATA_ID) {
+        sendMetadata(dl, peer, message->payload + 1, message->payloadLength - 1u);
         return;
     }
     if (message->payload[0] != EXTENSION_PEX_ID || !dl->pexEnabled ||
@@ -1318,6 +1367,7 @@ static void onPeerHandshake(void *privateArg, peerConnection *connection,
     memcpy(peer->remoteId, result->peerId, PEER_ID_LENGTH);
     peer->extended = (uint8_t)((result->extensions & PEER_EXTENSION_PROTOCOL) != 0);
     peer->pexId = 0;
+    peer->metadataId = 0;
     peer->remotePort = 0;
     peer->lastPexIn = 0;
     peer->advertisedCount = 0;
@@ -2181,6 +2231,8 @@ int32_t downloadBegin(uv_loop_t *loop, parserContext *context, const parserTorre
     dl->connectOptions.timeoutSeconds = options->handshakeTimeoutSeconds;
     dl->connectOptions.extensions = PEER_EXTENSION_PROTOCOL;
     dl->pexEnabled = (uint8_t)!torrent->isPrivate;      /* BEP 27: trackers only */
+    dl->info = options->infoDictionary;
+    dl->infoLength = options->infoDictionaryLength;
 
     if (uv_random(NULL, NULL, &seed, sizeof(seed), 0, NULL) != 0) {
         seed = 0;
@@ -2251,6 +2303,12 @@ int32_t downloadAddPeer(download *dl, const struct sockaddr *address)
     }
     TAILQ_FOREACH(peer, &dl->peers, entries) {
         if (sameAddress(&peer->address, address)) {
+            if (peer->state == DOWNLOAD_PEER_CLOSED && !peer->excluded && !peer->incoming) {
+                peer->state = DOWNLOAD_PEER_QUEUED; /* reported again: new chances */
+                peer->attempts = 0;
+                peer->retryAt = 0;
+                connectMore(dl);
+            }
             return DOWNLOAD_OK;                     /* already known */
         }
         if (peer->incoming && peer->remotePort != 0 && peer->state == DOWNLOAD_PEER_OPEN &&

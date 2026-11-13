@@ -27,6 +27,8 @@
 
 #include "announce.h"
 #include "download.h"
+#include "magnet.h"
+#include "metadata.h"
 #include "encoder.h"
 #include "net.h"
 #include "parser.h"
@@ -1453,7 +1455,8 @@ static void onDownloadFinished(void *privateArg, download *transfer, int32_t sta
 static int downloadTorrent(uv_loop_t *loop, parserContext *context, const parserTorrent *torrent,
                            const trackerConfig *config, uint32_t timeoutSeconds, int64_t wanted,
                            const char *directory, uint16_t listenPort, uint8_t seed,
-                           uint8_t mapPort)
+                           uint8_t mapPort, const uint8_t *info, uint32_t infoLength,
+                           const struct sockaddr_storage *knownPeers, uint32_t knownCount)
 {
     downloadEvents  events = { onDownloadReady, onDownloadEvent, onDownloadFinished,
                                onDownloadComplete };
@@ -1479,6 +1482,8 @@ static int downloadTorrent(uv_loop_t *loop, parserContext *context, const parser
     options.onlyPiece = wanted;
     options.listenPort = listenPort;
     options.seed = seed;
+    options.infoDictionary = info;
+    options.infoDictionaryLength = infoLength;
 
     uv_timer_init(loop, &run.timer);
     run.timer.data = &run;
@@ -1505,6 +1510,13 @@ static int downloadTorrent(uv_loop_t *loop, parserContext *context, const parser
     }
     run.lastReport = uv_now(loop);
     uv_timer_start(&run.timer, onProgressTick, 2000u, 2000u);   /* checking progress */
+    {
+        uint32_t i;
+
+        for (i = 0; i < knownCount; i++) {           /* met while fetching the metadata */
+            downloadAddPeer(run.transfer, (const struct sockaddr *)&knownPeers[i]);
+        }
+    }
     if (listenPort != 0) {
         if (downloadListenPort(run.transfer) != 0) {
             printf("Listening:  port %u\n", (unsigned)downloadListenPort(run.transfer));
@@ -1825,6 +1837,350 @@ done:
     return result;
 }
 
+/* ------------------------------------------------------------------------ */
+/* Magnet links: fetching the metadata                                      */
+/*                                                                          */
+/* A magnet link carries the info hash (and usually trackers), not the      */
+/* torrent. The trackers give peers; peers that have the torrent send its   */
+/* info dictionary (BEP 9); the info hash proves it is the right one. The   */
+/* result is saved as <info hash>.torrent in the download folder, so that   */
+/* running the same link again starts straight away.                        */
+/* ------------------------------------------------------------------------ */
+
+#define MAGNET_KNOWN_PEERS  500u
+
+typedef struct fetchRun {
+    uv_loop_t              *loop;
+    metadataFetch          *fetch;
+    announce               *trackers;
+    uv_timer_t              timer;
+    uv_signal_t             interrupt;
+#ifndef _WIN32
+    uv_signal_t             terminate;
+#endif
+    uint8_t                 stopped;
+    uint8_t                 interrupted;
+    parserContext          *context;
+    uint8_t                *info;               /* copy of the dictionary  */
+    uint32_t                infoLength;
+    struct sockaddr_storage peers[MAGNET_KNOWN_PEERS];  /* to reuse later  */
+    uint32_t                peerCount;
+} fetchRun;
+
+static void rememberPeer(fetchRun *run, const struct sockaddr *address)
+{
+    if (run->peerCount < MAGNET_KNOWN_PEERS) {
+        memcpy(&run->peers[run->peerCount++], address,
+               (address->sa_family == AF_INET) ? sizeof(struct sockaddr_in)
+                                               : sizeof(struct sockaddr_in6));
+    }
+}
+
+static void stopFetch(fetchRun *run)
+{
+    if (run->stopped) {
+        return;
+    }
+    run->stopped = 1;
+    if (run->trackers != NULL) {
+        announceEnd(run->trackers);
+        run->trackers = NULL;
+    }
+    if (run->fetch != NULL) {
+        metadataEnd(run->fetch);
+        run->fetch = NULL;
+    }
+    uv_timer_stop(&run->timer);
+    uv_signal_stop(&run->interrupt);
+#ifndef _WIN32
+    uv_signal_stop(&run->terminate);
+#endif
+}
+
+static void getFetchStats(void *privateArg, announceStats *stats)
+{
+    (void)privateArg;
+    stats->uploaded = 0;
+    stats->downloaded = 0;
+    stats->left = 16384u;                           /* not known yet: "a leecher" */
+}
+
+static void onFetchPeers(void *privateArg, const trackerPeer *peers, uint32_t count)
+{
+    fetchRun               *run = privateArg;
+    struct sockaddr_storage address;
+    uint32_t                i;
+
+    for (i = 0; i < count && run->fetch != NULL; i++) {
+        toSocketAddress(&peers[i], &address);
+        metadataAddPeer(run->fetch, (const struct sockaddr *)&address);
+        rememberPeer(run, (const struct sockaddr *)&address);
+    }
+}
+
+static void onFetchEvent(void *privateArg, metadataFetch *fetch, const char *message)
+{
+    (void)privateArg;
+    (void)fetch;
+    printf("  %s\n", message);
+    fflush(stdout);
+}
+
+static void onFetchDone(void *privateArg, metadataFetch *fetch, const uint8_t *info,
+                        uint32_t length)
+{
+    fetchRun *run = privateArg;
+
+    (void)fetch;
+    run->info = run->context->allocator.realloc(NULL, length);
+    if (run->info != NULL) {
+        memcpy(run->info, info, length);
+        run->infoLength = length;
+    }
+    stopFetch(run);
+}
+
+static void onFetchTick(uv_timer_t *timer)
+{
+    fetchRun        *run = timer->data;
+    metadataProgress progress;
+
+    metadataGetProgress(run->fetch, &progress);
+    printf("  fetching the metadata: %" PRIu32 " peer(s) connected, %" PRIu32 " offering it",
+           progress.peersConnected, progress.peersWithMetadata);
+    if (progress.pieces > 0) {
+        printf(", %" PRIu32 " of %" PRIu32 " pieces", progress.piecesDone, progress.pieces);
+    }
+    printf("\n");
+    fflush(stdout);
+}
+
+static void onFetchInterrupt(uv_signal_t *signal, int number)
+{
+    fetchRun *run = signal->data;
+
+    (void)number;
+    printf("\nInterrupted.\n");
+    run->interrupted = 1;
+    stopFetch(run);
+}
+
+/* "1.2.3.4:6881" or "[::1]:6881" (x.pe); host names are not looked up. */
+static int parsePeerAddress(const char *text, struct sockaddr_storage *address)
+{
+    char        host[64];
+    const char *colon = strrchr(text, ':');
+    const char *start = text;
+    size_t      length;
+    long        port;
+
+    if (colon == NULL) {
+        return 0;
+    }
+    port = strtol(colon + 1, NULL, 10);
+    if (*start == '[') {
+        start++;
+    }
+    length = (size_t)(colon - start);
+    if (length > 0 && start[length - 1u] == ']') {
+        length--;
+    }
+    if (port <= 0 || port > 65535 || length == 0 || length >= sizeof(host)) {
+        return 0;
+    }
+    memcpy(host, start, length);
+    host[length] = '\0';
+    memset(address, 0, sizeof(*address));
+    return uv_ip4_addr(host, (int)port, (struct sockaddr_in *)address) == 0 ||
+           uv_ip6_addr(host, (int)port, (struct sockaddr_in6 *)address) == 0;
+}
+
+/* Where a magnet link's torrent is kept: <directory>/<info hash>.torrent */
+static void magnetCachePath(const char *directory, const uint8_t infoHash[PARSER_SHA1_LENGTH],
+                            char *out, size_t size)
+{
+    char     hex[PARSER_SHA1_LENGTH * 2u + 1u];
+    uint32_t i;
+
+    for (i = 0; i < PARSER_SHA1_LENGTH; i++) {
+        snprintf(hex + 2u * i, 3, "%02x", infoHash[i]);
+    }
+    if (directory == NULL || directory[0] == '\0') {
+        snprintf(out, size, "%s.torrent", hex);
+    } else {
+        size_t length = strlen(directory);
+        int    slash = directory[length - 1u] == '/' || directory[length - 1u] == '\\';
+
+        snprintf(out, size, "%s%s%s.torrent", directory, slash ? "" : (PLATFORM_SEPARATOR == '/' ? "/" : "\\"),
+                 hex);
+    }
+}
+
+static int saveFile(const char *path, const uint8_t *data, uint64_t length)
+{
+    platformFile file;
+    uint32_t     written = 0;
+    int          ok;
+
+    if (platformFileOpenWrite(path, &file) != 0) {
+        return -1;
+    }
+    ok = platformFileWrite(&file, data, (uint32_t)length, &written) == 0 && written == length;
+    return (platformFileClose(&file) == 0 && ok) ? 0 : -1;
+}
+
+/*
+ * The torrent for a magnet link: from the cache if it was fetched before,
+ * otherwise from peers. On success *buffer holds a .torrent (release it with
+ * the allocator) and *peers / *peerCount the peers met (owned by the caller).
+ */
+static int magnetTorrent(parserContext *context, const parserAllocator *allocator,
+                         const magnetLink *link, const trackerConfig *config,
+                         uint32_t timeoutSeconds, const char *directory, uint16_t listenPort,
+                         uint8_t **buffer, uint64_t *length, fetchRun **runOut)
+{
+    static const announceEvents announceCallbacks = { getFetchStats, onFetchPeers,
+                                                      onAnnounceResult };
+    metadataEvents          events = { onFetchEvent, onFetchDone };
+    metadataOptions         options;
+    trackerConfig           settings = *config;
+    struct sockaddr_storage address;
+    parserTorrent           cached;
+    fetchRun               *run;
+    uv_loop_t               loop;
+    char                    path[1024];
+    uint64_t                size;
+    uint8_t                 isRegular;
+    uint32_t                i;
+    int                     result = -1;
+
+    *runOut = NULL;
+    magnetCachePath(directory, link->infoHash, path, sizeof(path));
+    if (platformFileStat(path, &size, &isRegular) == 0 && isRegular &&
+        readFile(allocator, path, buffer, length) == 0) {
+        if (parserParse(context, *buffer, *length, &cached) == PARSER_OK) {
+            int same = memcmp(cached.infoHash, link->infoHash, PARSER_SHA1_LENGTH) == 0;
+
+            parserFree(context, &cached);
+            if (same) {
+                printf("Using the torrent fetched before: %s\n", path);
+                return 0;
+            }
+        }
+        allocator->free(*buffer);
+        *buffer = NULL;
+    }
+    if (link->trackerCount == 0 && link->peerCount == 0) {
+        printf("The magnet link names no trackers or peers, and without DHT there is no other\n"
+               "way to find peers yet.\n");
+        return -1;
+    }
+
+    run = allocator->realloc(NULL, sizeof(*run));
+    if (run == NULL) {
+        return -1;
+    }
+    memset(run, 0, sizeof(*run));
+    run->loop = &loop;
+    run->context = context;
+    uv_loop_init(&loop);
+    uv_timer_init(&loop, &run->timer);
+    run->timer.data = run;
+    uv_signal_init(&loop, &run->interrupt);
+    run->interrupt.data = run;
+#ifndef _WIN32
+    uv_signal_init(&loop, &run->terminate);
+    run->terminate.data = run;
+#endif
+
+    printf("\nFetching the torrent's metadata from peers; Ctrl-C to stop\n");
+    fflush(stdout);
+    memset(&options, 0, sizeof(options));
+    memcpy(options.infoHash, link->infoHash, PARSER_SHA1_LENGTH);
+    memcpy(options.peerId, config->peerId, PEER_ID_LENGTH);
+    options.handshakeTimeoutSeconds = timeoutSeconds;
+    options.listenPort = listenPort;
+    if (peerInit(&loop, context, config->binding) == PEER_OK &&
+        metadataBegin(&loop, context, &options, &events, run, &run->fetch) == METADATA_OK) {
+        for (i = 0; i < link->peerCount; i++) {
+            if (parsePeerAddress(link->peers[i], &address)) {
+                metadataAddPeer(run->fetch, (const struct sockaddr *)&address);
+                rememberPeer(run, (const struct sockaddr *)&address);
+            }
+        }
+        if (link->trackerCount > 0 && trackerInit(&loop, context, &settings) == TRACKER_OK) {
+            announceBeginUrls(&loop, context, link->infoHash, link->trackers, link->trackerCount,
+                              &announceCallbacks, run, &run->trackers);
+        }
+        uv_timer_start(&run->timer, onFetchTick, 5000u, 5000u);
+        uv_signal_start(&run->interrupt, onFetchInterrupt, SIGINT);
+#ifndef _WIN32
+        uv_signal_start(&run->terminate, onFetchInterrupt, SIGTERM);
+#endif
+        uv_run(&loop, UV_RUN_DEFAULT);              /* until stopFetch() */
+        if (link->trackerCount > 0) {
+            trackerShutdown();
+        }
+        peerShutdown();
+    }
+    stopFetch(run);
+    uv_close((uv_handle_t *)&run->timer, NULL);
+    uv_close((uv_handle_t *)&run->interrupt, NULL);
+#ifndef _WIN32
+    uv_close((uv_handle_t *)&run->terminate, NULL);
+#endif
+    uv_run(&loop, UV_RUN_DEFAULT);
+    uv_loop_close(&loop);
+
+    if (run->info != NULL &&
+        magnetBuildTorrent(context, link, run->info, run->infoLength, buffer, length) ==
+            MAGNET_OK) {
+        printf("Got the metadata (%" PRIu32 " bytes).\n", run->infoLength);
+        if (directory != NULL && directory[0] != '\0') {
+            (void)platformMakeDirectory(directory);
+        }
+        if (saveFile(path, *buffer, *length) == 0) {
+            printf("Saved the torrent as %s\n", path);
+        }
+        result = 0;
+    } else if (!run->interrupted) {
+        printf("Could not get the metadata.\n");
+    }
+    if (run->info != NULL) {
+        allocator->free(run->info);
+        run->info = NULL;
+    }
+    *runOut = run;                                  /* for the peers it met */
+    return result;
+}
+
+/* Show what a magnet link says. */
+static int showMagnet(parserContext *context, const char *uri)
+{
+    magnetLink link;
+    uint32_t   i;
+
+    if (magnetParse(context, uri, &link) != MAGNET_OK) {
+        fprintf(stderr, "not a usable magnet link (it needs xt=urn:btih:...)\n");
+        return -1;
+    }
+    printf("Magnet link\n  Info hash:  ");
+    printHex(link.infoHash, PARSER_SHA1_LENGTH);
+    printf("\n  Name:       %s\n", (link.name != NULL) ? link.name : "(not given)");
+    for (i = 0; i < link.trackerCount; i++) {
+        printf("  %s %s\n", (i == 0) ? "Trackers:  " : "           ", link.trackers[i]);
+    }
+    for (i = 0; i < link.peerCount; i++) {
+        printf("  %s %s\n", (i == 0) ? "Peers:     " : "           ", link.peers[i]);
+    }
+    for (i = 0; i < link.webSeedCount; i++) {
+        printf("  %s %s\n", (i == 0) ? "Web seeds: " : "           ", link.webSeeds[i]);
+    }
+    printf("\nUse -D to download it: the torrent itself is fetched from peers first.\n");
+    magnetFree(context, &link);
+    return 0;
+}
+
 static int announceTorrent(parserContext *context, const parserAllocator *allocator,
                            const char *path, uint32_t timeoutSeconds, const char *caFile,
                            uint32_t mode, int64_t wanted, const char *outputDirectory,
@@ -1856,16 +2212,6 @@ static int announceTorrent(parserContext *context, const parserAllocator *alloca
     uint32_t          j;
     int32_t           status;
 
-    if (readFile(allocator, path, &buffer, &length) != 0) {
-        return -1;
-    }
-    status = parserParse(context, buffer, length, &torrent);
-    allocator->free(buffer);
-    if (status != PARSER_OK) {
-        fprintf(stderr, "%s: parse failed: %s\n", path, parserErrorString(status));
-        return -1;
-    }
-
     /* Peer id in the common "-XX0000-" client style, then random characters. */
     memset(&config, 0, sizeof(config));
     memcpy(config.peerId, "-TI0001-", 8);
@@ -1879,14 +2225,69 @@ static int announceTorrent(parserContext *context, const parserAllocator *alloca
     config.caFile = caFile;
     config.binding = binding;
 
+    /* The torrent: a file, or for a magnet link fetched from peers. The
+     * bytes are kept, so the info dictionary can be sent to others. */
+    if (magnetIs(path)) {
+        magnetLink link;
+        fetchRun  *fetched = NULL;
+
+        if (mode != MODE_DOWNLOAD) {
+            fprintf(stderr, "magnet links work with -D (or on their own, to show them)\n");
+            return -1;
+        }
+        if (magnetParse(context, path, &link) != MAGNET_OK) {
+            fprintf(stderr, "not a usable magnet link (it needs xt=urn:btih:...)\n");
+            return -1;
+        }
+        status = magnetTorrent(context, allocator, &link, &config, timeoutSeconds,
+                               outputDirectory, listenPort, &buffer, &length, &fetched);
+        magnetFree(context, &link);
+        if (status != 0) {
+            allocator->free(fetched);
+            return -1;
+        }
+        status = parserParse(context, buffer, length, &torrent);
+        if (status == PARSER_OK) {
+            uv_loop_init(&loop);
+            downloaded = (downloadTorrent(&loop, context, &torrent, &config, timeoutSeconds,
+                                          wanted, outputDirectory, listenPort, seed, mapPort,
+                                          buffer + torrent.infoOffset,
+                                          (uint32_t)torrent.infoLength,
+                                          (fetched != NULL) ? fetched->peers : NULL,
+                                          (fetched != NULL) ? fetched->peerCount : 0u) == 0);
+            uv_loop_close(&loop);
+            parserFree(context, &torrent);
+        } else {
+            fprintf(stderr, "the fetched torrent does not parse: %s\n",
+                    parserErrorString(status));
+        }
+        allocator->free(fetched);
+        allocator->free(buffer);
+        return downloaded ? 0 : -1;
+    }
+    if (readFile(allocator, path, &buffer, &length) != 0) {
+        return -1;
+    }
+    status = parserParse(context, buffer, length, &torrent);
+    if (status != PARSER_OK) {
+        fprintf(stderr, "%s: parse failed: %s\n", path, parserErrorString(status));
+        allocator->free(buffer);
+        return -1;
+    }
+
     uv_loop_init(&loop);
     if (mode == MODE_DOWNLOAD) {
         downloaded = (downloadTorrent(&loop, context, &torrent, &config, timeoutSeconds, wanted,
-                                      outputDirectory, listenPort, seed, mapPort) == 0);
+                                      outputDirectory, listenPort, seed, mapPort,
+                                      buffer + torrent.infoOffset, (uint32_t)torrent.infoLength,
+                                      NULL, 0) == 0);
         uv_loop_close(&loop);
         parserFree(context, &torrent);
+        allocator->free(buffer);
         return downloaded ? 0 : -1;
     }
+    allocator->free(buffer);
+    buffer = NULL;
     status = trackerInit(&loop, context, &config);
     if (status != TRACKER_OK) {
         fprintf(stderr, "trackerInit: %s\n", trackerStatusString(status));
@@ -2074,12 +2475,12 @@ static char **utf8Arguments(const parserAllocator *allocator, int *count)
 static void usage(const char *program)
 {
     fprintf(stderr,
-            "usage: %s <file.torrent>\n"
+            "usage: %s <file.torrent | magnet-link>\n"
             "       %s -o <output.torrent> [options] <file>...\n"
             "       %s -t [-T seconds] [-C ca.pem] [-I interface] <file.torrent>\n"
             "       %s -P [-T seconds] [-C ca.pem] [-I interface] <file.torrent>\n"
             "       %s -D [-S] [-L port] [-N] [-O dir] [-i piece] [-T seconds] [-C ca.pem]\n"
-            "            [-I interface] <file.torrent>\n"
+            "            [-I interface] <file.torrent | magnet-link>\n"
             "       %s -V [-O dir] <file.torrent>\n"
             "\n"
             "  -o file   create a torrent from the given files and write it to 'file'\n"
@@ -2342,7 +2743,8 @@ int main(int argc, char **argv)
             usage(argv[0]);
             goto cleanup;
         }
-        status = inspectTorrent(&context, &allocator, argv[optionIndex]);
+        status = magnetIs(argv[optionIndex]) ? showMagnet(&context, argv[optionIndex])
+                                             : inspectTorrent(&context, &allocator, argv[optionIndex]);
     }
 
 cleanup:

@@ -98,6 +98,8 @@
     <ClCompile Include="src\announce.c" />
     <ClCompile Include="src\extension.c" />
     <ClCompile Include="src\portmap.c" />
+    <ClCompile Include="src\magnet.c" />
+    <ClCompile Include="src\metadata.c" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="src\queue.h" />
@@ -116,6 +118,8 @@
     <ClInclude Include="src\announce.h" />
     <ClInclude Include="src\extension.h" />
     <ClInclude Include="src\portmap.h" />
+    <ClInclude Include="src\magnet.h" />
+    <ClInclude Include="src\metadata.h" />
   </ItemGroup>
   <ItemGroup>
     <None Include="vcpkg.json" />

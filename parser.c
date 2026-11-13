@@ -412,7 +412,8 @@ static int32_t readOwnedString(parserContext *context, parserCursor *cursor, cha
 
 /*
  * A path component must be usable as a single file name, and must not let
- * a hostile torrent escape the download directory.
+ * a hostile torrent escape the download directory. '\\' is rejected on
+ * every platform because it is a path separator on Windows ("..\\x").
  */
 static uint8_t isSafeComponent(const uint8_t *data, uint64_t length)
 {
@@ -424,6 +425,7 @@ static uint8_t isSafeComponent(const uint8_t *data, uint64_t length)
         return 0;
     }
     if (memchr(data, '/', (size_t)length) != NULL ||
+        memchr(data, '\\', (size_t)length) != NULL ||
         memchr(data, '\0', (size_t)length) != NULL) {
         return 0;
     }

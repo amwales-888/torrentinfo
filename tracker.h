@@ -40,10 +40,13 @@
  *     trackerShutdown();              when finished with all trackers,
  *     uv_run(loop, UV_RUN_DEFAULT);   then let the loop finish closing
  *
- * Building: <uv.h> needs POSIX types, so with -std=c99 define
- * _POSIX_C_SOURCE=200809L (before any #include, or with -D on the command
- * line), or use -std=gnu99. Link with
- * $(pkg-config --cflags --libs libuv openssl).
+ * Building:
+ *   Linux:   <uv.h> needs POSIX types, so with -std=c99 define
+ *            _POSIX_C_SOURCE=200809L (before any #include, or with -D on the
+ *            command line), or use -std=gnu99. Link with
+ *            $(pkg-config --cflags --libs libuv openssl). See the Makefile.
+ *   Windows: define WIN32_LEAN_AND_MEAN and link libuv, OpenSSL and the
+ *            system libraries they need. torrentinfo.sln does all of this.
  */
 #ifndef TRACKER_H
 #define TRACKER_H

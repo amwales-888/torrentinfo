@@ -18,13 +18,14 @@
  * a request is freed when detached (callback returned, or cancelled) and
  * pending is zero.
  */
+#ifndef _WIN32
 #define _POSIX_C_SOURCE 200809L
+#endif
 
 #include <inttypes.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
-#include <sys/queue.h>
 
 #include "http.h"   /* httpUrlParse() */
 #include "udp.h"

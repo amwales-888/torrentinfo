@@ -28,8 +28,8 @@
  *         }
  *     }   // the request is freed after the callback returns
  *
- * Building: as for tracker.h, define _POSIX_C_SOURCE=200809L with
- * -std=c99, and link with $(pkg-config --cflags --libs libuv openssl).
+ * Building: as for tracker.h. On Windows also link crypt32.lib (for the
+ * system certificate store).
  */
 #ifndef HTTP_H
 #define HTTP_H
@@ -70,10 +70,11 @@ extern "C" {
 /* Settings for the module. Copied by httpInit(); strings are only read there. */
 typedef struct httpConfig {
     const char *caFile;     /* PEM file of trusted CAs, or NULL for the
-                               system's CA bundle ($SSL_CERT_FILE, else the
-                               usual Linux locations). Either way the
-                               certificates are loaded into memory here, so
-                               handshakes never read from disk.            */
+                               system's trusted CAs ($SSL_CERT_FILE; else
+                               the Windows certificate store, or the usual
+                               Linux bundle locations). Either way they are
+                               loaded into memory here, so handshakes never
+                               read from disk.                             */
     const char *userAgent;  /* NULL for HTTP_DEFAULT_USER_AGENT; at most 127
                                characters                                  */
 } httpConfig;

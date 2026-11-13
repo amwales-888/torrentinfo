@@ -5,25 +5,31 @@
  * Create:   ./torrentinfo -o out.torrent [options] file1 [file2 ...]
  * Announce: ./torrentinfo -t [-T seconds] [-C ca.pem] file.torrent
  *
- * Build:    cc -std=c99 -Wall -Wextra -O2 -o torrentinfo main.c parser.c encoder.c \
- *               http.c udp.c tracker.c $(pkg-config --cflags --libs libuv openssl)
+ * Options come before the file names.
+ *
+ * Build:    Linux:   make   (see Makefile)
+ *           Windows: open torrentinfo.sln in Visual Studio (see BUILDING.md)
  */
+#ifndef _WIN32
 #define _POSIX_C_SOURCE 200809L
+#endif
 
 #include <errno.h>
-#include <fcntl.h>
 #include <inttypes.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/stat.h>
 #include <time.h>
-#include <unistd.h>
 
 #include "encoder.h"
 #include "parser.h"
-#include "tracker.h"
+#include "platform.h"
+#include "tracker.h"    /* includes <uv.h>, and on Windows <windows.h> */
+
+#ifdef _WIN32
+#include <shellapi.h>   /* CommandLineToArgvW(); not in WIN32_LEAN_AND_MEAN */
+#endif
 
 static const uint64_t maxTorrentSize = 64u * 1024u * 1024u;
 static const uint32_t piecePreviewCount = 3u;
@@ -63,60 +69,57 @@ static void trackingFree(void *ptr)
 static int readFile(const parserAllocator *allocator, const char *path,
                     uint8_t **bufferOut, uint64_t *lengthOut)
 {
-    struct stat info;
-    uint8_t    *buffer;
-    uint64_t    size;
-    uint64_t    total = 0;
-    ssize_t     count;
-    int         fd;
+    platformFile file;
+    uint8_t     *buffer;
+    uint64_t     size;
+    uint64_t     total = 0;
+    uint32_t     count;
+    uint8_t      isRegular;
+    int32_t      result;
 
-    fd = open(path, O_RDONLY | O_CLOEXEC);
-    if (fd < 0) {
-        fprintf(stderr, "%s: %s\n", path, strerror(errno));
+    result = platformFileOpenRead(path, &file);
+    if (result != 0) {
+        fprintf(stderr, "%s: %s\n", path, uv_strerror(result));
         return -1;
     }
-    if (fstat(fd, &info) != 0) {
-        fprintf(stderr, "%s: %s\n", path, strerror(errno));
-        close(fd);
+    result = platformFileInfo(&file, &size, &isRegular);
+    if (result != 0) {
+        fprintf(stderr, "%s: %s\n", path, uv_strerror(result));
+        platformFileClose(&file);
         return -1;
     }
-    if (!S_ISREG(info.st_mode)) {
+    if (!isRegular) {
         fprintf(stderr, "%s: not a regular file\n", path);
-        close(fd);
+        platformFileClose(&file);
         return -1;
     }
-    if (info.st_size <= 0 || (uint64_t)info.st_size > maxTorrentSize) {
-        fprintf(stderr, "%s: unexpected file size (%lld bytes)\n",
-                path, (long long)info.st_size);
-        close(fd);
+    if (size == 0 || size > maxTorrentSize) {
+        fprintf(stderr, "%s: unexpected file size (%" PRIu64 " bytes)\n", path, size);
+        platformFileClose(&file);
         return -1;
     }
-    size = (uint64_t)info.st_size;
 
     buffer = allocator->realloc(NULL, (size_t)size);
     if (buffer == NULL) {
         fprintf(stderr, "%s: out of memory\n", path);
-        close(fd);
+        platformFileClose(&file);
         return -1;
     }
 
     while (total < size) {
-        count = read(fd, buffer + total, (size_t)(size - total));
-        if (count < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-            fprintf(stderr, "%s: %s\n", path, strerror(errno));
+        result = platformFileRead(&file, buffer + total, (uint32_t)(size - total), &count);
+        if (result != 0) {
+            fprintf(stderr, "%s: %s\n", path, uv_strerror(result));
             allocator->free(buffer);
-            close(fd);
+            platformFileClose(&file);
             return -1;
         }
         if (count == 0) {
             break;
         }
-        total += (uint64_t)count;
+        total += count;
     }
-    close(fd);
+    platformFileClose(&file);
 
     if (total != size) {
         fprintf(stderr, "%s: short read\n", path);
@@ -201,6 +204,16 @@ static void printFilePath(const parserTorrent *torrent, const parserFile *file)
     }
 }
 
+/* Thread-safe UTC conversion: gmtime_r() on POSIX, gmtime_s() on Windows. */
+static int toUtc(time_t timestamp, struct tm *calendar)
+{
+#ifdef _WIN32
+    return gmtime_s(calendar, &timestamp) == 0;
+#else
+    return gmtime_r(&timestamp, calendar) != NULL;
+#endif
+}
+
 static void printTorrent(const char *path, const parserTorrent *torrent)
 {
     const parserTier *tier;
@@ -229,7 +242,7 @@ static void printTorrent(const char *path, const parserTorrent *torrent)
     printField("Created by:", torrent->createdBy);
     if (torrent->hasCreationDate) {
         timestamp = (time_t)torrent->creationDate;
-        if (gmtime_r(&timestamp, &calendar) != NULL &&
+        if (toUtc(timestamp, &calendar) &&
             strftime(dateText, sizeof(dateText), "%Y-%m-%d %H:%M:%S UTC", &calendar) > 0) {
             printf("  %-15s %s (%" PRId64 ")\n", "Creation date:", dateText,
                    torrent->creationDate);
@@ -292,7 +305,7 @@ static void printTorrent(const char *path, const parserTorrent *torrent)
 static void printEncoderError(const char *path, int32_t result, int32_t systemError)
 {
     if (result == ENCODER_ERROR_IO && systemError != 0) {
-        fprintf(stderr, "%s: %s\n", path, strerror(systemError));
+        fprintf(stderr, "%s: %s\n", path, uv_strerror(systemError));
     } else {
         fprintf(stderr, "%s: %s\n", path, encoderErrorString(result));
     }
@@ -332,29 +345,28 @@ static int inspectTorrent(parserContext *context, const parserAllocator *allocat
 
 static int writeFile(const char *path, const uint8_t *data, uint64_t length)
 {
-    uint64_t total = 0;
-    ssize_t  count;
-    int      fd;
+    platformFile file;
+    uint64_t     total = 0;
+    uint32_t     count;
+    int32_t      result;
 
-    fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
-    if (fd < 0) {
-        fprintf(stderr, "%s: %s\n", path, strerror(errno));
+    result = platformFileOpenWrite(path, &file);
+    if (result != 0) {
+        fprintf(stderr, "%s: %s\n", path, uv_strerror(result));
         return -1;
     }
     while (total < length) {
-        count = write(fd, data + total, (size_t)(length - total));
-        if (count < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-            fprintf(stderr, "%s: %s\n", path, strerror(errno));
-            close(fd);
+        result = platformFileWrite(&file, data + total, (uint32_t)(length - total), &count);
+        if (result != 0) {
+            fprintf(stderr, "%s: %s\n", path, uv_strerror(result));
+            platformFileClose(&file);
             return -1;
         }
-        total += (uint64_t)count;
+        total += count;
     }
-    if (close(fd) != 0) {
-        fprintf(stderr, "%s: %s\n", path, strerror(errno));
+    result = platformFileClose(&file);
+    if (result != 0) {
+        fprintf(stderr, "%s: %s\n", path, uv_strerror(result));
         return -1;
     }
     return 0;
@@ -365,10 +377,20 @@ static void nameFromOutput(const char *outputPath, char *name, size_t size)
 {
     static const char suffix[] = ".torrent";
     const size_t      suffixLength = sizeof(suffix) - 1u;
-    const char       *base = strrchr(outputPath, '/');
+    const char       *base = outputPath;
+    const char       *p;
     size_t            length;
 
-    base = (base != NULL) ? base + 1 : outputPath;
+    /* The file name part: after the last '/' (and on Windows '\\' or "C:"). */
+    for (p = outputPath; *p != '\0'; p++) {
+#ifdef _WIN32
+        if (*p == '/' || *p == '\\' || (*p == ':' && p == outputPath + 1)) {
+#else
+        if (*p == '/') {
+#endif
+            base = p + 1;
+        }
+    }
     length = strlen(base);
     if (length > suffixLength && strcmp(base + length - suffixLength, suffix) == 0) {
         length -= suffixLength;
@@ -737,6 +759,107 @@ static int announceTorrent(parserContext *context, const parserAllocator *alloca
 
 /* ------------------------------------------------------------------------ */
 
+/*
+ * Minimal getopt(): Windows has none. 'spec' lists option letters, with ':'
+ * after those that take a value ("-o file" or "-ofile"). Flags may be
+ * grouped ("-pt"). Option parsing stops at the first non-option or "--".
+ * Returns the option letter, '?' for an unknown option or missing value,
+ * or -1 when there are no more options.
+ */
+static int         optionIndex = 1;     /* next argv element to examine */
+static const char *optionValue;         /* value of the last option     */
+
+static int nextOption(int argc, char **argv, const char *spec)
+{
+    static const char *cursor = NULL;   /* position within grouped flags */
+    const char        *found;
+    int                letter;
+
+    if (cursor == NULL || *cursor == '\0') {
+        if (optionIndex >= argc || argv[optionIndex][0] != '-' ||
+            argv[optionIndex][1] == '\0') {
+            return -1;
+        }
+        if (strcmp(argv[optionIndex], "--") == 0) {
+            optionIndex++;
+            return -1;
+        }
+        cursor = argv[optionIndex++] + 1;
+    }
+
+    letter = (unsigned char)*cursor++;
+    found = (letter != ':') ? strchr(spec, letter) : NULL;
+    if (found == NULL) {
+        fprintf(stderr, "unknown option -%c\n", letter);
+        return '?';
+    }
+    if (found[1] == ':') {
+        if (*cursor != '\0') {                  /* "-ofile" */
+            optionValue = cursor;
+        } else if (optionIndex < argc) {        /* "-o file" */
+            optionValue = argv[optionIndex++];
+        } else {
+            fprintf(stderr, "option -%c needs a value\n", letter);
+            return '?';
+        }
+        cursor = NULL;
+    }
+    return letter;
+}
+
+#ifdef _WIN32
+/*
+ * Windows passes main() its arguments in the ANSI code page, which cannot
+ * represent every file name. Rebuild argv from the UTF-16 command line as
+ * UTF-8, which is what the library expects for paths and torrent names.
+ */
+static void freeArguments(const parserAllocator *allocator, char **arguments)
+{
+    int i;
+
+    if (arguments != NULL) {
+        for (i = 0; arguments[i] != NULL; i++) {
+            allocator->free(arguments[i]);
+        }
+        allocator->free((void *)arguments);
+    }
+}
+
+static char **utf8Arguments(const parserAllocator *allocator, int *count)
+{
+    wchar_t **wide;
+    char    **arguments;
+    int       total;
+    int       bytes;
+    int       i;
+
+    wide = CommandLineToArgvW(GetCommandLineW(), &total);
+    if (wide == NULL) {
+        return NULL;
+    }
+    arguments = allocator->realloc(NULL, sizeof(*arguments) * ((size_t)total + 1u));
+    if (arguments == NULL) {
+        LocalFree(wide);
+        return NULL;
+    }
+    memset(arguments, 0, sizeof(*arguments) * ((size_t)total + 1u));
+
+    for (i = 0; i < total; i++) {
+        bytes = WideCharToMultiByte(CP_UTF8, 0, wide[i], -1, NULL, 0, NULL, NULL);
+        arguments[i] = (bytes > 0) ? allocator->realloc(NULL, (size_t)bytes) : NULL;
+        if (arguments[i] == NULL ||
+            WideCharToMultiByte(CP_UTF8, 0, wide[i], -1, arguments[i], bytes, NULL, NULL) == 0) {
+            freeArguments(allocator, arguments);
+            LocalFree(wide);
+            return NULL;
+        }
+    }
+    LocalFree(wide);
+    *count = total;
+    return arguments;
+}
+#endif
+
 static void usage(const char *program)
 {
     fprintf(stderr,
@@ -781,10 +904,21 @@ int main(int argc, char **argv)
 
     memset(&options, 0, sizeof(options));
 
+#ifdef _WIN32
+    /* Torrent names and paths are UTF-8; show them correctly in the console,
+     * and take the arguments as UTF-8 too. */
+    SetConsoleOutputCP(CP_UTF8);
+    argv = utf8Arguments(&allocator, &argc);
+    if (argv == NULL) {
+        fprintf(stderr, "could not read the command line\n");
+        return EXIT_FAILURE;
+    }
+#endif
+
     result = parserInit(&context, &allocator);
     if (result != PARSER_OK) {
         fprintf(stderr, "parserInit: %s\n", parserErrorString(result));
-        return EXIT_FAILURE;
+        goto cleanup;
     }
 
     /* One slot per argument is always enough for the -a and -w values. */
@@ -797,31 +931,31 @@ int main(int argc, char **argv)
     options.trackers = (const char *const *)trackers;
     options.webSeeds = (const char *const *)webSeeds;
 
-    while ((option = getopt(argc, argv, "o:a:w:c:n:l:ptT:C:h")) != -1) {
+    while ((option = nextOption(argc, argv, "o:a:w:c:n:l:ptT:C:h")) != -1) {
         switch (option) {
         case 'o':
-            outputPath = optarg;
+            outputPath = optionValue;
             break;
         case 'a':
-            trackers[options.trackerCount++] = optarg;
+            trackers[options.trackerCount++] = optionValue;
             createOnly = 1;
             break;
         case 'w':
-            webSeeds[options.webSeedCount++] = optarg;
+            webSeeds[options.webSeedCount++] = optionValue;
             createOnly = 1;
             break;
         case 'c':
-            options.comment = optarg;
+            options.comment = optionValue;
             createOnly = 1;
             break;
         case 'n':
-            options.name = optarg;
+            options.name = optionValue;
             createOnly = 1;
             break;
         case 'l':
-            if (parsePieceLength(optarg, &options.pieceLength) != 0) {
+            if (parsePieceLength(optionValue, &options.pieceLength) != 0) {
                 fprintf(stderr, "invalid piece length '%s': use a power of two "
-                        "from 16K to 64M\n", optarg);
+                        "from 16K to 64M\n", optionValue);
                 goto cleanup;
             }
             createOnly = 1;
@@ -834,16 +968,16 @@ int main(int argc, char **argv)
             announce = 1;
             break;
         case 'T':
-            number = strtoul(optarg, &end, 10);
-            if (*optarg < '0' || *optarg > '9' || *end != '\0' || number == 0 || number > 3600u) {
-                fprintf(stderr, "invalid timeout '%s': use 1 to 3600 seconds\n", optarg);
+            number = strtoul(optionValue, &end, 10);
+            if (*optionValue < '0' || *optionValue > '9' || *end != '\0' || number == 0 || number > 3600u) {
+                fprintf(stderr, "invalid timeout '%s': use 1 to 3600 seconds\n", optionValue);
                 goto cleanup;
             }
             timeoutSeconds = (uint32_t)number;
             announceOnly = 1;
             break;
         case 'C':
-            caFile = optarg;
+            caFile = optionValue;
             announceOnly = 1;
             break;
         case 'h':
@@ -862,31 +996,34 @@ int main(int argc, char **argv)
     }
 
     if (announce) {
-        if (outputPath != NULL || createOnly || argc - optind != 1) {
+        if (outputPath != NULL || createOnly || argc - optionIndex != 1) {
             usage(argv[0]);
             goto cleanup;
         }
-        status = announceTorrent(&context, &allocator, argv[optind], timeoutSeconds, caFile);
+        status = announceTorrent(&context, &allocator, argv[optionIndex], timeoutSeconds, caFile);
     } else if (outputPath != NULL) {
-        if (optind >= argc) {
+        if (optionIndex >= argc) {
             usage(argv[0]);
             goto cleanup;
         }
         options.createdBy = "torrentinfo";
         options.creationDate = (int64_t)time(NULL);
         options.hasCreationDate = 1;
-        status = createTorrent(&context, outputPath, &options, argv + optind, argc - optind);
+        status = createTorrent(&context, outputPath, &options, argv + optionIndex, argc - optionIndex);
     } else {
-        if (createOnly || argc - optind != 1) {
+        if (createOnly || argc - optionIndex != 1) {
             usage(argv[0]);
             goto cleanup;
         }
-        status = inspectTorrent(&context, &allocator, argv[optind]);
+        status = inspectTorrent(&context, &allocator, argv[optionIndex]);
     }
 
 cleanup:
     allocator.free((void *)trackers);
     allocator.free((void *)webSeeds);
+#ifdef _WIN32
+    freeArguments(&allocator, argv);
+#endif
 
     if (liveAllocations != 0) {
         fprintf(stderr, "warning: %" PRIu64 " allocation(s) not freed\n", liveAllocations);

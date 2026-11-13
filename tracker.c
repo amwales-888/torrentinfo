@@ -18,13 +18,14 @@
  * has reached zero. When an announce finishes, its handles are closed at
  * once, but its results stay until trackerClose().
  */
+#ifndef _WIN32
 #define _POSIX_C_SOURCE 200809L
+#endif
 
 #include <inttypes.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
-#include <sys/queue.h>
 
 #include "http.h"
 #include "tracker.h"

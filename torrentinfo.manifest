@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!--
+  Application manifest for torrentinfo.exe.
+    activeCodePage UTF-8: argv and other narrow-character APIs use UTF-8
+                          (Windows 10 version 1903 and later), so file names
+                          given on the command line reach the library as UTF-8.
+    longPathAware:        allow paths longer than 260 characters where the
+                          system has long paths enabled.
+-->
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <application xmlns="urn:schemas-microsoft-com:asm.v3">
+    <windowsSettings>
+      <activeCodePage xmlns="http://schemas.microsoft.com/SMI/2019/WindowsSettings">UTF-8</activeCodePage>
+      <longPathAware xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">true</longPathAware>
+    </windowsSettings>
+  </application>
+</assembly>

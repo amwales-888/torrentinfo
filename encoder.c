@@ -8,15 +8,14 @@
  * which keeps the encoding functions linear and easy to compare with the
  * specification.
  */
+#ifndef _WIN32
 #define _POSIX_C_SOURCE 200809L
+#endif
 
-#include <errno.h>
-#include <fcntl.h>
 #include <string.h>
-#include <sys/stat.h>
-#include <unistd.h>
 
 #include "encoder.h"
+#include "platform.h"   /* file access on Linux and Windows */
 
 #define ENCODER_STATE_MAGIC             0x454E4344u     /* "ENCD" */
 #define ENCODER_WRITER_MIN_CAPACITY     256u
@@ -81,13 +80,34 @@ static int32_t copyString(parserContext *context, const char *text, char **out)
     return ENCODER_OK;
 }
 
-/* A name used as a single path component: not "", ".", "..", and no '/'. */
+/* A name used as a single path component: not "", ".", "..", and no '/'
+ * or '\\' (a separator on Windows), matching what the parser accepts. */
 static uint8_t isSafeName(const char *name)
 {
     return (uint8_t)(name[0] != '\0' &&
                      strcmp(name, ".") != 0 &&
                      strcmp(name, "..") != 0 &&
-                     strchr(name, '/') == NULL);
+                     strchr(name, '/') == NULL &&
+                     strchr(name, '\\') == NULL);
+}
+
+/* The file name part of a path: after the last separator ('/' everywhere;
+ * also '\\' and a drive prefix such as "C:" on Windows). */
+static const char *baseName(const char *path)
+{
+    const char *name = path;
+    const char *p;
+
+    for (p = path; *p != '\0'; p++) {
+#ifdef _WIN32
+        if (*p == '/' || *p == '\\' || (*p == ':' && p == path + 1)) {
+#else
+        if (*p == '/') {
+#endif
+            name = p + 1;
+        }
+    }
+    return name;
 }
 
 static uint8_t isPowerOfTwo(uint64_t value)
@@ -520,9 +540,10 @@ static void statWork(uv_work_t *work)
 {
     encoderState      *encoder = work->data;
     encoderSourceFile *source;
-    struct stat        info;
     uint64_t           total = 0;
     uint32_t           index = 0;
+    uint8_t            isRegular;
+    int32_t            result;
 
     encoder->workResult = ENCODER_OK;
     TAILQ_FOREACH(source, &encoder->files, entries) {
@@ -531,16 +552,16 @@ static void statWork(uv_work_t *work)
             return;
         }
         encoder->errorFileIndex = index;
-        if (stat(source->diskPath, &info) != 0) {
-            encoder->systemError = errno;
+        result = platformFileStat(source->diskPath, &source->length, &isRegular);
+        if (result != 0) {
+            encoder->systemError = result;
             encoder->workResult = ENCODER_ERROR_IO;
             return;
         }
-        if (!S_ISREG(info.st_mode)) {
+        if (!isRegular) {
             encoder->workResult = ENCODER_ERROR_NOT_REGULAR_FILE;
             return;
         }
-        source->length = (uint64_t)info.st_size;
         if (source->length > (uint64_t)INT64_MAX - total) {
             encoder->workResult = ENCODER_ERROR_TOO_LARGE;  /* bencode integers are signed */
             return;
@@ -558,56 +579,56 @@ static void statWork(uv_work_t *work)
 static int32_t hashFile(encoderState *encoder, const encoderSourceFile *source,
                         parserTorrent *torrent, uint64_t *fill, uint32_t *index)
 {
-    uint8_t    *piece = encoder->pieceBuffer;
-    struct stat info;
-    uint64_t    remaining = source->length;
-    uint64_t    wanted;
-    ssize_t     count;
-    int         fd;
+    uint8_t     *piece = encoder->pieceBuffer;
+    platformFile file;
+    uint64_t     remaining = source->length;
+    uint64_t     wanted;
+    uint64_t     size;
+    uint32_t     count;
+    uint8_t      isRegular;
+    int32_t      result;
 
-    fd = open(source->diskPath, O_RDONLY | O_CLOEXEC);
-    if (fd < 0) {
-        encoder->systemError = errno;
+    result = platformFileOpenRead(source->diskPath, &file);
+    if (result != 0) {
+        encoder->systemError = result;
         return ENCODER_ERROR_IO;
     }
-    if (fstat(fd, &info) != 0) {
-        encoder->systemError = errno;
-        close(fd);
+    result = platformFileInfo(&file, &size, &isRegular);
+    if (result != 0) {
+        encoder->systemError = result;
+        platformFileClose(&file);
         return ENCODER_ERROR_IO;
     }
-    if (!S_ISREG(info.st_mode) || (uint64_t)info.st_size != source->length) {
-        close(fd);
+    if (!isRegular || size != source->length) {
+        platformFileClose(&file);
         return ENCODER_ERROR_FILE_CHANGED;
     }
 
     while (remaining > 0) {
         if (isCancelled(encoder)) {
-            close(fd);
+            platformFileClose(&file);
             return ENCODER_ERROR_CANCELLED;
         }
-        wanted = torrent->pieceLength - *fill;
+        wanted = torrent->pieceLength - *fill;      /* at most 64 MiB */
         if (wanted > remaining) {
             wanted = remaining;
         }
-        count = read(fd, piece + *fill, (size_t)wanted);
-        if (count < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-            encoder->systemError = errno;
-            close(fd);
+        result = platformFileRead(&file, piece + *fill, (uint32_t)wanted, &count);
+        if (result != 0) {
+            encoder->systemError = result;
+            platformFileClose(&file);
             return ENCODER_ERROR_IO;
         }
         if (count == 0) {
-            close(fd);
+            platformFileClose(&file);
             return ENCODER_ERROR_FILE_CHANGED;      /* file shrank */
         }
-        *fill += (uint64_t)count;
-        remaining -= (uint64_t)count;
+        *fill += count;
+        remaining -= count;
 
         if (*fill == torrent->pieceLength) {
             if (*index >= torrent->pieceCount) {
-                close(fd);
+                platformFileClose(&file);
                 return ENCODER_ERROR_FILE_CHANGED;
             }
             parserSha1(piece, *fill,
@@ -616,7 +637,7 @@ static int32_t hashFile(encoderState *encoder, const encoderSourceFile *source,
             *fill = 0;
         }
     }
-    close(fd);
+    platformFileClose(&file);
     return ENCODER_OK;
 }
 
@@ -853,7 +874,6 @@ int32_t encoderAddFile(encoderState *encoder, const char *path)
     parserContext     *context;
     encoderSourceFile *source;
     encoderSourceFile *existing;
-    const char        *slash;
     const char        *name;
 
     if (encoder == NULL || path == NULL || encoder->magic != ENCODER_STATE_MAGIC ||
@@ -864,8 +884,7 @@ int32_t encoderAddFile(encoderState *encoder, const char *path)
     encoder->errorFileIndex = encoder->fileCount;
     encoder->systemError = 0;
 
-    slash = strrchr(path, '/');
-    name = (slash != NULL) ? slash + 1 : path;
+    name = baseName(path);
     if (!isSafeName(name)) {
         return ENCODER_ERROR_INVALID_NAME;
     }

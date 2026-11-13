@@ -45,7 +45,7 @@
 #define ENCODER_H
 
 #include <stdint.h>
-#include <sys/queue.h>  /* BSD queue.h */
+#include "queue.h"      /* bundled 4.4BSD queue.h */
 #include <uv.h>
 
 #include "parser.h"
@@ -68,13 +68,13 @@ extern "C" {
  * (e.g. PARSER_ERROR_NO_MEMORY); encoderErrorString() describes both.
  */
 #define ENCODER_OK                      0
-#define ENCODER_ERROR_IO                (-20)   /* System call failed: see systemError */
+#define ENCODER_ERROR_IO                (-20)   /* File access failed: see systemError */
 #define ENCODER_ERROR_NOT_REGULAR_FILE  (-21)   /* Path is a directory, device, ...    */
 #define ENCODER_ERROR_DUPLICATE_FILE    (-22)   /* Two files with the same name        */
 #define ENCODER_ERROR_NO_FILES          (-23)   /* encoderEnd() before any AddFile     */
 #define ENCODER_ERROR_FILE_CHANGED      (-24)   /* File size changed while hashing     */
 #define ENCODER_ERROR_TOO_LARGE         (-25)   /* Too much data for the piece length  */
-#define ENCODER_ERROR_INVALID_NAME      (-26)   /* Name is empty, ".", ".." or has '/' */
+#define ENCODER_ERROR_INVALID_NAME      (-26)   /* Name is "", ".", ".." or has / or \ */
 #define ENCODER_ERROR_CANCELLED         (-27)   /* encoderAbort() during encoderEnd()  */
 
 /* ------------------------------------------------------------------------ */
@@ -126,7 +126,9 @@ typedef struct encoderState {
     struct encoderSourceList files;
     uint32_t                 fileCount;
     uint64_t                 totalLength;
-    int32_t                  systemError;    /* errno for ENCODER_ERROR_IO       */
+    int32_t                  systemError;    /* For ENCODER_ERROR_IO: a libuv
+                                                error code (UV_ENOENT, ...); see
+                                                uv_strerror()                    */
     uint32_t                 errorFileIndex; /* Which file (0-based, in the order
                                                 added) caused the last error     */
 
@@ -172,7 +174,8 @@ int32_t encoderBegin(encoderState *encoder, parserContext *context, uv_loop_t *l
 
 /*
  * Queue a file. No I/O happens here: the path is only recorded. The file
- * appears in the torrent under its own name (the last part of 'path'), so
+ * appears in the torrent under its own name (the last part of 'path';
+ * on Windows '\\' and "C:" also separate parts), so
  * two files with the same name are rejected. Files appear in the order
  * they are added. Whether the file exists and is a regular file is checked
  * by encoderEnd(), which reports problems with errorFileIndex.

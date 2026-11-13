@@ -10,7 +10,7 @@
  * The library never calls malloc/realloc/free directly. Every allocation
  * goes through the parserAllocator supplied to parserInit().
  *
- * Lists use the BSD <sys/queue.h> TAILQ macros.
+ * Lists use the TAILQ macros from the bundled 4.4BSD queue.h.
  *
  * Usage:
  *     parserContext context;
@@ -32,7 +32,7 @@
 
 #include <stddef.h>     /* size_t: needed so realloc()/free() can be passed directly */
 #include <stdint.h>
-#include <sys/queue.h>  /* BSD queue.h */
+#include "queue.h"      /* bundled 4.4BSD queue.h */
 
 #ifdef __cplusplus
 extern "C" {
@@ -106,7 +106,7 @@ TAILQ_HEAD(parserTierList, parserTier);
 /* One component of a file path, e.g. "dir" and "file.txt" in dir/file.txt. */
 typedef struct parserPathComponent {
     char                             *name; /* NUL-terminated, never "", ".", ".." and
-                                               never contains '/'               */
+                                               never contains '/' or '\\'       */
     TAILQ_ENTRY(parserPathComponent)  entries;
 } parserPathComponent;
 TAILQ_HEAD(parserPathList, parserPathComponent);

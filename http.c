@@ -15,20 +15,28 @@
  * callback still to come. A request is freed when it is detached (its
  * callback has returned, or it was cancelled) and pending is zero.
  */
+#ifndef _WIN32
 #define _POSIX_C_SOURCE 200809L
+#endif
 
 #include <inttypes.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/queue.h>
+
+/* http.h brings in <uv.h>, which on Windows includes <winsock2.h> and
+ * <windows.h> in the right order. <wincrypt.h> must come before the OpenSSL
+ * headers, which then undefine the wincrypt macros that clash with OpenSSL
+ * names (X509_NAME and others). */
+#include "http.h"
+#ifdef _WIN32
+#include <wincrypt.h>
+#endif
 
 #include <openssl/err.h>
 #include <openssl/ssl.h>
 #include <openssl/x509v3.h>
-
-#include "http.h"
 
 #define HTTP_STATE_MAGIC        0x48545450u     /* "HTTP" */
 #define HTTP_MAX_ADDRESSES      8u
@@ -363,9 +371,13 @@ static void onPlainAlloc(uv_handle_t *handle, size_t suggested, uv_buf_t *buffer
     uint64_t     space = growResponse(request);
 
     (void)suggested;
-    /* A zero-length buffer makes libuv report UV_ENOBUFS to onPlainRead(). */
-    buffer->base = (space > 0) ? (char *)request->response + request->responseLength : NULL;
-    buffer->len = (size_t)space;
+    /* uv_buf_t's length is 32 bits on Windows: never offer more than that.
+     * A zero-length buffer makes libuv report UV_ENOBUFS to onPlainRead(). */
+    if (space > UINT32_MAX) {
+        space = UINT32_MAX;
+    }
+    *buffer = uv_buf_init((space > 0) ? (char *)request->response + request->responseLength : NULL,
+                          (unsigned int)space);
 }
 
 static void onPlainRead(uv_stream_t *stream, ssize_t count, const uv_buf_t *buffer)
@@ -782,13 +794,46 @@ static int32_t buildRequestText(httpRequest *request, const httpUrl *url)
 /* Trusted certificates                                                     */
 /* ======================================================================== */
 
+#ifdef _WIN32
 /*
- * Load the system's CA bundle into memory, so that verifying a server never
- * has to read certificate files during a handshake (on the loop thread).
- * Order: $SSL_CERT_FILE, OpenSSL's built-in default file, then the bundle
- * locations used by the major Linux distributions. If none exists, fall
- * back to OpenSSL's default paths, which may look up certificates on disk
- * during handshakes.
+ * Windows keeps its trusted roots in the system certificate store, not in
+ * a file. Copy every certificate from the "ROOT" store (which includes
+ * roots trusted by Group Policy) into OpenSSL's in-memory store.
+ */
+static int loadWindowsCertificates(SSL_CTX *tls)
+{
+    X509_STORE    *store = SSL_CTX_get_cert_store(tls);
+    HCERTSTORE     system = CertOpenSystemStoreW(0, L"ROOT");
+    PCCERT_CONTEXT certificate = NULL;
+    uint32_t       added = 0;
+
+    if (system == NULL) {
+        return 0;
+    }
+    while ((certificate = CertEnumCertificatesInStore(system, certificate)) != NULL) {
+        const unsigned char *der = certificate->pbCertEncoded;
+        X509                *x509 = d2i_X509(NULL, &der, (long)certificate->cbCertEncoded);
+
+        if (x509 != NULL) {
+            if (X509_STORE_add_cert(store, x509) == 1) {
+                added++;
+            }
+            X509_free(x509);
+        }
+    }
+    CertCloseStore(system, 0);
+    ERR_clear_error();                              /* e.g. duplicates, unusual certs */
+    return added > 0;
+}
+#endif
+
+/*
+ * Load the system's trusted CAs into memory, so that verifying a server
+ * never has to read certificate files during a handshake (on the loop
+ * thread). Order: $SSL_CERT_FILE; on Windows the system certificate store;
+ * OpenSSL's built-in default file; then the bundle locations used by the
+ * major Linux distributions. If none exists, fall back to OpenSSL's default
+ * paths, which may look up certificates on disk during handshakes.
  */
 static int loadSystemCertificates(SSL_CTX *tls)
 {
@@ -807,6 +852,11 @@ static int loadSystemCertificates(SSL_CTX *tls)
     if (environment != NULL && environment[0] != '\0') {
         return SSL_CTX_load_verify_locations(tls, environment, NULL) == 1;
     }
+#ifdef _WIN32
+    if (loadWindowsCertificates(tls)) {
+        return 1;
+    }
+#endif
     if (SSL_CTX_load_verify_locations(tls, defaultFile, NULL) == 1) {
         return 1;
     }

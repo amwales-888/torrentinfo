@@ -1110,6 +1110,8 @@ static configSettings  settingsFile;
 static blocklist      *peerBlocklist;
 static uint32_t        settingsMaxPeers;
 static uint32_t        settingsUploadSlots;
+static uint64_t        maxDownloadRate;     /* -d, or max_download_rate; 0: none */
+static uint64_t        maxUploadRate;       /* -u, or max_upload_rate            */
 
 static int dataFilePath(const char *subdirectory, const char *name, char *path, size_t size)
 {
@@ -1137,7 +1139,7 @@ static dht *startDht(uv_loop_t *loop, parserContext *context, const parserAlloca
     uint64_t   size;
     uint8_t    isRegular;
 
-    static char        list[512];
+    static char        list[CONFIG_MAX_VALUE];
     static const char *bootstrap[9];
     const char        *environment = getenv("TORRENTINFO_DHT_BOOTSTRAP");
 
@@ -1630,6 +1632,8 @@ static int downloadTorrent(uv_loop_t *loop, parserContext *context, const parser
     options.blocklist = peerBlocklist;
     options.maxPeers = settingsMaxPeers;
     options.uploadSlots = settingsUploadSlots;
+    options.maxDownloadRate = maxDownloadRate;
+    options.maxUploadRate = maxUploadRate;
 
     uv_timer_init(loop, &run.timer);
     run.timer.data = &run;
@@ -2831,8 +2835,8 @@ static void usage(const char *program)
             "       %s -o <output.torrent> [options] <file>...\n"
             "       %s -t [-T seconds] [-C ca.pem] [-I interface] <file.torrent>\n"
             "       %s -P [-T seconds] [-C ca.pem] [-I interface] <file.torrent>\n"
-            "       %s -D [-S] [-L port] [-N] [-X] [-O dir] [-i piece] [-T seconds] [-C ca.pem]\n"
-            "            [-I interface] <file.torrent | magnet-link>\n"
+            "       %s -D [-S] [-L port] [-N] [-X] [-d rate] [-u rate] [-O dir] [-i piece]\n"
+            "            [-T seconds] [-C ca.pem] [-I interface] <file.torrent | magnet-link>\n"
             "       %s -V [-O dir] <file.torrent>\n"
             "       %s -m <file.torrent>\n"
             "\n"
@@ -2858,6 +2862,9 @@ static void usage(const char *program)
             "            NAT-PMP are tried by default)\n"
             "  -X        with -D: do not use the DHT (by default it finds peers too,\n"
             "            except for private torrents)\n"
+            "  -d rate   with -D: download no faster than this, in KiB/s or with a\n"
+            "            unit: 500k, 1.5M (0: no limit)\n"
+            "  -u rate   with -D: upload no faster than this (same units)\n"
             "  -m        print the torrent's magnet link (info hash, name, trackers,\n"
             "            web seeds)\n"
             "  -V        verify downloaded data against the torrent (no network, changes\n"
@@ -2893,6 +2900,8 @@ int main(int argc, char **argv)
     uint8_t         listenGiven = 0;    /* -L: wins over the settings file */
     uint8_t         mapGiven = 0;       /* -N */
     uint8_t         dhtGiven = 0;       /* -X */
+    uint8_t         downRateGiven = 0;  /* -d */
+    uint8_t         upRateGiven = 0;    /* -u */
     const char     *interfaceSpec = NULL;   /* -I */
     netBinding      binding;
     uint8_t         directoryGiven = 0; /* -O */
@@ -2943,7 +2952,7 @@ int main(int argc, char **argv)
     options.trackers = (const char *const *)trackers;
     options.webSeeds = (const char *const *)webSeeds;
 
-    while ((option = nextOption(argc, argv, "o:a:w:c:n:l:ptPDVSNXmL:O:i:T:C:I:h")) != -1) {
+    while ((option = nextOption(argc, argv, "o:a:w:c:n:l:ptPDVSNXmL:O:i:T:C:I:d:u:h")) != -1) {
         switch (option) {
         case 'o':
             outputPath = optionValue;
@@ -3014,6 +3023,21 @@ int main(int argc, char **argv)
             downloadOnly = 1;
             break;
         }
+        case 'd':
+        case 'u':
+            if (!configParseRate(optionValue, (option == 'd') ? &maxDownloadRate
+                                                               : &maxUploadRate)) {
+                fprintf(stderr, "-%c: not a speed: %s (examples: 500k, 1.5M, 0 for no limit)\n",
+                        option, optionValue);
+                goto cleanup;
+            }
+            if (option == 'd') {
+                downRateGiven = 1;
+            } else {
+                upRateGiven = 1;
+            }
+            downloadOnly = 1;
+            break;
         case 'V':
             verify = 1;
             break;
@@ -3105,12 +3129,32 @@ int main(int argc, char **argv)
         }
         settingsMaxPeers = settingsFile.maxPeers;
         settingsUploadSlots = settingsFile.uploadSlots;
+        if (!downRateGiven && (settingsFile.set & CONFIG_SET_MAX_DOWNLOAD_RATE) != 0) {
+            maxDownloadRate = settingsFile.maxDownloadRate;
+        }
+        if (!upRateGiven && (settingsFile.set & CONFIG_SET_MAX_UPLOAD_RATE) != 0) {
+            maxUploadRate = settingsFile.maxUploadRate;
+        }
         if (mode == MODE_DOWNLOAD) {
             if (!directoryGiven && (settingsFile.set & CONFIG_SET_DOWNLOAD_DIRECTORY) != 0) {
                 outputDirectory = settingsFile.downloadDirectory;
             }
             if (loadBlocklist(&context) != 0) {
                 goto cleanup;
+            }
+            if (maxDownloadRate != 0 || maxUploadRate != 0) {
+                char down[32] = "no limit";
+                char up[32] = "no limit";
+
+                if (maxDownloadRate != 0) {
+                    formatBytes(maxDownloadRate, down, sizeof(down));
+                    strcat(down, "/s");
+                }
+                if (maxUploadRate != 0) {
+                    formatBytes(maxUploadRate, up, sizeof(up));
+                    strcat(up, "/s");
+                }
+                printf("Speed:      download %s, upload %s\n", down, up);
             }
         }
         memset(&binding, 0, sizeof(binding));

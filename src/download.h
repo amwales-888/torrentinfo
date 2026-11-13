@@ -118,6 +118,8 @@ typedef struct downloadOptions {
     uint32_t        infoDictionaryLength;
     const blocklist *blocklist;         /* addresses never to talk to; NULL:
                                            none. Must outlive the download.    */
+    uint64_t        maxDownloadRate;    /* bytes per second; 0 = no limit      */
+    uint64_t        maxUploadRate;      /* bytes per second; 0 = no limit      */
 } downloadOptions;
 
 typedef struct downloadProgress {
@@ -147,6 +149,8 @@ typedef struct downloadProgress {
     uint32_t        checkedPieces;      /* ...pieces checked so far            */
     uint32_t        checkTotal;         /* ...of these (0 until known)         */
     uint32_t        peersBlocked;       /* addresses refused by the blocklist  */
+    uint64_t        maxDownloadRate;    /* the limits in force (0: none)       */
+    uint64_t        maxUploadRate;
 } downloadProgress;
 
 typedef struct downloadEvents {
@@ -182,6 +186,9 @@ int32_t downloadAddPeer(download *transfer, const struct sockaddr *address);
 void downloadGetProgress(const download *transfer, downloadProgress *progress);
 
 /* The port peers can connect to, or 0 (not listening). */
+/* Change the speed limits (bytes per second, 0 = no limit) while running. */
+void downloadSetRateLimits(download *transfer, uint64_t maxDownloadRate, uint64_t maxUploadRate);
+
 uint16_t downloadListenPort(const download *transfer);
 
 /* The download's top-level path (file, or directory of a multi-file torrent). */

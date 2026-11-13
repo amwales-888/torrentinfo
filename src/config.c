@@ -44,7 +44,12 @@ static const char configTemplate[] =
     "#max_peers = 50\n"
     "\n"
     "# Peers to upload to at once (1 to 100).\n"
-    "#upload_slots = 4\n";
+    "#upload_slots = 4\n"
+    "\n"
+    "# Speed limits, in KiB/s, or with a unit: 500k, 1.5M. 0: no limit.\n"
+    "# Like -d and -u.\n"
+    "#max_download_rate = 0\n"
+    "#max_upload_rate = 0\n";
 
 typedef struct lineContext {
     configWarningCallback warning;
@@ -191,6 +196,75 @@ static int readNumber(const char *value, uint32_t minimum, uint32_t maximum, uin
     return 1;
 }
 
+int configParseRate(const char *text, uint64_t *bytesPerSecond)
+{
+    uint64_t whole = 0;
+    uint64_t fraction = 0;
+    uint64_t scale = 1;                         /* 10^digits of the fraction */
+    uint64_t unit = 1024u;
+    int      digits = 0;
+    char     c;
+
+    if (text == NULL || bytesPerSecond == NULL) {
+        return 0;
+    }
+    if (strcmp(text, "none") == 0 || strcmp(text, "unlimited") == 0) {
+        *bytesPerSecond = 0;
+        return 1;
+    }
+    while (*text >= '0' && *text <= '9') {
+        if (whole > 100000000u) {
+            return 0;
+        }
+        whole = whole * 10u + (uint64_t)(*text++ - '0');
+        digits++;
+    }
+    if (*text == '.') {
+        text++;
+        while (*text >= '0' && *text <= '9') {
+            if (scale < 1000000u) {
+                fraction = fraction * 10u + (uint64_t)(*text - '0');
+                scale *= 10u;
+            }
+            text++;
+            digits++;
+        }
+    }
+    if (digits == 0) {
+        return 0;
+    }
+    c = *text;
+    if (c == 'k' || c == 'K') {
+        text++;
+    } else if (c == 'm' || c == 'M') {
+        unit = 1024u * 1024u;
+        text++;
+    } else if (c == 'g' || c == 'G') {
+        unit = 1024u * 1024u * 1024u;
+        text++;
+    }
+    if (*text == 'i' || *text == 'I') {
+        text++;                                 /* KiB */
+    }
+    if (*text == 'b' || *text == 'B') {
+        text++;
+    }
+    if (text[0] == '/' && (text[1] == 's' || text[1] == 'S')) {
+        text += 2;
+    }
+    if (*text != '\0') {
+        return 0;
+    }
+    if (whole > ((uint64_t)100u * 1024u * 1024u * 1024u) / unit) {
+        return 0;
+    }
+    *bytesPerSecond = whole * unit + fraction * unit / scale;
+    if (*bytesPerSecond == 0 && (whole != 0 || fraction != 0)) {
+        *bytesPerSecond = 1;                    /* a tiny limit, not none */
+    }
+    return 1;
+}
+
 static void parseSetting(lineContext *lc, configSettings *s, const char *key, size_t keyLength,
                          const char *start, const char *end)
 {
@@ -268,6 +342,22 @@ static void parseSetting(lineContext *lc, configSettings *s, const char *key, si
         }
         s->uploadSlots = number;
         s->set |= CONFIG_SET_UPLOAD_SLOTS;
+    } else if (sameKey(key, keyLength, "max_download_rate") ||
+               sameKey(key, keyLength, "max_upload_rate")) {
+        uint64_t rate;
+
+        if (!configParseRate(value, &rate)) {
+            warn(lc, "%s: not a speed (examples: 500k, 2M, 0 for no limit): %s", keyText,
+                 value);
+            return;
+        }
+        if (keyText[4] == 'd') {
+            s->maxDownloadRate = rate;
+            s->set |= CONFIG_SET_MAX_DOWNLOAD_RATE;
+        } else {
+            s->maxUploadRate = rate;
+            s->set |= CONFIG_SET_MAX_UPLOAD_RATE;
+        }
     } else {
         warn(lc, "unknown setting \"%s\"%s", keyText, "");
     }

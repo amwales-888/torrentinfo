@@ -11,8 +11,8 @@ torrentinfo file.torrent | magnet-link
 torrentinfo -o new.torrent [-a url]... [-w url]... [-c text] [-n name] [-l size] [-p] file...
 torrentinfo -t [-T seconds] [-C certs.pem] [-I interface] file.torrent
 torrentinfo -P [-T seconds] [-C certs.pem] [-I interface] file.torrent
-torrentinfo -D [-S] [-L port] [-N] [-X] [-O folder] [-i piece] [-T seconds] [-C certs.pem]
-               [-I interface] file.torrent | magnet-link
+torrentinfo -D [-S] [-L port] [-N] [-X] [-d speed] [-u speed] [-O folder] [-i piece]
+               [-T seconds] [-C certs.pem] [-I interface] file.torrent | magnet-link
 torrentinfo -V [-O folder] file.torrent
 torrentinfo -m file.torrent
 ```
@@ -144,6 +144,16 @@ The program works in one of six ways, chosen by the first option.
   router (using UPnP or NAT-PMP) to let other peers reach you, and removes
   the forwarding again when it ends.
 
+`-d speed`
+: Download no faster than this. Give it in KiB per second (`-d 500`) or
+  with a unit: `500k`, `1.5M`, `2G`. `0` means no limit, the default. The
+  limit is for the whole download, shared by all the peers.
+
+`-u speed`
+: Upload no faster than this (same units). The allowance is shared evenly
+  between the peers you are uploading to. Useful to leave a seed running
+  without slowing down the rest of your connection.
+
 `-i piece`
 : Download just one piece, given by its number (starting at 0). Mostly
   useful for testing.
@@ -272,6 +282,9 @@ and in `%APPDATA%\torrentinfo` on Windows (made when first needed):
   `upload_slots = 4`
   : How many peers to upload to at once (1 to 100).
 
+  `max_download_rate = 2M`, `max_upload_rate = 500k`
+  : Like `-d` and `-u`.
+
 `blocklist.txt`
 : Addresses never to talk to (see "Blocking addresses" under NOTES). Used
   if it exists, unless `config` names another file or says `none`. If
@@ -397,6 +410,12 @@ default (Linux; on Windows edit the same files in `%APPDATA%\torrentinfo`):
 echo "198.51.100.0/24" >> ~/.torrentinfo/blocklist.txt
 sed -i 's|^#download_directory.*|download_directory = ~/Downloads|' ~/.torrentinfo/config
 torrentinfo -D ubuntu.torrent
+```
+
+Download at no more than 1 MiB/s, then seed at no more than 200 KiB/s:
+
+```
+torrentinfo -D -S -d 1M -u 200k ubuntu.torrent
 ```
 
 Then share it by seeding from the folder that holds the files:

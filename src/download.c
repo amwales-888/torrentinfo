@@ -61,6 +61,7 @@
 #define DOWNLOAD_ENDGAME_DELAY_MS   1500u   /* ...once the first is this old   */
 #define DOWNLOAD_MAX_ACTIVE_BYTES   (128u * 1024u * 1024u)
 #define DOWNLOAD_TICK_MS            1000u
+#define DOWNLOAD_RATE_TICK_MS       100u    /* refilling the speed limits      */
 #define DOWNLOAD_UPLOAD_QUEUE       256u    /* requests a peer may queue with us */
 #define DOWNLOAD_UPLOAD_READS       4u      /* block reads in flight per peer    */
 #define DOWNLOAD_UPLOAD_BUFFERED    (256u * 1024u)  /* queued to send: wait     */
@@ -122,6 +123,7 @@ typedef struct downloadPeer {
     uint8_t                 choked;         /* the peer is choking us       */
     uint8_t                 amInterested;
     uint8_t                 excluded;       /* misbehaved: never again      */
+    uint8_t                 complete;       /* a seed, dropped as we are one */
     uint8_t                 strikes;
     uint8_t                 attempts;       /* connections made             */
     uint32_t                unexpected;     /* blocks we did not ask it for */
@@ -147,6 +149,8 @@ typedef struct downloadPeer {
     uint32_t                readingCount;
     uint64_t                uploaded;       /* total sent to it             */
     uint64_t                uploadedWindow; /* sent since the last rechoke  */
+    uint64_t                uploadTurn;     /* when last served, under a limit */
+    uint64_t                pumpPass;       /* pumpAll() pass that skipped it  */
     uint64_t                downloadedWindow;   /* received since then      */
 
     /* Extension protocol and peer exchange */
@@ -163,6 +167,13 @@ typedef struct downloadPeer {
 
 TAILQ_HEAD(activeList, activePiece);
 TAILQ_HEAD(peerList, downloadPeer);
+
+/* A speed limit: a token bucket of bytes, refilled continuously. */
+typedef struct rateLimit {
+    uint64_t    rate;                   /* bytes per second; 0: no limit */
+    int64_t     tokens;                 /* may dip one block below zero  */
+    uint64_t    updated;                /* uv_now() of the last refill   */
+} rateLimit;
 
 struct download {
     uv_loop_t              *loop;
@@ -220,6 +231,12 @@ struct download {
     uint32_t                pexLearned;     /* new peers heard of by PEX    */
     const blocklist        *blocklist;
     uint32_t                blocked;        /* addresses refused            */
+
+    rateLimit               downLimit;      /* requests we send            */
+    rateLimit               upLimit;        /* blocks we read to send      */
+    uint64_t                uploadTurns;    /* counter for uploadTurn      */
+    uint64_t                pumpPasses;     /* counter for pumpPass        */
+    uint64_t                lastTick;       /* uv_now() of the last 1 s tick */
 
     uint32_t                verifyJobs;     /* piece checks on the thread pool */
     uint8_t                 timerClosed;    /* waiting only for those to end */
@@ -351,6 +368,47 @@ static uint32_t blockLength(const activePiece *piece, uint32_t block)
     return (left < PIECE_BLOCK_LENGTH) ? left : PIECE_BLOCK_LENGTH;
 }
 
+/* Up to half a second of data may be sent at once, and at least one block. */
+static void rateSet(rateLimit *limit, uint64_t rate, uint64_t now)
+{
+    uint64_t burst = rate / 2u;
+
+    limit->rate = rate;
+    limit->tokens = (int64_t)((burst < PIECE_BLOCK_LENGTH) ? PIECE_BLOCK_LENGTH : burst);
+    limit->updated = now;
+}
+
+/* May another block go now? */
+static int rateAvailable(download *dl, rateLimit *limit)
+{
+    uint64_t now;
+    uint64_t burst;
+
+    if (limit->rate == 0) {
+        return 1;
+    }
+    now = uv_now(dl->loop);
+    if (now > limit->updated) {
+        burst = limit->rate / 2u;
+        if (burst < PIECE_BLOCK_LENGTH) {
+            burst = PIECE_BLOCK_LENGTH;
+        }
+        limit->tokens += (int64_t)(limit->rate * (now - limit->updated) / 1000u);
+        if (limit->tokens > (int64_t)burst) {
+            limit->tokens = (int64_t)burst;
+        }
+        limit->updated = now;
+    }
+    return limit->tokens > 0;
+}
+
+static void rateCharge(rateLimit *limit, uint32_t bytes)
+{
+    if (limit->rate != 0) {
+        limit->tokens -= (int64_t)bytes;
+    }
+}
+
 /* Send a message; 0 on success. */
 static int sendFrame(downloadPeer *peer, const messageFrame *frame)
 {
@@ -448,6 +506,7 @@ static int sendRequest(download *dl, downloadPeer *peer, activePiece *piece, uin
     if (piece->requests[block]++ == 0) {
         piece->requestedAt[block] = uv_now(dl->loop);
     }
+    rateCharge(&dl->downLimit, blockLength(piece, block));
     sendBlockMessage(peer, MESSAGE_REQUEST, piece, block);
     if (peer->state != DOWNLOAD_PEER_OPEN) {
         return -1;
@@ -649,15 +708,17 @@ static int requestOne(download *dl, downloadPeer *peer)
     return 0;
 }
 
-/* Keep the peer's pipeline full. */
+static int canRequest(const download *dl, const downloadPeer *peer)
+{
+    return !stopped(dl) && dl->ready && peer->state == DOWNLOAD_PEER_OPEN && !peer->choked &&
+           !peer->excluded && peer->requestCount < dl->pipeline;
+}
+
+/* Keep the peer's pipeline full, as far as the download limit allows. */
 static void fillPeer(download *dl, downloadPeer *peer)
 {
-    if (stopped(dl) || !dl->ready || peer->state != DOWNLOAD_PEER_OPEN || peer->choked ||
-        peer->excluded) {
-        return;
-    }
-    while (peer->requestCount < dl->pipeline) {
-        if (requestOne(dl, peer) <= 0 || stopped(dl)) {
+    while (canRequest(dl, peer) && rateAvailable(dl, &dl->downLimit)) {
+        if (requestOne(dl, peer) <= 0) {
             return;
         }
     }
@@ -666,13 +727,29 @@ static void fillPeer(download *dl, downloadPeer *peer)
 static void fillAll(download *dl)
 {
     downloadPeer *peer;
+    int           sent;
 
-    TAILQ_FOREACH(peer, &dl->peers, entries) {
-        if (stopped(dl)) {
-            return;
+    if (dl->downLimit.rate == 0) {
+        TAILQ_FOREACH(peer, &dl->peers, entries) {
+            if (stopped(dl)) {
+                return;
+            }
+            fillPeer(dl, peer);
         }
-        fillPeer(dl, peer);
+        return;
     }
+    /* Limited: one request per peer per round, so they share the allowance. */
+    do {
+        sent = 0;
+        TAILQ_FOREACH(peer, &dl->peers, entries) {
+            if (stopped(dl) || !rateAvailable(dl, &dl->downLimit)) {
+                return;
+            }
+            if (canRequest(dl, peer) && requestOne(dl, peer) > 0) {
+                sent = 1;
+            }
+        }
+    } while (sent);
 }
 
 /* ------------------------------------------------------------------------ */
@@ -756,19 +833,22 @@ static void setChoking(download *dl, downloadPeer *peer, int choke)
 static void onBlockRead(void *privateArg, storage *store, uint32_t pieceIndex, uint32_t begin,
                         uint32_t length, uint8_t *data, int32_t status, const char *errorMessage);
 
-/* Read queued requests from disk while the peer's send queue has room. */
-static void pumpUploads(download *dl, downloadPeer *peer)
+/* Read up to 'most' queued requests from disk while the peer's send queue
+ * has room and the upload limit allows. The number started. */
+static uint32_t pumpSome(download *dl, downloadPeer *peer, uint32_t most)
 {
     peerRemoteState state;
     uploadRequest   request;
     uint8_t        *data;
+    uint32_t        started = 0;
 
-    while (!stopped(dl) && dl->store != NULL && peer->state == DOWNLOAD_PEER_OPEN &&
+    while (started < most && !stopped(dl) && dl->store != NULL &&
+           peer->state == DOWNLOAD_PEER_OPEN &&
            !peer->amChoking && peer->queueCount > 0 &&
-           peer->readingCount < DOWNLOAD_UPLOAD_READS) {
+           peer->readingCount < DOWNLOAD_UPLOAD_READS && rateAvailable(dl, &dl->upLimit)) {
         if (peerGetState(peer->connection, &state) != PEER_OK ||
             state.sendQueued >= DOWNLOAD_UPLOAD_BUFFERED) {
-            return;                                 /* onDrain will call again */
+            return started;                         /* onDrain will call again */
         }
         request = peer->uploadQueue[0];
         peer->queueCount--;
@@ -776,13 +856,57 @@ static void pumpUploads(download *dl, downloadPeer *peer)
                 sizeof(*peer->uploadQueue) * peer->queueCount);
         data = dl->context->allocator.realloc(NULL, request.length);
         if (data == NULL) {
-            return;
+            return started;
         }
         peer->reading[peer->readingCount++] = request;
+        rateCharge(&dl->upLimit, request.length);
+        peer->uploadTurn = ++dl->uploadTurns;
+        started++;
         if (storageReadBlock(dl->store, request.index, request.begin, request.length, data,
                              onBlockRead, peer) != STORAGE_OK) {
             peer->readingCount--;                   /* storage freed the buffer */
         }
+    }
+    return started;
+}
+
+static int canPump(const download *dl, const downloadPeer *peer)
+{
+    return peer->state == DOWNLOAD_PEER_OPEN && !peer->amChoking && peer->queueCount > 0 &&
+           peer->readingCount < DOWNLOAD_UPLOAD_READS && dl->store != NULL;
+}
+
+/* Limited uploads: each block the limit allows goes to the waiting peer
+ * served longest ago, so peers share the allowance evenly. */
+static void pumpAll(download *dl)
+{
+    downloadPeer *peer;
+    downloadPeer *best;
+    uint64_t      pass = ++dl->pumpPasses;
+
+    while (!stopped(dl) && rateAvailable(dl, &dl->upLimit)) {
+        best = NULL;
+        TAILQ_FOREACH(peer, &dl->peers, entries) {
+            if (peer->pumpPass != pass && canPump(dl, peer) &&
+                (best == NULL || peer->uploadTurn < best->uploadTurn)) {
+                best = peer;
+            }
+        }
+        if (best == NULL) {
+            return;
+        }
+        if (pumpSome(dl, best, 1u) == 0) {
+            best->pumpPass = pass;                  /* send queue full: the others */
+        }
+    }
+}
+
+static void pumpUploads(download *dl, downloadPeer *peer)
+{
+    if (dl->upLimit.rate != 0) {
+        pumpAll(dl);                                /* fair shares, not first come */
+    } else {
+        (void)pumpSome(dl, peer, UINT32_MAX);
     }
 }
 
@@ -1529,6 +1653,7 @@ static void complete(download *dl)
         }
         if (peer->state == DOWNLOAD_PEER_OPEN && bothComplete(dl, peer)) {
             peer->attempts = DOWNLOAD_MAX_ATTEMPTS;
+            peer->complete = 1;
             dropPeer(peer, "complete, as we are", 0);
         }
     }
@@ -1780,6 +1905,7 @@ static void onPeerMessage(void *privateArg, peerConnection *connection,
         }
         if (bothComplete(dl, peer)) {
             peer->attempts = DOWNLOAD_MAX_ATTEMPTS;
+            peer->complete = 1;
             dropPeer(peer, "complete, as we are", 0);
             break;
         }
@@ -1790,6 +1916,7 @@ static void onPeerMessage(void *privateArg, peerConnection *connection,
         peerHasPiece(dl, peer, message->index);
         if (bothComplete(dl, peer)) {
             peer->attempts = DOWNLOAD_MAX_ATTEMPTS;
+            peer->complete = 1;
             dropPeer(peer, "complete, as we are", 0);
             break;
         }
@@ -2023,6 +2150,17 @@ static void onTick(uv_timer_t *timer)
     if (stopped(dl)) {
         return;
     }
+    /* Every 100 ms: let through what the speed limits now allow. */
+    if (dl->upLimit.rate != 0) {
+        pumpAll(dl);
+    }
+    if (dl->downLimit.rate != 0) {
+        fillAll(dl);
+    }
+    if (stopped(dl) || now - dl->lastTick < DOWNLOAD_TICK_MS) {
+        return;
+    }
+    dl->lastTick = now;
     if (dl->seeding) {
         dl->lastProgress = now;                     /* nothing to wait for */
     }
@@ -2185,7 +2323,8 @@ static void onStorageOpen(void *privateArg, storage *store, int32_t status,
             recountInteresting(dl, peer);
         }
     }
-    uv_timer_start(&dl->timer, onTick, DOWNLOAD_TICK_MS, DOWNLOAD_TICK_MS);
+    dl->lastTick = uv_now(dl->loop);
+    uv_timer_start(&dl->timer, onTick, DOWNLOAD_RATE_TICK_MS, DOWNLOAD_RATE_TICK_MS);
     connectMore(dl);
 }
 
@@ -2240,6 +2379,8 @@ int32_t downloadBegin(uv_loop_t *loop, parserContext *context, const parserTorre
     dl->info = options->infoDictionary;
     dl->infoLength = options->infoDictionaryLength;
     dl->blocklist = options->blocklist;
+    rateSet(&dl->downLimit, options->maxDownloadRate, uv_now(loop));
+    rateSet(&dl->upLimit, options->maxUploadRate, uv_now(loop));
 
     if (uv_random(NULL, NULL, &seed, sizeof(seed), 0, NULL) != 0) {
         seed = 0;
@@ -2314,7 +2455,8 @@ int32_t downloadAddPeer(download *dl, const struct sockaddr *address)
     }
     TAILQ_FOREACH(peer, &dl->peers, entries) {
         if (sameAddress(&peer->address, address)) {
-            if (peer->state == DOWNLOAD_PEER_CLOSED && !peer->excluded && !peer->incoming) {
+            if (peer->state == DOWNLOAD_PEER_CLOSED && !peer->excluded && !peer->incoming &&
+                !(peer->complete && dl->seeding)) {
                 peer->state = DOWNLOAD_PEER_QUEUED; /* reported again: new chances */
                 peer->attempts = 0;
                 peer->retryAt = 0;
@@ -2376,6 +2518,8 @@ void downloadGetProgress(const download *dl, downloadProgress *progress)
     progress->listenPort = dl->listenPort;
     progress->peersFromPex = dl->pexLearned;
     progress->peersBlocked = dl->blocked;
+    progress->maxDownloadRate = dl->downLimit.rate;
+    progress->maxUploadRate = dl->upLimit.rate;
     progress->checking = (uint8_t)(!dl->ready && !dl->finished);
     storageCheckProgress(dl->store, &progress->checkedPieces, &progress->checkTotal);
     TAILQ_FOREACH(peer, &dl->peers, entries) {
@@ -2397,6 +2541,19 @@ void downloadGetProgress(const download *dl, downloadProgress *progress)
         default:
             break;
         }
+    }
+}
+
+void downloadSetRateLimits(download *dl, uint64_t maxDownloadRate, uint64_t maxUploadRate)
+{
+    if (dl == NULL || stopped(dl)) {
+        return;
+    }
+    rateSet(&dl->downLimit, maxDownloadRate, uv_now(dl->loop));
+    rateSet(&dl->upLimit, maxUploadRate, uv_now(dl->loop));
+    fillAll(dl);
+    if (!stopped(dl)) {
+        pumpAll(dl);
     }
 }
 

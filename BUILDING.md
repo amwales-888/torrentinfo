@@ -174,6 +174,20 @@ project's *Properties > Debugging > Command Arguments*.
   asked nor answered) and incoming DHT messages; the refusals are counted
   in `peersBlocked` / `dhtStatus.blocked`.
 
+- **Speed limits (`-d`, `-u`, `max_download_rate`, `max_upload_rate`).**
+  Token buckets in download.c (`downloadOptions.maxDownloadRate` /
+  `maxUploadRate`, changeable with `downloadSetRateLimits()`), refilled
+  continuously and topped up by the download's timer, which ticks every
+  100 ms. A bucket holds at most half a second of data (at least one 16 KiB
+  block). Downloads are limited by charging each block *request* as it is
+  sent, so peers are never left with unread data in their sockets; the
+  requests are handed out one per peer per round. Uploads are limited by
+  charging each block read from disk for a peer, and every block the limit
+  allows goes to the waiting peer served longest ago, so peers share it
+  evenly. Rates are parsed by `configParseRate()` (KiB/s by default; k, m,
+  g units). Measured: `-d 64k` gave 64.9 KiB/s from seeds that gave 2.1 MiB/s unlimited;
+  `-u 100k` gave two leechers 50.8 and 50.4 KiB/s.
+
 - **Peer exchange.** Peers that support the extension protocol (BEP 10;
   nearly all current clients do) are sent an extended handshake, and with
   peer exchange (BEP 11, "ut_pex") tell each other every minute which peers

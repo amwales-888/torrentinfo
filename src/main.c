@@ -1116,6 +1116,7 @@ typedef struct downloadRun {
     const parserTorrent *torrent;
     uint8_t         stopping;           /* telling the trackers we leave    */
     uint8_t         complete;           /* everything wanted is on disk     */
+    uint8_t         seed;               /* -S: keep running once complete   */
     uint8_t         failed;
     uint64_t        startedAt;          /* uv_hrtime() when the files were ready */
     uint64_t        lastReport;         /* uv_now() of the last progress line */
@@ -1321,6 +1322,9 @@ static void onDownloadReady(void *privateArg, download *transfer, int32_t status
     if (progress.done < progress.wanted) {
         printf("\nDownloading %" PRIu32 " piece(s); Ctrl-C to stop\n",
                progress.wanted - progress.done);
+    } else if (run->seed) {
+        run->complete = 1;                          /* complete already: seeding only */
+        printf("\nSeeding; Ctrl-C to stop\n");
     }
     fflush(stdout);
     run->startedAt = uv_hrtime();
@@ -1429,6 +1433,7 @@ static int downloadTorrent(uv_loop_t *loop, parserContext *context, const parser
     run.loop = loop;
     run.context = context;
     run.torrent = torrent;
+    run.seed = seed;
     memset(&options, 0, sizeof(options));
     memcpy(options.peerId, config->peerId, PEER_ID_LENGTH);
     options.directory = directory;

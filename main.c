@@ -667,12 +667,33 @@ static uint32_t startAnnounces(const parserTorrent *torrent, const char **seen,
 /* Peer mode: ./torrentinfo -P file.torrent                                 */
 /* ------------------------------------------------------------------------ */
 
-/* One handshake attempt; also the privateArg of its connection. */
+struct peerRun;
+
+/* One peer: handshake, then wait for its pieces and an unchoke. Also the
+ * privateArg of its connection. */
 typedef struct peerAttempt {
+    struct peerRun *run;
     trackerPeer     peer;
     peerConnection *connection;
-    int32_t         status;
+    int32_t         status;         /* handshake outcome                    */
+    uint8_t         settled;        /* reported and closed                  */
+    uint8_t         sawPieces;      /* bitfield or have received            */
+    uint8_t         unchoked;
+    uint8_t         dropped;        /* connection ended after the handshake */
+    char            client[64];
+    uint32_t        extensions;
+    uint32_t        haveCount;
 } peerAttempt;
+
+/* The whole -P run. */
+typedef struct peerRun {
+    uv_timer_t      deadline;
+    peerAttempt    *attempts;
+    uint32_t        count;
+    uint32_t        pieceCount;
+    uint32_t        started;
+    uint32_t        settled;
+} peerRun;
 
 /*
  * Name the client from its peer id. Most clients use the Azureus style
@@ -759,34 +780,114 @@ static void toSocketAddress(const trackerPeer *peer, struct sockaddr_storage *ou
     port[1] = (uint8_t)(peer->port & 0xFFu);
 }
 
-/* Runs from the loop as each handshake completes or fails. */
+/* Print one line for a peer, close it, and stop the run once all are done. */
+static void settle(peerAttempt *attempt, const char *note)
+{
+    peerRemoteState state;
+    peerRun        *run = attempt->run;
+    char            where[80];
+
+    if (attempt->settled) {
+        return;
+    }
+    attempt->settled = 1;
+    formatPeer(&attempt->peer, where, sizeof(where));
+    if (attempt->status != PEER_OK) {
+        printf("  %-46s %s\n", where, note);
+    } else {
+        if (attempt->connection != NULL && peerGetState(attempt->connection, &state) == PEER_OK) {
+            attempt->haveCount = state.haveCount;
+        }
+        printf("  %-46s %s", where, attempt->client);
+        if (attempt->extensions != 0) {
+            printf("  [%s%s%s ]",
+                   (attempt->extensions & PEER_EXTENSION_PROTOCOL) ? " extensions" : "",
+                   (attempt->extensions & PEER_EXTENSION_FAST) ? " fast" : "",
+                   (attempt->extensions & PEER_EXTENSION_DHT) ? " dht" : "");
+        }
+        printf("\n  %-46s ", "");
+        if (attempt->sawPieces) {
+            printf("has %" PRIu32 "/%" PRIu32 " pieces (%.0f%%)", attempt->haveCount,
+                   run->pieceCount,
+                   run->pieceCount ? 100.0 * attempt->haveCount / run->pieceCount : 100.0);
+        } else {
+            printf("sent no bitfield");
+        }
+        printf(", %s%s%s\n", attempt->unchoked ? "unchoked us" : "choking us",
+               (note != NULL) ? "; " : "", (note != NULL) ? note : "");
+    }
+    fflush(stdout);
+
+    peerClose(attempt->connection);
+    attempt->connection = NULL;
+    if (++run->settled == run->started) {
+        uv_timer_stop(&run->deadline);              /* everyone done: finish early */
+    }
+}
+
 static void onHandshake(void *privateArg, peerConnection *connection,
                         const peerHandshakeResult *result)
 {
     peerAttempt *attempt = privateArg;
-    char         where[80];
-    char         client[64];
+    messageFrame interested;
 
     attempt->status = result->status;
-    formatPeer(&attempt->peer, where, sizeof(where));
-    if (result->status == PEER_OK) {
-        describeClient(result->peerId, client, sizeof(client));
-        printf("  %-46s %s", where, client);
-        if (result->extensions != 0) {
-            printf("  [%s%s%s ]",
-                   (result->extensions & PEER_EXTENSION_PROTOCOL) ? " extensions" : "",
-                   (result->extensions & PEER_EXTENSION_FAST) ? " fast" : "",
-                   (result->extensions & PEER_EXTENSION_DHT) ? " dht" : "");
-        }
-        putchar('\n');
-    } else {
-        printf("  %-46s %s\n", where, result->errorMessage);
+    if (result->status != PEER_OK) {
+        settle(attempt, result->errorMessage);
+        return;
     }
-    fflush(stdout);
+    describeClient(result->peerId, attempt->client, sizeof(attempt->client));
+    attempt->extensions = result->extensions;
 
-    /* Step 1 only checks the handshake, so close straight away. */
-    peerClose(connection);
-    attempt->connection = NULL;
+    /* Ask for data, so that the peer has a reason to unchoke us. */
+    memset(&interested, 0, sizeof(interested));
+    interested.id = MESSAGE_INTERESTED;
+    if (peerSend(connection, &interested) != PEER_OK) {
+        settle(attempt, "could not send interested");
+    }
+}
+
+static void onMessage(void *privateArg, peerConnection *connection, const messageFrame *message)
+{
+    peerAttempt *attempt = privateArg;
+
+    (void)connection;
+    if (message->id == MESSAGE_BITFIELD || message->id == MESSAGE_HAVE) {
+        attempt->sawPieces = 1;
+    } else if (message->id == MESSAGE_UNCHOKE) {
+        attempt->unchoked = 1;
+    } else if (message->id == MESSAGE_CHOKE) {
+        attempt->unchoked = 0;
+    }
+    if (attempt->sawPieces && attempt->unchoked) {
+        settle(attempt, NULL);                      /* seen what we wanted */
+    }
+}
+
+static void onPeerClosed(void *privateArg, peerConnection *connection, int32_t status,
+                         const char *errorMessage)
+{
+    peerAttempt *attempt = privateArg;
+
+    (void)connection;
+    (void)status;
+    attempt->dropped = 1;
+    settle(attempt, errorMessage);
+}
+
+/* Time is up: report whatever each remaining peer has told us. */
+static void onDeadline(uv_timer_t *timer)
+{
+    peerRun *run = timer->data;
+    uint32_t i;
+
+    for (i = 0; i < run->count; i++) {
+        if (run->attempts[i].connection != NULL && !run->attempts[i].settled) {
+            settle(&run->attempts[i], (run->attempts[i].status == PEER_OK)
+                                          ? "no unchoke before the deadline"
+                                          : "no handshake before the deadline");
+        }
+    }
 }
 
 /* Add a peer unless it is already listed. Returns 0 if out of memory. */
@@ -815,17 +916,23 @@ static int addPeer(const parserAllocator *allocator, peerAttempt **attempts,
     return 1;
 }
 
-/* Handshake with every peer at once, then summarise by outcome. */
+/* Handshake with every peer at once, wait for pieces and unchokes, then summarise. */
 static uint32_t handshakePeers(uv_loop_t *loop, peerAttempt *attempts, uint32_t count,
                                const uint8_t infoHash[PARSER_SHA1_LENGTH],
-                               const uint8_t peerId[PEER_ID_LENGTH], uint32_t timeoutSeconds)
+                               const uint8_t peerId[PEER_ID_LENGTH], uint32_t pieceCount,
+                               uint32_t timeoutSeconds)
 {
-    static const int32_t outcomes[] = {
-        PEER_OK, PEER_ETIMEDOUT, PEER_ERROR, PEER_ECLOSED, PEER_EPROTO, PEER_EHASH,
-        PEER_ESELF, PEER_ENOMEM
+    static const int32_t failures[] = {
+        PEER_ETIMEDOUT, PEER_ERROR, PEER_ECLOSED, PEER_EPROTO, PEER_EHASH, PEER_ESELF, PEER_ENOMEM
     };
+    peerCallbacks           callbacks = { onHandshake, onMessage, onPeerClosed };
+    peerConnectOptions      options;
     struct sockaddr_storage address;
-    uint32_t                started = 0;
+    peerRun                 run;
+    uint32_t                handshakes = 0;
+    uint32_t                seeds = 0;
+    uint32_t                unchoked = 0;
+    uint32_t                dropped = 0;
     uint32_t                tally;
     uint32_t                i;
     uint32_t                j;
@@ -835,41 +942,68 @@ static uint32_t handshakePeers(uv_loop_t *loop, peerAttempt *attempts, uint32_t 
         printf("\n(Trying the first %" PRIu32 " of %" PRIu32 " peers.)\n", maxPeerAttempts, count);
         count = maxPeerAttempts;
     }
-    printf("\nHandshakes (%" PRIu32 " peers, timeout %" PRIu32 " s)\n", count, timeoutSeconds);
+    printf("\nPeers (%" PRIu32 ", handshake timeout %" PRIu32 " s, then up to %" PRIu32
+           " s for a bitfield and an unchoke)\n", count, timeoutSeconds, timeoutSeconds);
+
+    memset(&run, 0, sizeof(run));
+    run.attempts = attempts;
+    run.count = count;
+    run.pieceCount = pieceCount;
+    memset(&options, 0, sizeof(options));
+    memcpy(options.infoHash, infoHash, PARSER_SHA1_LENGTH);
+    memcpy(options.peerId, peerId, PEER_ID_LENGTH);
+    options.pieceCount = pieceCount;
+    options.timeoutSeconds = timeoutSeconds;
 
     for (i = 0; i < count; i++) {
+        attempts[i].run = &run;
         toSocketAddress(&attempts[i].peer, &address);
-        status = peerConnect((const struct sockaddr *)&address, infoHash, peerId,
-                             timeoutSeconds, onHandshake, &attempts[i], &attempts[i].connection);
-        attempts[i].status = status;
+        status = peerConnect((const struct sockaddr *)&address, &options, &callbacks,
+                             &attempts[i], &attempts[i].connection);
         if (status == PEER_OK) {
-            started++;
+            attempts[i].status = PEER_ETIMEDOUT;    /* until onHandshake says otherwise */
+            run.started++;
         } else {
             char where[80];
 
+            attempts[i].status = status;
+            attempts[i].settled = 1;
             formatPeer(&attempts[i].peer, where, sizeof(where));
             printf("  %-46s %s (not started)\n", where, peerStatusString(status));
         }
     }
-    if (started > 0) {
-        uv_run(loop, UV_RUN_DEFAULT);               /* until every handshake is done */
+    if (run.started > 0) {
+        uv_timer_init(loop, &run.deadline);
+        run.deadline.data = &run;
+        uv_timer_start(&run.deadline, onDeadline, (uint64_t)timeoutSeconds * 2000u, 0);
+        uv_run(loop, UV_RUN_DEFAULT);               /* until every peer is settled */
+        uv_close((uv_handle_t *)&run.deadline, NULL);
+        uv_run(loop, UV_RUN_DEFAULT);
     }
 
     printf("\nPeer summary\n");
-    for (j = 0; j < sizeof(outcomes) / sizeof(outcomes[0]); j++) {
+    for (i = 0; i < count; i++) {
+        if (attempts[i].status == PEER_OK) {
+            handshakes++;
+            seeds += (attempts[i].sawPieces && attempts[i].haveCount == pieceCount) ? 1u : 0u;
+            unchoked += attempts[i].unchoked;
+            dropped += attempts[i].dropped;
+        }
+    }
+    printf("  %-28s %5" PRIu32 "\n", "Handshake OK", handshakes);
+    printf("  %-28s %5" PRIu32 "\n", "  with every piece", seeds);
+    printf("  %-28s %5" PRIu32 "\n", "  unchoked us", unchoked);
+    printf("  %-28s %5" PRIu32 "\n", "  dropped afterwards", dropped);
+    for (j = 0; j < sizeof(failures) / sizeof(failures[0]); j++) {
         tally = 0;
         for (i = 0; i < count; i++) {
-            tally += (attempts[i].status == outcomes[j]) ? 1u : 0u;
+            tally += (attempts[i].status == failures[j]) ? 1u : 0u;
         }
         if (tally > 0) {
-            printf("  %-28s %5" PRIu32 "\n", peerStatusString(outcomes[j]), tally);
+            printf("  %-28s %5" PRIu32 "\n", peerStatusString(failures[j]), tally);
         }
     }
-    tally = 0;
-    for (i = 0; i < count; i++) {
-        tally += (attempts[i].status == PEER_OK) ? 1u : 0u;
-    }
-    return tally;
+    return handshakes;
 }
 
 static int announceTorrent(parserContext *context, const parserAllocator *allocator,
@@ -885,6 +1019,7 @@ static int announceTorrent(parserContext *context, const parserAllocator *alloca
     const char      **seen;
     peerAttempt      *attempts = NULL;
     uint8_t           infoHash[PARSER_SHA1_LENGTH];
+    uint32_t          pieceCount;
     uint32_t          attemptCount = 0;
     uint32_t          attemptCapacity = 0;
     uint32_t          handshakes = 0;
@@ -947,6 +1082,7 @@ static int announceTorrent(parserContext *context, const parserAllocator *alloca
     }
     allocator->free((void *)seen);
     memcpy(infoHash, torrent.infoHash, PARSER_SHA1_LENGTH);
+    pieceCount = torrent.pieceCount;
     parserFree(context, &torrent);      /* trackerConnect() copied what it needs */
 
     uv_run(&loop, UV_RUN_DEFAULT);      /* returns when every announce is done */
@@ -986,7 +1122,7 @@ static int announceTorrent(parserContext *context, const parserAllocator *alloca
             printf("\nNo peers to connect to.\n");
         } else if (peerInit(&loop, context) == PEER_OK) {
             handshakes = handshakePeers(&loop, attempts, attemptCount, infoHash,
-                                        config.peerId, timeoutSeconds);
+                                        config.peerId, pieceCount, timeoutSeconds);
             peerShutdown();
         }
         allocator->free(attempts);
@@ -1121,7 +1257,8 @@ static void usage(const char *program)
             "  -p        mark the torrent private\n"
             "\n"
             "  -t        announce to every tracker in the torrent and list the peers\n"
-            "  -P        announce, then handshake with each peer found (up to 200)\n"
+            "  -P        announce, then contact each peer found (up to 200): handshake,\n"
+            "            send interested, report its pieces and whether it unchokes us\n"
             "  -T secs   announce and handshake timeout (default 15)\n"
             "  -C file   trust the CA certificates in this PEM file for HTTPS\n"
             "            trackers (default: the system's certificate store)\n",

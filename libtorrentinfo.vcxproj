@@ -1,6 +1,6 @@
 ﻿<?xml version="1.0" encoding="utf-8"?>
 <!--
-  libtorrentinfo: the torrent library (parser, encoder, http, udp, tracker, peer)
+  libtorrentinfo: the torrent library (parser, encoder, http, udp, tracker, message, peer)
   as a static library. Dependencies (libuv, OpenSSL) come from vcpkg.json.
 -->
 <Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
@@ -89,6 +89,7 @@
     <ClCompile Include="http.c" />
     <ClCompile Include="udp.c" />
     <ClCompile Include="tracker.c" />
+    <ClCompile Include="message.c" />
     <ClCompile Include="peer.c" />
   </ItemGroup>
   <ItemGroup>
@@ -99,6 +100,7 @@
     <ClInclude Include="http.h" />
     <ClInclude Include="udp.h" />
     <ClInclude Include="tracker.h" />
+    <ClInclude Include="message.h" />
     <ClInclude Include="peer.h" />
   </ItemGroup>
   <ItemGroup>

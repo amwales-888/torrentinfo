@@ -60,7 +60,8 @@ cd build\x64\Release
 .\torrentinfo.exe file.torrent
 .\torrentinfo.exe -o out.torrent C:\path\to\file1 C:\path\to\file2
 .\torrentinfo.exe -t file.torrent
-.\torrentinfo.exe -P file.torrent      # announce, then handshake with the peers
+.\torrentinfo.exe -P file.torrent      # announce, then contact the peers: handshake,
+                                        # pieces each one has, and whether it unchokes us
 ```
 
 To pass arguments when debugging in Visual Studio, use the `torrentinfo`

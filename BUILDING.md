@@ -62,6 +62,8 @@ cd build\x64\Release
 .\torrentinfo.exe -t file.torrent
 .\torrentinfo.exe -P file.torrent      # announce, then contact the peers: handshake,
                                         # pieces each one has, and whether it unchokes us
+.\torrentinfo.exe -D file.torrent      # download one piece into memory and verify it
+.\torrentinfo.exe -D -i 42 file.torrent   # ... a specific piece
 ```
 
 To pass arguments when debugging in Visual Studio, use the `torrentinfo`

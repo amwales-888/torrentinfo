@@ -8,8 +8,9 @@
  *     and host name verification
  *   - UDP trackers (BEP 15)
  *
- * HTTP and HTTPS go through the http module (http.h), which trackerInit()
- * sets up and trackerShutdown() releases. OpenSSL allocates through its own
+ * HTTP and HTTPS go through the http module (http.h) and UDP through the
+ * udp module (udp.h); trackerInit() sets both up and trackerShutdown()
+ * releases them. OpenSSL allocates through its own
  * hook, CRYPTO_set_mem_functions(), which the application may point at the
  * same allocator if wanted.
  *
@@ -99,8 +100,8 @@ typedef struct trackerConfig {
     uint16_t    port;                           /* Port we accept peers on    */
     uint32_t    numWant;                        /* Peers to ask for; 0 = default */
     const char *caFile;     /* PEM file of trusted CA certificates for HTTPS,
-                               or NULL for the system's default store. Only
-                               read during trackerInit().                    */
+                               or NULL for the system's CA bundle. Loaded into
+                               memory during trackerInit().                  */
 } trackerConfig;
 
 /* A peer returned by a tracker. */

@@ -6,7 +6,7 @@
  * Announce: ./torrentinfo -t [-T seconds] [-C ca.pem] file.torrent
  *
  * Build:    cc -std=c99 -Wall -Wextra -O2 -o torrentinfo main.c parser.c encoder.c \
- *               http.c tracker.c $(pkg-config --cflags --libs libuv openssl)
+ *               http.c udp.c tracker.c $(pkg-config --cflags --libs libuv openssl)
  */
 #define _POSIX_C_SOURCE 200809L
 
@@ -418,10 +418,17 @@ static int parsePieceLength(const char *text, uint64_t *out)
     return 0;
 }
 
+/* Runs on the loop thread when the background hashing finishes. */
+static void onCreated(void *privateArg, int32_t status)
+{
+    *(int32_t *)privateArg = status;
+}
+
 static int createTorrent(parserContext *context, const char *outputPath,
                          encoderOptions *options, char **paths, int pathCount)
 {
     encoderState  encoder;
+    uv_loop_t     loop;
     parserTorrent torrent;
     parserTorrent check;
     uint8_t       infoHash[PARSER_SHA1_LENGTH];
@@ -438,9 +445,14 @@ static int createTorrent(parserContext *context, const char *outputPath,
         options->name = name;
     }
 
-    result = encoderBegin(&encoder, context, options);
+    if (uv_loop_init(&loop) != 0) {
+        fprintf(stderr, "uv_loop_init failed\n");
+        return -1;
+    }
+    result = encoderBegin(&encoder, context, &loop, options);
     if (result != ENCODER_OK) {
         fprintf(stderr, "encoderBegin: %s\n", encoderErrorString(result));
+        uv_loop_close(&loop);
         return -1;
     }
 
@@ -449,16 +461,23 @@ static int createTorrent(parserContext *context, const char *outputPath,
         if (result != ENCODER_OK) {
             printEncoderError(paths[i], result, encoder.systemError);
             encoderAbort(&encoder);
+            uv_loop_close(&loop);
             return -1;
         }
     }
 
-    formatSize(encoder.totalLength, sizeText, sizeof(sizeText));
-    fprintf(stderr, "Hashing %" PRIu32 " file(s), %s...\n", encoder.fileCount, sizeText);
+    fprintf(stderr, "Hashing %" PRIu32 " file(s)...\n", encoder.fileCount);
 
-    result = encoderEnd(&encoder, &torrent);
+    /* The reading and hashing happen on libuv's thread pool; the loop runs
+     * until the callback has reported the result. */
+    result = encoderEnd(&encoder, &torrent, onCreated, &result);
+    if (result == ENCODER_OK) {
+        uv_run(&loop, UV_RUN_DEFAULT);
+    }
+    uv_loop_close(&loop);
     if (result != ENCODER_OK) {
-        if ((result == ENCODER_ERROR_IO || result == ENCODER_ERROR_FILE_CHANGED) &&
+        if ((result == ENCODER_ERROR_IO || result == ENCODER_ERROR_FILE_CHANGED ||
+             result == ENCODER_ERROR_NOT_REGULAR_FILE || result == ENCODER_ERROR_TOO_LARGE) &&
             encoder.errorFileIndex < (uint32_t)pathCount) {
             printEncoderError(paths[encoder.errorFileIndex], result, encoder.systemError);
         } else {
@@ -466,6 +485,8 @@ static int createTorrent(parserContext *context, const char *outputPath,
         }
         return -1;
     }
+    formatSize(torrent.totalLength, sizeText, sizeof(sizeText));
+    fprintf(stderr, "Hashed %s in %" PRIu32 " pieces.\n", sizeText, torrent.pieceCount);
 
     memcpy(infoHash, torrent.infoHash, PARSER_SHA1_LENGTH);
     result = encoderEncode(context, &torrent, &buffer, &length);

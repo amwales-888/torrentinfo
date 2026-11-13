@@ -2,6 +2,8 @@
  * encoder.c - BitTorrent metainfo (.torrent) encoder and creator.
  *
  * Output goes into a buffer that grows through the context's realloc hook.
+ * Creating a torrent reads and hashes files on libuv's thread pool, so no
+ * public function blocks the calling thread on file I/O.
  * Write errors are remembered in the writer and checked once at the end,
  * which keeps the encoding functions linear and easy to compare with the
  * specification.
@@ -472,7 +474,7 @@ static int32_t buildFiles(encoderState *encoder, parserTorrent *torrent)
 
         file->length = source->length;
         file->offset = torrent->totalLength;
-        torrent->totalLength += source->length;     /* overflow checked in AddFile */
+        torrent->totalLength += source->length;     /* overflow checked in statWork */
 
         /* Single-file torrents use the torrent name as the file's path,
          * matching what parserParse() produces. */
@@ -492,14 +494,71 @@ static int32_t buildFiles(encoderState *encoder, parserTorrent *torrent)
     return ENCODER_OK;
 }
 
+/* ======================================================================== */
+/* Background work                                                          */
+/*                                                                          */
+/* encoderEnd() runs in two stages on libuv's thread pool:                  */
+/*   1. statWork:  find each file's size            -> statDone (loop)      */
+/*   2. hashWork:  read and SHA-1 every piece       -> hashDone (loop)      */
+/* Between them, on the loop thread, the torrent structure and the piece    */
+/* buffers are allocated. Worker threads never call the allocator (it need  */
+/* not be thread-safe) and never touch the torrent's lists.                 */
+/* ======================================================================== */
+
+static uint8_t isCancelled(encoderState *encoder)
+{
+    uint8_t cancelled;
+
+    uv_mutex_lock(&encoder->lock);
+    cancelled = encoder->cancelled;
+    uv_mutex_unlock(&encoder->lock);
+    return cancelled;
+}
+
+/* Worker thread: size of every file, total length. */
+static void statWork(uv_work_t *work)
+{
+    encoderState      *encoder = work->data;
+    encoderSourceFile *source;
+    struct stat        info;
+    uint64_t           total = 0;
+    uint32_t           index = 0;
+
+    encoder->workResult = ENCODER_OK;
+    TAILQ_FOREACH(source, &encoder->files, entries) {
+        if (isCancelled(encoder)) {
+            encoder->workResult = ENCODER_ERROR_CANCELLED;
+            return;
+        }
+        encoder->errorFileIndex = index;
+        if (stat(source->diskPath, &info) != 0) {
+            encoder->systemError = errno;
+            encoder->workResult = ENCODER_ERROR_IO;
+            return;
+        }
+        if (!S_ISREG(info.st_mode)) {
+            encoder->workResult = ENCODER_ERROR_NOT_REGULAR_FILE;
+            return;
+        }
+        source->length = (uint64_t)info.st_size;
+        if (source->length > (uint64_t)INT64_MAX - total) {
+            encoder->workResult = ENCODER_ERROR_TOO_LARGE;  /* bencode integers are signed */
+            return;
+        }
+        total += source->length;
+        index++;
+    }
+    encoder->totalLength = total;
+}
+
 /*
- * Read one file into the piece buffer, hashing each piece as it fills.
- * Pieces span file boundaries, so 'fill' carries over between files.
+ * Worker thread: read one file into the piece buffer, hashing each piece as
+ * it fills. Pieces span file boundaries, so 'fill' carries over.
  */
 static int32_t hashFile(encoderState *encoder, const encoderSourceFile *source,
-                        parserTorrent *torrent, uint8_t *piece,
-                        uint64_t *fill, uint32_t *index)
+                        parserTorrent *torrent, uint64_t *fill, uint32_t *index)
 {
+    uint8_t    *piece = encoder->pieceBuffer;
     struct stat info;
     uint64_t    remaining = source->length;
     uint64_t    wanted;
@@ -522,6 +581,10 @@ static int32_t hashFile(encoderState *encoder, const encoderSourceFile *source,
     }
 
     while (remaining > 0) {
+        if (isCancelled(encoder)) {
+            close(fd);
+            return ENCODER_ERROR_CANCELLED;
+        }
         wanted = torrent->pieceLength - *fill;
         if (wanted > remaining) {
             wanted = remaining;
@@ -557,30 +620,19 @@ static int32_t hashFile(encoderState *encoder, const encoderSourceFile *source,
     return ENCODER_OK;
 }
 
-static int32_t hashPieces(encoderState *encoder, parserTorrent *torrent)
+/* Worker thread: hash every piece into the pre-allocated torrent->pieces. */
+static void hashWork(uv_work_t *work)
 {
-    parserContext     *context = encoder->context;
+    encoderState      *encoder = work->data;
+    parserTorrent     *torrent = encoder->torrent;
     encoderSourceFile *source;
-    uint8_t           *piece;
     uint64_t           fill = 0;
     uint32_t           index = 0;
     uint32_t           fileIndex = 0;
     int32_t            result = ENCODER_OK;
 
-    if (torrent->pieceCount == 0) {
-        return ENCODER_OK;                          /* only empty files */
-    }
-    torrent->pieces = allocate(context, (uint64_t)torrent->pieceCount * PARSER_SHA1_LENGTH);
-    if (torrent->pieces == NULL) {
-        return PARSER_ERROR_NO_MEMORY;
-    }
-    piece = allocate(context, torrent->pieceLength);
-    if (piece == NULL) {
-        return PARSER_ERROR_NO_MEMORY;
-    }
-
     TAILQ_FOREACH(source, &encoder->files, entries) {
-        result = hashFile(encoder, source, torrent, piece, &fill, &index);
+        result = hashFile(encoder, source, torrent, &fill, &index);
         if (result != ENCODER_OK) {
             encoder->errorFileIndex = fileIndex;
             break;
@@ -592,16 +644,15 @@ static int32_t hashPieces(encoderState *encoder, parserTorrent *torrent)
         if (index >= torrent->pieceCount) {
             result = ENCODER_ERROR_FILE_CHANGED;
         } else {
-            parserSha1(piece, fill, torrent->pieces + (uint64_t)index * PARSER_SHA1_LENGTH);
+            parserSha1(encoder->pieceBuffer, fill,
+                       torrent->pieces + (uint64_t)index * PARSER_SHA1_LENGTH);
             index++;
         }
     }
     if (result == ENCODER_OK && index != torrent->pieceCount) {
         result = ENCODER_ERROR_FILE_CHANGED;
     }
-
-    release(context, piece);
-    return result;
+    encoder->workResult = result;
 }
 
 /* The info hash is the SHA-1 of the bencoded info dictionary. */
@@ -621,16 +672,13 @@ static int32_t computeInfoHash(parserContext *context, parserTorrent *torrent)
     return ENCODER_OK;
 }
 
+/* Loop thread: everything except the hashing, once file sizes are known. */
 static int32_t buildTorrent(encoderState *encoder, parserTorrent *torrent)
 {
     parserContext        *context = encoder->context;
     const encoderOptions *options = &encoder->options;
     const char           *name;
     uint64_t              pieceCount;
-
-    if (encoder->fileCount == 0) {
-        return ENCODER_ERROR_NO_FILES;
-    }
 
     if (options->name != NULL) {
         name = options->name;
@@ -652,9 +700,73 @@ static int32_t buildTorrent(encoderState *encoder, parserTorrent *torrent)
 
     ENCODER_TRY(buildMetadata(context, options, torrent));
     ENCODER_TRY(buildFiles(encoder, torrent));
-    ENCODER_TRY(hashPieces(encoder, torrent));
-    ENCODER_TRY(computeInfoHash(context, torrent));
+
+    /* Buffers the worker fills: the piece hashes and one piece of data. */
+    if (torrent->pieceCount > 0) {
+        torrent->pieces = allocate(context, (uint64_t)torrent->pieceCount * PARSER_SHA1_LENGTH);
+        encoder->pieceBuffer = allocate(context, torrent->pieceLength);
+        if (torrent->pieces == NULL || encoder->pieceBuffer == NULL) {
+            return PARSER_ERROR_NO_MEMORY;
+        }
+    }
     return ENCODER_OK;
+}
+
+/* Loop thread: release the state, then report. The callback runs last, so
+ * it may free or reuse the encoderState and start another torrent. */
+static void complete(encoderState *encoder, int32_t status)
+{
+    encoderCallback callback = encoder->callback;
+    void           *privateArg = encoder->privateArg;
+
+    if (status != ENCODER_OK) {
+        parserFree(encoder->context, encoder->torrent);
+    }
+    release(encoder->context, encoder->pieceBuffer);
+    encoder->pieceBuffer = NULL;
+    encoder->torrent = NULL;
+    freeSources(encoder);
+    uv_mutex_destroy(&encoder->lock);
+    encoder->busy = 0;
+
+    callback(privateArg, status);
+}
+
+static void hashDone(uv_work_t *work, int status)
+{
+    encoderState *encoder = work->data;
+    int32_t       result = encoder->workResult;
+
+    if (status == UV_ECANCELED || isCancelled(encoder)) {
+        result = ENCODER_ERROR_CANCELLED;
+    } else if (result == ENCODER_OK) {
+        result = computeInfoHash(encoder->context, encoder->torrent);
+    }
+    complete(encoder, result);
+}
+
+static void statDone(uv_work_t *work, int status)
+{
+    encoderState *encoder = work->data;
+    int32_t       result = encoder->workResult;
+
+    if (status == UV_ECANCELED || isCancelled(encoder)) {
+        complete(encoder, ENCODER_ERROR_CANCELLED);
+        return;
+    }
+    if (result == ENCODER_OK) {
+        result = buildTorrent(encoder, encoder->torrent);
+    }
+    if (result == ENCODER_OK && encoder->torrent->pieceCount > 0) {
+        if (uv_queue_work(encoder->loop, &encoder->work, hashWork, hashDone) == 0) {
+            return;                                 /* stage 2 under way */
+        }
+        result = ENCODER_ERROR_IO;
+    }
+    if (result == ENCODER_OK) {                     /* only empty files: nothing to hash */
+        result = computeInfoHash(encoder->context, encoder->torrent);
+    }
+    complete(encoder, result);
 }
 
 /* ======================================================================== */
@@ -699,7 +811,7 @@ void encoderFreeBuffer(parserContext *context, uint8_t *buffer)
     }
 }
 
-int32_t encoderBegin(encoderState *encoder, parserContext *context,
+int32_t encoderBegin(encoderState *encoder, parserContext *context, uv_loop_t *loop,
                      const encoderOptions *options)
 {
     if (encoder == NULL) {
@@ -708,7 +820,7 @@ int32_t encoderBegin(encoderState *encoder, parserContext *context,
     memset(encoder, 0, sizeof(*encoder));
     TAILQ_INIT(&encoder->files);
 
-    if (context == NULL || options == NULL) {
+    if (context == NULL || loop == NULL || options == NULL) {
         return PARSER_ERROR_INVALID_ARGUMENT;
     }
     if (!contextValid(context)) {
@@ -729,11 +841,13 @@ int32_t encoderBegin(encoderState *encoder, parserContext *context,
     }
 
     encoder->context = context;
+    encoder->loop = loop;
     encoder->options = *options;
     encoder->magic = ENCODER_STATE_MAGIC;
     return ENCODER_OK;
 }
 
+/* No I/O here: the file is examined in encoderEnd()'s background work. */
 int32_t encoderAddFile(encoderState *encoder, const char *path)
 {
     parserContext     *context;
@@ -741,39 +855,24 @@ int32_t encoderAddFile(encoderState *encoder, const char *path)
     encoderSourceFile *existing;
     const char        *slash;
     const char        *name;
-    struct stat        info;
-    uint64_t           length;
 
-    if (encoder == NULL || path == NULL || encoder->magic != ENCODER_STATE_MAGIC) {
+    if (encoder == NULL || path == NULL || encoder->magic != ENCODER_STATE_MAGIC ||
+        encoder->busy) {
         return PARSER_ERROR_INVALID_ARGUMENT;
     }
     context = encoder->context;
     encoder->errorFileIndex = encoder->fileCount;
     encoder->systemError = 0;
 
-    if (stat(path, &info) != 0) {
-        encoder->systemError = errno;
-        return ENCODER_ERROR_IO;
-    }
-    if (!S_ISREG(info.st_mode)) {
-        return ENCODER_ERROR_NOT_REGULAR_FILE;
-    }
-    length = (uint64_t)info.st_size;
-
     slash = strrchr(path, '/');
     name = (slash != NULL) ? slash + 1 : path;
     if (!isSafeName(name)) {
         return ENCODER_ERROR_INVALID_NAME;
     }
-
     TAILQ_FOREACH(existing, &encoder->files, entries) {
         if (strcmp(existing->name, name) == 0) {
             return ENCODER_ERROR_DUPLICATE_FILE;
         }
-    }
-    if (length > UINT64_MAX - encoder->totalLength ||
-        encoder->totalLength + length > (uint64_t)INT64_MAX) {
-        return ENCODER_ERROR_TOO_LARGE;             /* bencode integers are signed */
     }
 
     source = allocate(context, sizeof(*source));
@@ -785,43 +884,66 @@ int32_t encoderAddFile(encoderState *encoder, const char *path)
         return PARSER_ERROR_NO_MEMORY;
     }
     source->name = source->diskPath + (name - path);
-    source->length = length;
 
     TAILQ_INSERT_TAIL(&encoder->files, source, entries);
     encoder->fileCount++;
-    encoder->totalLength += length;
     return ENCODER_OK;
 }
 
-int32_t encoderEnd(encoderState *encoder, parserTorrent *torrent)
+int32_t encoderEnd(encoderState *encoder, parserTorrent *torrent,
+                   encoderCallback callback, void *privateArg)
 {
-    int32_t result;
-
-    if (torrent != NULL) {
-        initTorrent(torrent);
-    }
-    if (encoder == NULL || encoder->magic != ENCODER_STATE_MAGIC) {
-        return PARSER_ERROR_INVALID_ARGUMENT;
+    if (encoder == NULL || encoder->magic != ENCODER_STATE_MAGIC || encoder->busy) {
+        return PARSER_ERROR_INVALID_ARGUMENT;       /* state untouched */
     }
     encoder->systemError = 0;
 
-    if (torrent == NULL) {
-        result = PARSER_ERROR_INVALID_ARGUMENT;
-    } else {
-        result = buildTorrent(encoder, torrent);
-        if (result != ENCODER_OK) {
-            parserFree(encoder->context, torrent);
-        }
+    if (torrent == NULL || callback == NULL) {
+        freeSources(encoder);
+        return PARSER_ERROR_INVALID_ARGUMENT;
     }
-    freeSources(encoder);
-    return result;
+    initTorrent(torrent);
+    if (encoder->fileCount == 0) {
+        freeSources(encoder);
+        return ENCODER_ERROR_NO_FILES;
+    }
+    if (uv_mutex_init(&encoder->lock) != 0) {
+        freeSources(encoder);
+        return ENCODER_ERROR_IO;
+    }
+
+    encoder->torrent = torrent;
+    encoder->callback = callback;
+    encoder->privateArg = privateArg;
+    encoder->cancelled = 0;
+    encoder->pieceBuffer = NULL;
+    encoder->work.data = encoder;
+    encoder->busy = 1;
+
+    if (uv_queue_work(encoder->loop, &encoder->work, statWork, statDone) != 0) {
+        uv_mutex_destroy(&encoder->lock);
+        encoder->busy = 0;
+        freeSources(encoder);
+        return ENCODER_ERROR_IO;
+    }
+    return ENCODER_OK;
 }
 
 void encoderAbort(encoderState *encoder)
 {
-    if (encoder != NULL && encoder->magic == ENCODER_STATE_MAGIC) {
-        freeSources(encoder);
+    if (encoder == NULL || encoder->magic != ENCODER_STATE_MAGIC) {
+        return;
     }
+    if (!encoder->busy) {
+        freeSources(encoder);                       /* encoderEnd() not called */
+        return;
+    }
+    /* Background work running: ask it to stop. The callback still runs,
+     * with ENCODER_ERROR_CANCELLED. */
+    uv_mutex_lock(&encoder->lock);
+    encoder->cancelled = 1;
+    uv_mutex_unlock(&encoder->lock);
+    uv_cancel((uv_req_t *)&encoder->work);          /* succeeds only if not started */
 }
 
 const char *encoderErrorString(int32_t error)
@@ -834,6 +956,7 @@ const char *encoderErrorString(int32_t error)
     case ENCODER_ERROR_FILE_CHANGED:     return "File changed while being hashed";
     case ENCODER_ERROR_TOO_LARGE:        return "Too much data";
     case ENCODER_ERROR_INVALID_NAME:     return "Invalid or missing torrent name";
+    case ENCODER_ERROR_CANCELLED:        return "Cancelled";
     default:                             return parserErrorString(error);
     }
 }

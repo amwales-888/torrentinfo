@@ -20,6 +20,7 @@
 #include <inttypes.h>
 #include <stdarg.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/queue.h>
 
@@ -778,6 +779,47 @@ static int32_t buildRequestText(httpRequest *request, const httpUrl *url)
 }
 
 /* ======================================================================== */
+/* Trusted certificates                                                     */
+/* ======================================================================== */
+
+/*
+ * Load the system's CA bundle into memory, so that verifying a server never
+ * has to read certificate files during a handshake (on the loop thread).
+ * Order: $SSL_CERT_FILE, OpenSSL's built-in default file, then the bundle
+ * locations used by the major Linux distributions. If none exists, fall
+ * back to OpenSSL's default paths, which may look up certificates on disk
+ * during handshakes.
+ */
+static int loadSystemCertificates(SSL_CTX *tls)
+{
+    static const char *const bundles[] = {
+        "/etc/ssl/certs/ca-certificates.crt",                   /* Debian, Ubuntu, Arch */
+        "/etc/pki/tls/certs/ca-bundle.crt",                     /* Fedora, RHEL       */
+        "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem",    /* RHEL 7+            */
+        "/etc/ssl/ca-bundle.pem",                               /* openSUSE           */
+        "/etc/ssl/cert.pem",                                    /* Alpine, macOS      */
+        NULL
+    };
+    const char *environment = getenv(X509_get_default_cert_file_env());
+    const char *defaultFile = X509_get_default_cert_file();
+    uint32_t    i;
+
+    if (environment != NULL && environment[0] != '\0') {
+        return SSL_CTX_load_verify_locations(tls, environment, NULL) == 1;
+    }
+    if (SSL_CTX_load_verify_locations(tls, defaultFile, NULL) == 1) {
+        return 1;
+    }
+    for (i = 0; bundles[i] != NULL; i++) {
+        if (SSL_CTX_load_verify_locations(tls, bundles[i], NULL) == 1) {
+            return 1;
+        }
+    }
+    ERR_clear_error();                              /* failures from the probes */
+    return SSL_CTX_set_default_verify_paths(tls) == 1;
+}
+
+/* ======================================================================== */
 /* Public API                                                               */
 /* ======================================================================== */
 
@@ -917,12 +959,13 @@ int32_t httpInit(uv_loop_t *loop, parserContext *context, const httpConfig *conf
     SSL_CTX_set_verify(httpState.tls, SSL_VERIFY_PEER, NULL);
     if ((config->caFile != NULL)
             ? SSL_CTX_load_verify_locations(httpState.tls, config->caFile, NULL) != 1
-            : SSL_CTX_set_default_verify_paths(httpState.tls) != 1) {
+            : !loadSystemCertificates(httpState.tls)) {
         SSL_CTX_free(httpState.tls);
         httpState.tls = NULL;
         ERR_clear_error();
         return HTTP_ETLS;
     }
+    ERR_clear_error();
 
     snprintf(httpState.userAgent, sizeof(httpState.userAgent), "%s", userAgent);
     httpState.loop = loop;

@@ -70,7 +70,10 @@ extern "C" {
 /* Settings for the module. Copied by httpInit(); strings are only read there. */
 typedef struct httpConfig {
     const char *caFile;     /* PEM file of trusted CAs, or NULL for the
-                               system's default certificate store          */
+                               system's CA bundle ($SSL_CERT_FILE, else the
+                               usual Linux locations). Either way the
+                               certificates are loaded into memory here, so
+                               handshakes never read from disk.            */
     const char *userAgent;  /* NULL for HTTP_DEFAULT_USER_AGENT; at most 127
                                characters                                  */
 } httpConfig;

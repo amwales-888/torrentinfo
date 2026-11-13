@@ -5,15 +5,14 @@
  *
  *   HTTP/HTTPS: build the announce URL -> httpGet() (http.c) -> parse the
  *               bencoded body
- *   UDP:        resolve (uv_getaddrinfo) -> connect request -> connect
- *               response -> announce request -> announce response,
- *               retransmitting on a timer (BEP 15)
+ *   UDP:        udpAnnounce() (udp.c) -> copy the compact peers
  *
  * A single timeout timer covers the whole announce, for every protocol.
  *
  * Lifetime: libuv handles must be closed with uv_close() and requests must
- * complete before their memory is freed. (An HTTP request manages its own
- * handles inside http.c; we only cancel it.) 'pending' counts every libuv
+ * complete before their memory is freed. (HTTP and UDP requests manage
+ * their own handles inside http.c and udp.c; we only cancel them.) The only
+ * handle here is the timeout timer. 'pending' counts every libuv
  * callback still to come (open handles plus in-flight requests). A request
  * is freed only when it has been closed by the user (detached) and pending
  * has reached zero. When an announce finishes, its handles are closed at
@@ -29,21 +28,11 @@
 
 #include "http.h"
 #include "tracker.h"
+#include "udp.h"
 
 #define TRACKER_STATE_MAGIC         0x5452434Bu     /* "TRCK" */
 #define TRACKER_PROTOCOL_HTTP       1u              /* http and https */
 #define TRACKER_PROTOCOL_UDP        2u
-#define TRACKER_MAX_ADDRESSES       8u
-#define TRACKER_UDP_BUFFER          8192u
-#define TRACKER_UDP_RETRY_MS        2000u           /* first retransmit      */
-#define TRACKER_UDP_MAX_RETRY_MS    16000u          /* retransmit back-off cap */
-#define TRACKER_UDP_PROTOCOL_ID     0x41727101980ull
-#define TRACKER_UDP_ACTION_CONNECT  0u
-#define TRACKER_UDP_ACTION_ANNOUNCE 1u
-#define TRACKER_UDP_ACTION_ERROR    3u
-#define TRACKER_UDP_EVENT_STARTED   2u
-#define TRACKER_UDP_CONNECT_SIZE    16u
-#define TRACKER_UDP_ANNOUNCE_SIZE   98u
 #define TRACKER_CANCELLED           (-100)          /* internal only         */
 /*
  * Bytes left to download, as reported to the tracker. The announce API has
@@ -65,36 +54,14 @@ typedef struct trackerRequest {
     /* Parsed URL */
     uint8_t                 protocol;
     char                   *url;
-    char                   *host;           /* UDP: for DNS                     */
-    uint16_t                port;
     uint8_t                 infoHash[PARSER_SHA1_LENGTH];
 
-    /* HTTP and HTTPS: the request in http.c, or NULL when not running */
+    /* The transport request in http.c or udp.c, or NULL when not running */
     httpRequest            *http;
+    udpRequest             *udp;
 
-    /* UDP: addresses from DNS */
-    struct sockaddr_storage addresses[TRACKER_MAX_ADDRESSES];
-    uint32_t                addressCount;
-
-    /* libuv handles and requests; the flags say which handles are open */
-    uv_getaddrinfo_t        resolver;
     uv_timer_t              timeoutTimer;
-    uv_timer_t              retryTimer;
-    uv_udp_t                udp;
-    uint8_t                 resolving;
     uint8_t                 timeoutOpen;
-    uint8_t                 retryOpen;
-    uint8_t                 udpOpen;
-
-    /* UDP */
-    uint8_t                 udpStage;       /* TRACKER_UDP_ACTION_CONNECT/ANNOUNCE */
-    uint8_t                 udpIpv6;
-    uint32_t                transactionId;
-    uint64_t                connectionId;
-    uint32_t                retryCount;
-    uint8_t                 packet[TRACKER_UDP_ANNOUNCE_SIZE];
-    uint32_t                packetLength;
-    uint8_t                 ioBuffer[TRACKER_UDP_BUFFER];
 
     /* Results */
     uint32_t                interval;
@@ -202,37 +169,6 @@ static uint32_t random32(void)
     return value;
 }
 
-static void put16(uint8_t *out, uint16_t value)
-{
-    out[0] = (uint8_t)(value >> 8);
-    out[1] = (uint8_t)value;
-}
-
-static void put32(uint8_t *out, uint32_t value)
-{
-    out[0] = (uint8_t)(value >> 24);
-    out[1] = (uint8_t)(value >> 16);
-    out[2] = (uint8_t)(value >> 8);
-    out[3] = (uint8_t)value;
-}
-
-static void put64(uint8_t *out, uint64_t value)
-{
-    put32(out, (uint32_t)(value >> 32));
-    put32(out + 4, (uint32_t)value);
-}
-
-static uint32_t get32(const uint8_t *in)
-{
-    return ((uint32_t)in[0] << 24) | ((uint32_t)in[1] << 16) |
-           ((uint32_t)in[2] << 8) | (uint32_t)in[3];
-}
-
-static uint64_t get64(const uint8_t *in)
-{
-    return ((uint64_t)get32(in) << 32) | (uint64_t)get32(in + 4);
-}
-
 static uint32_t numWant(void)
 {
     return (trackerState.config.numWant != 0) ? trackerState.config.numWant
@@ -271,7 +207,6 @@ static uint32_t allocateId(void)
 static void freeRequest(trackerRequest *request)
 {
     release(request->url);
-    release(request->host);
     release(request->failureReason);
     release(request->warningMessage);
     release(request->peers);
@@ -285,58 +220,36 @@ static void maybeFree(trackerRequest *request)
     }
 }
 
-static void onHandleClosed(uv_handle_t *handle)
+static void onTimerClosed(uv_handle_t *handle)
 {
     trackerRequest *request = handle->data;
 
-    if (handle == (uv_handle_t *)&request->udp) {
-        request->udpOpen = 0;
-    } else if (handle == (uv_handle_t *)&request->timeoutTimer) {
-        request->timeoutOpen = 0;
-    } else if (handle == (uv_handle_t *)&request->retryTimer) {
-        request->retryOpen = 0;
-    }
+    request->timeoutOpen = 0;
     request->pending--;
     maybeFree(request);
 }
 
-static void closeHandle(uv_handle_t *handle, uint8_t open)
-{
-    if (open && !uv_is_closing(handle)) {
-        uv_close(handle, onHandleClosed);
-    }
-}
-
-/* Stop all network activity. Callbacks still to come will see 'finished'. */
+/* Stop the transport and the timer. Callbacks still to come see 'finished'. */
 static void closeAll(trackerRequest *request)
 {
     if (request->http != NULL) {
         httpCancel(request->http);                  /* its callback will not run */
         request->http = NULL;
     }
-    if (request->resolving) {
-        /* If the lookup is already running this fails, and its callback
-         * simply arrives later. */
-        uv_cancel((uv_req_t *)&request->resolver);
+    if (request->udp != NULL) {
+        udpCancel(request->udp);                    /* its callback will not run */
+        request->udp = NULL;
     }
-    if (request->timeoutOpen) {
+    if (request->timeoutOpen && !uv_is_closing((uv_handle_t *)&request->timeoutTimer)) {
         uv_timer_stop(&request->timeoutTimer);
+        uv_close((uv_handle_t *)&request->timeoutTimer, onTimerClosed);
     }
-    if (request->retryOpen) {
-        uv_timer_stop(&request->retryTimer);
-    }
-    if (request->udpOpen) {
-        uv_udp_recv_stop(&request->udp);
-    }
-    closeHandle((uv_handle_t *)&request->timeoutTimer, request->timeoutOpen);
-    closeHandle((uv_handle_t *)&request->retryTimer, request->retryOpen);
-    closeHandle((uv_handle_t *)&request->udp, request->udpOpen);
 }
 
 /*
- * Record the final status and tell the user. Handles close asynchronously,
- * so 'pending' stays above zero and the request cannot be freed during the
- * callback, even if the callback calls trackerClose().
+ * Record the final status and tell the user. The timer closes
+ * asynchronously, so 'pending' stays above zero and the request cannot be
+ * freed during the callback, even if the callback calls trackerClose().
  */
 static void finish(trackerRequest *request, int32_t status)
 {
@@ -382,6 +295,21 @@ static int32_t fromHttpStatus(int32_t status)
     }
 }
 
+static int32_t fromUdpStatus(int32_t status)
+{
+    switch (status) {
+    case UDP_OK:        return TRACKER_OK;
+    case UDP_EINVAL:    return TRACKER_EINVAL;
+    case UDP_ENOMEM:    return TRACKER_ENOMEM;
+    case UDP_ETIMEDOUT: return TRACKER_ETIMEDOUT;
+    case UDP_ENOTSUP:   return TRACKER_ENOTSUP;
+    case UDP_EFAILURE:  return TRACKER_EFAILURE;
+    case UDP_EPROTO:    return TRACKER_EPROTO;
+    case UDP_ENOTINIT:  return TRACKER_ENOTINIT;
+    default:            return TRACKER_ERROR;
+    }
+}
+
 static uint8_t schemeIs(const httpUrl *url, const char *scheme)
 {
     size_t   length = strlen(scheme);
@@ -422,10 +350,8 @@ static int32_t parseUrl(trackerRequest *request, const char *url, httpUrl *parts
     } else {
         return TRACKER_ENOTSUP;
     }
-    request->port = parts->port;
     request->url = copyBytes(url, strlen(url));
-    request->host = copyBytes(parts->host, parts->hostLength);
-    return (request->url != NULL && request->host != NULL) ? TRACKER_OK : TRACKER_ENOMEM;
+    return (request->url != NULL) ? TRACKER_OK : TRACKER_ENOMEM;
 }
 
 /* Percent-encode binary data: 20 bytes need at most 61 characters. */
@@ -732,213 +658,31 @@ static void onHttpDone(void *privateArg, const httpResponse *response)
 }
 
 /* ======================================================================== */
-/* UDP (BEP 15)                                                             */
+/* UDP (the protocol is in udp.c)                                           */
 /* ======================================================================== */
 
-static void udpTransmit(trackerRequest *request);
-
-static void onUdpRetry(uv_timer_t *timer)
+static void onUdpDone(void *privateArg, const udpResponse *response)
 {
-    trackerRequest *request = timer->data;
+    trackerRequest *request = privateArg;
 
-    if (request->finished) {
+    request->udp = NULL;                            /* udp.c frees it after this */
+    if (response->failureReason != NULL &&
+        replaceString(&request->failureReason, (const uint8_t *)response->failureReason,
+                      strlen(response->failureReason)) != TRACKER_OK) {
+        finish(request, TRACKER_ENOMEM);
         return;
     }
-    if (request->retryCount < 16u) {
-        request->retryCount++;
-    }
-    udpTransmit(request);
-}
-
-/* Send the current packet and arm the retransmit timer (2s, 4s, 8s, 16s...). */
-static void udpTransmit(trackerRequest *request)
-{
-    uv_buf_t buffer = uv_buf_init((char *)request->packet, request->packetLength);
-    uint64_t delay;
-    int      result;
-
-    result = uv_udp_try_send(&request->udp, &buffer, 1, NULL);
-    if (result < 0 && result != UV_EAGAIN) {        /* EAGAIN: the retry resends */
-        setError(request, "send failed: %s", uv_strerror(result));
-        finish(request, TRACKER_ERROR);
+    if (response->status != UDP_OK) {
+        setError(request, "%s", response->errorMessage);
+        finish(request, fromUdpStatus(response->status));
         return;
     }
-
-    delay = (uint64_t)TRACKER_UDP_RETRY_MS << request->retryCount;
-    if (delay > TRACKER_UDP_MAX_RETRY_MS) {
-        delay = TRACKER_UDP_MAX_RETRY_MS;
-    }
-    uv_timer_start(&request->retryTimer, onUdpRetry, delay, 0);
-}
-
-static void udpBeginStage(trackerRequest *request, uint8_t stage)
-{
-    uint8_t *p = request->packet;
-
-    request->udpStage = stage;
-    request->retryCount = 0;
-    request->transactionId = random32();
-
-    if (stage == TRACKER_UDP_ACTION_CONNECT) {
-        put64(p, TRACKER_UDP_PROTOCOL_ID);
-        put32(p + 8, TRACKER_UDP_ACTION_CONNECT);
-        put32(p + 12, request->transactionId);
-        request->packetLength = TRACKER_UDP_CONNECT_SIZE;
-    } else {
-        put64(p, request->connectionId);
-        put32(p + 8, TRACKER_UDP_ACTION_ANNOUNCE);
-        put32(p + 12, request->transactionId);
-        memcpy(p + 16, request->infoHash, PARSER_SHA1_LENGTH);
-        memcpy(p + 36, trackerState.config.peerId, TRACKER_PEER_ID_LENGTH);
-        put64(p + 56, 0);                           /* downloaded */
-        put64(p + 64, TRACKER_ANNOUNCE_LEFT);       /* left       */
-        put64(p + 72, 0);                           /* uploaded   */
-        put32(p + 80, TRACKER_UDP_EVENT_STARTED);
-        put32(p + 84, 0);                           /* IP: use sender's */
-        put32(p + 88, trackerState.key);
-        put32(p + 92, numWant());
-        put16(p + 96, trackerState.config.port);
-        request->packetLength = TRACKER_UDP_ANNOUNCE_SIZE;
-    }
-    udpTransmit(request);
-}
-
-static void onUdpAlloc(uv_handle_t *handle, size_t suggested, uv_buf_t *buffer)
-{
-    trackerRequest *request = handle->data;
-
-    (void)suggested;
-    buffer->base = (char *)request->ioBuffer;
-    buffer->len = sizeof(request->ioBuffer);
-}
-
-static void onUdpRead(uv_udp_t *udp, ssize_t count, const uv_buf_t *buffer,
-                      const struct sockaddr *from, unsigned flags)
-{
-    trackerRequest *request = udp->data;
-    const uint8_t  *data = request->ioBuffer;
-    uint64_t        length;
-    uint32_t        action;
-    int32_t         result;
-
-    (void)buffer;
-    (void)from;
-    if (request->finished) {
-        return;
-    }
-    if (count < 0) {                                /* e.g. ECONNREFUSED via ICMP */
-        setError(request, "receive failed: %s", uv_strerror((int)count));
-        finish(request, TRACKER_ERROR);
-        return;
-    }
-    length = (uint64_t)count;
-    if (length < 8u || (flags & UV_UDP_PARTIAL) || get32(data + 4) != request->transactionId) {
-        return;                                     /* not for us: ignore */
-    }
-    action = get32(data);
-
-    if (action == TRACKER_UDP_ACTION_ERROR) {
-        result = replaceString(&request->failureReason, data + 8, length - 8u);
-        if (result == TRACKER_OK) {
-            setError(request, "tracker refused the announce");
-            result = TRACKER_EFAILURE;
-        }
-        finish(request, result);
-    } else if (request->udpStage == TRACKER_UDP_ACTION_CONNECT &&
-               action == TRACKER_UDP_ACTION_CONNECT && length >= 16u) {
-        request->connectionId = get64(data + 8);
-        udpBeginStage(request, TRACKER_UDP_ACTION_ANNOUNCE);
-    } else if (request->udpStage == TRACKER_UDP_ACTION_ANNOUNCE &&
-               action == TRACKER_UDP_ACTION_ANNOUNCE && length >= 20u) {
-        request->interval = get32(data + 8);
-        request->leechers = (int64_t)get32(data + 12);
-        request->seeders = (int64_t)get32(data + 16);
-        /* Peer address size follows the address family we reached the tracker on. */
-        finish(request, addCompactPeers(request, data + 20, length - 20u,
-                                        request->udpIpv6 ? TRACKER_FAMILY_IPV6
-                                                         : TRACKER_FAMILY_IPV4));
-    }
-}
-
-static void udpStart(trackerRequest *request)
-{
-    const struct sockaddr *address = (const struct sockaddr *)&request->addresses[0];
-    int                    result;
-
-    result = uv_udp_init(trackerState.loop, &request->udp);
-    if (result < 0) {
-        setError(request, "socket failed: %s", uv_strerror(result));
-        finish(request, TRACKER_ERROR);
-        return;
-    }
-    request->udp.data = request;
-    request->udpOpen = 1;
-    request->pending++;
-    request->udpIpv6 = (uint8_t)(address->sa_family == AF_INET6);
-
-    result = uv_udp_connect(&request->udp, address);
-    if (result == 0) {
-        result = uv_udp_recv_start(&request->udp, onUdpAlloc, onUdpRead);
-    }
-    if (result == 0) {
-        result = uv_timer_init(trackerState.loop, &request->retryTimer);
-    }
-    if (result < 0) {
-        setError(request, "could not reach %s: %s", request->host, uv_strerror(result));
-        finish(request, TRACKER_ERROR);
-        return;
-    }
-    request->retryTimer.data = request;
-    request->retryOpen = 1;
-    request->pending++;
-
-    udpBeginStage(request, TRACKER_UDP_ACTION_CONNECT);
-}
-
-/* ======================================================================== */
-/* DNS                                                                      */
-/* ======================================================================== */
-
-static void onResolved(uv_getaddrinfo_t *resolver, int status, struct addrinfo *addresses)
-{
-    trackerRequest  *request = resolver->data;
-    struct addrinfo *entry;
-
-    request->resolving = 0;
-    request->pending--;
-
-    if (request->finished) {
-        if (addresses != NULL) {
-            uv_freeaddrinfo(addresses);
-        }
-        maybeFree(request);
-        return;
-    }
-    if (status < 0) {
-        if (addresses != NULL) {
-            uv_freeaddrinfo(addresses);
-        }
-        setError(request, "DNS lookup for %s failed: %s", request->host, uv_strerror(status));
-        finish(request, TRACKER_ERROR);
-        return;
-    }
-
-    for (entry = addresses; entry != NULL && request->addressCount < TRACKER_MAX_ADDRESSES;
-         entry = entry->ai_next) {
-        if ((entry->ai_family == AF_INET || entry->ai_family == AF_INET6) &&
-            entry->ai_addrlen <= sizeof(request->addresses[0])) {
-            memcpy(&request->addresses[request->addressCount++], entry->ai_addr,
-                   entry->ai_addrlen);
-        }
-    }
-    uv_freeaddrinfo(addresses);
-
-    if (request->addressCount == 0) {
-        setError(request, "DNS lookup for %s returned no usable address", request->host);
-        finish(request, TRACKER_ERROR);
-    } else {
-        udpStart(request);
-    }
+    request->interval = response->interval;
+    request->leechers = (int64_t)response->leechers;
+    request->seeders = (int64_t)response->seeders;
+    finish(request, addCompactPeers(request, response->peers, response->peersLength,
+                                    (response->peerFamily == UDP_FAMILY_IPV6)
+                                        ? TRACKER_FAMILY_IPV6 : TRACKER_FAMILY_IPV4));
 }
 
 /* ======================================================================== */
@@ -965,6 +709,11 @@ int32_t trackerInit(uv_loop_t *loop, parserContext *context, const trackerConfig
     if (result != HTTP_OK) {
         return fromHttpStatus(result);
     }
+    result = udpInit(loop, context);
+    if (result != UDP_OK) {
+        httpShutdown();
+        return fromUdpStatus(result);
+    }
 
     trackerState.loop = loop;
     trackerState.context = context;
@@ -981,13 +730,11 @@ int32_t trackerConnect(const uint8_t infoHash[PARSER_SHA1_LENGTH],
                        uint32_t timeoutSeconds, trackerCallback callback,
                        void *privateArg)
 {
-    trackerRequest *request;
-    struct addrinfo hints;
-    httpUrl         parts;
-    char            portText[8];
-    char           *announceUrl;
-    int32_t         result;
-    int             status;
+    trackerRequest   *request;
+    httpUrl           parts;
+    udpAnnounceParams params;
+    char             *announceUrl;
+    int32_t           result;
 
     if (trackerState.magic != TRACKER_STATE_MAGIC) {
         return TRACKER_ENOTINIT;
@@ -1020,37 +767,29 @@ int32_t trackerConnect(const uint8_t infoHash[PARSER_SHA1_LENGTH],
                                             onHttpDone, request, &request->http));
             release(announceUrl);
         }
+    } else if (result == TRACKER_OK) {
+        memset(&params, 0, sizeof(params));
+        memcpy(params.infoHash, request->infoHash, PARSER_SHA1_LENGTH);
+        memcpy(params.peerId, trackerState.config.peerId, TRACKER_PEER_ID_LENGTH);
+        params.left = TRACKER_ANNOUNCE_LEFT;
+        params.event = UDP_EVENT_STARTED;
+        params.key = trackerState.key;
+        params.numWant = (int32_t)numWant();
+        params.port = trackerState.config.port;
+        result = fromUdpStatus(udpAnnounce(trackerUrl, &params, 0, onUdpDone, request,
+                                           &request->udp));
     }
     if (result != TRACKER_OK) {
         freeRequest(request);                       /* nothing is running yet */
         return result;
     }
 
-    /* From here on, handles are open: failures must close them. */
+    /* One timer covers the whole announce, whatever the transport. */
     uv_timer_init(trackerState.loop, &request->timeoutTimer);
     request->timeoutTimer.data = request;
     request->timeoutOpen = 1;
     request->pending++;
     uv_timer_start(&request->timeoutTimer, onTimeout, (uint64_t)timeoutSeconds * 1000u, 0);
-
-    if (request->protocol == TRACKER_PROTOCOL_UDP) {
-        memset(&hints, 0, sizeof(hints));
-        hints.ai_family = AF_UNSPEC;
-        hints.ai_socktype = SOCK_DGRAM;
-        snprintf(portText, sizeof(portText), "%u", (unsigned)request->port);
-
-        request->resolver.data = request;
-        status = uv_getaddrinfo(trackerState.loop, &request->resolver, onResolved,
-                                request->host, portText, &hints);
-        if (status < 0) {
-            request->finished = 1;
-            request->detached = 1;
-            closeAll(request);                      /* freed once the timer closes */
-            return TRACKER_ERROR;
-        }
-        request->resolving = 1;
-        request->pending++;
-    }
 
     request->id = allocateId();
     TAILQ_INSERT_TAIL(&trackerState.requests, request, entries);
@@ -1151,6 +890,7 @@ void trackerShutdown(void)
     /* loop and context stay set: closing requests still need the allocator. */
     trackerState.magic = 0;
     httpShutdown();
+    udpShutdown();
 }
 
 const char *trackerStatusString(int32_t status)

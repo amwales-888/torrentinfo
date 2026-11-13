@@ -2325,6 +2325,35 @@ static int magnetTorrent(parserContext *context, const parserAllocator *allocato
     return result;
 }
 
+/* Print the magnet link for a .torrent file. */
+static int printMagnet(parserContext *context, const parserAllocator *allocator, const char *path)
+{
+    parserTorrent torrent;
+    uint8_t      *buffer = NULL;
+    uint64_t      length = 0;
+    char         *uri = NULL;
+    int32_t       status;
+
+    if (readFile(allocator, path, &buffer, &length) != 0) {
+        return -1;
+    }
+    status = parserParse(context, buffer, length, &torrent);
+    allocator->free(buffer);
+    if (status != PARSER_OK) {
+        fprintf(stderr, "%s: parse failed: %s\n", path, parserErrorString(status));
+        return -1;
+    }
+    status = magnetFromTorrent(context, &torrent, &uri);
+    parserFree(context, &torrent);
+    if (status != MAGNET_OK) {
+        fprintf(stderr, "%s: out of memory\n", path);
+        return -1;
+    }
+    printf("%s\n", uri);
+    allocator->free(uri);
+    return 0;
+}
+
 /* Show what a magnet link says. */
 static int showMagnet(parserContext *context, const char *uri)
 {
@@ -2653,6 +2682,7 @@ static void usage(const char *program)
             "       %s -D [-S] [-L port] [-N] [-X] [-O dir] [-i piece] [-T seconds] [-C ca.pem]\n"
             "            [-I interface] <file.torrent | magnet-link>\n"
             "       %s -V [-O dir] <file.torrent>\n"
+            "       %s -m <file.torrent>\n"
             "\n"
             "  -o file   create a torrent from the given files and write it to 'file'\n"
             "  -a url    tracker announce URL (repeat for more; one tier each)\n"
@@ -2676,6 +2706,8 @@ static void usage(const char *program)
             "            NAT-PMP are tried by default)\n"
             "  -X        with -D: do not use the DHT (by default it finds peers too,\n"
             "            except for private torrents)\n"
+            "  -m        print the torrent's magnet link (info hash, name, trackers,\n"
+            "            web seeds)\n"
             "  -V        verify downloaded data against the torrent (no network, changes\n"
             "            nothing): each file's state, bytes verified, missing pieces;\n"
             "            exit status 0 if complete, 2 if not, 1 on error\n"
@@ -2687,7 +2719,7 @@ static void usage(const char *program)
             "  -I iface  with -t, -P or -D: send all tracker and peer traffic through\n"
             "            this network interface, given by name (tun0, \"Ethernet 2\")\n"
             "            or by one of its IP addresses; DNS lookups are not covered\n",
-            program, program, program, program, program, program);
+            program, program, program, program, program, program, program);
 }
 
 int main(int argc, char **argv)
@@ -2701,6 +2733,7 @@ int main(int argc, char **argv)
     uint8_t         createOnly = 0;     /* an option that only makes sense with -o */
     uint8_t         announceMode = 0;
     uint8_t         verify = 0;         /* -V */
+    uint8_t         makeMagnet = 0;     /* -m */
     uint8_t         seed = 0;           /* -S */
     uint32_t        listenPort = 6881;  /* -L */
     uint8_t         downloadOnly = 0;   /* -S, -L or -N given */
@@ -2755,7 +2788,7 @@ int main(int argc, char **argv)
     options.trackers = (const char *const *)trackers;
     options.webSeeds = (const char *const *)webSeeds;
 
-    while ((option = nextOption(argc, argv, "o:a:w:c:n:l:ptPDVSNXL:O:i:T:C:I:h")) != -1) {
+    while ((option = nextOption(argc, argv, "o:a:w:c:n:l:ptPDVSNXmL:O:i:T:C:I:h")) != -1) {
         switch (option) {
         case 'o':
             outputPath = optionValue;
@@ -2826,6 +2859,9 @@ int main(int argc, char **argv)
         case 'V':
             verify = 1;
             break;
+        case 'm':
+            makeMagnet = 1;
+            break;
         case 'O':
             outputDirectory = optionValue;
             directoryGiven = 1;
@@ -2872,7 +2908,14 @@ int main(int argc, char **argv)
         goto cleanup;
     }
 
-    if (verify) {
+    if (makeMagnet) {
+        if (verify || announceMode || announceOnly || downloadOnly || directoryGiven ||
+            outputPath != NULL || createOnly || argc - optionIndex != 1) {
+            usage(argv[0]);
+            goto cleanup;
+        }
+        status = printMagnet(&context, &allocator, argv[optionIndex]);
+    } else if (verify) {
         if (announceMode || announceOnly || outputPath != NULL || createOnly || argc - optionIndex != 1) {
             usage(argv[0]);
             goto cleanup;

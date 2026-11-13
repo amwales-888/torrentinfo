@@ -324,3 +324,77 @@ int32_t magnetBuildTorrent(parserContext *context, const magnetLink *link, const
     *length = b.used;
     return MAGNET_OK;
 }
+
+/* ------------------------------------------------------------------------ */
+/* Making a magnet link from a torrent                                      */
+/* ------------------------------------------------------------------------ */
+
+/* "&key=" then 'value' percent-encoded (all but unreserved characters). */
+static void addParameter(builder *b, const char *key, const char *value)
+{
+    static const char hex[] = "0123456789ABCDEF";
+    const unsigned char *at;
+
+    add(b, "&", 1);
+    add(b, key, strlen(key));
+    add(b, "=", 1);
+    for (at = (const unsigned char *)value; *at != '\0'; at++) {
+        if ((*at >= 'A' && *at <= 'Z') || (*at >= 'a' && *at <= 'z') ||
+            (*at >= '0' && *at <= '9') || *at == '-' || *at == '.' || *at == '_' || *at == '~') {
+            add(b, at, 1);
+        } else {
+            char escaped[3];
+
+            escaped[0] = '%';
+            escaped[1] = hex[*at >> 4];
+            escaped[2] = hex[*at & 0x0fu];
+            add(b, escaped, 3);
+        }
+    }
+}
+
+int32_t magnetFromTorrent(parserContext *context, const parserTorrent *torrent, char **uri)
+{
+    const parserTier *tier;
+    const parserUrl  *url;
+    builder           b;
+    char              text[64];
+    uint32_t          i;
+
+    if (context == NULL || torrent == NULL || uri == NULL) {
+        return MAGNET_EINVAL;
+    }
+    *uri = NULL;
+    memset(&b, 0, sizeof(b));
+    b.context = context;
+    add(&b, "magnet:?xt=urn:btih:", 20);
+    for (i = 0; i < PARSER_SHA1_LENGTH; i++) {
+        snprintf(text, sizeof(text), "%02x", torrent->infoHash[i]);
+        add(&b, text, 2);
+    }
+    if (torrent->name != NULL && torrent->name[0] != '\0') {
+        addParameter(&b, "dn", torrent->name);
+    }
+    /* BEP 12: announce-list replaces announce when present. */
+    if (torrent->tierCount > 0) {
+        TAILQ_FOREACH(tier, &torrent->announceList, entries) {
+            TAILQ_FOREACH(url, &tier->urls, entries) {
+                addParameter(&b, "tr", url->url);
+            }
+        }
+    } else if (torrent->announce != NULL) {
+        addParameter(&b, "tr", torrent->announce);
+    }
+    TAILQ_FOREACH(url, &torrent->webSeeds, entries) {
+        addParameter(&b, "ws", url->url);
+    }
+    add(&b, "", 1);                                 /* the terminating zero */
+    if (b.failed) {
+        if (b.data != NULL) {
+            context->allocator.free(b.data);
+        }
+        return MAGNET_ENOMEM;
+    }
+    *uri = (char *)b.data;
+    return MAGNET_OK;
+}

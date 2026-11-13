@@ -131,6 +131,10 @@ project's *Properties > Debugging > Command Arguments*.
   addresses and from the DHT, so a link with only the info hash works. On
   its own (no option) a magnet link is just shown.
 
+- **Making magnet links (`-m`).** Prints a torrent's magnet link: the info
+  hash in hex, then `dn`, each `tr` (the announce-list, else announce) and
+  each `ws`, percent-encoded (`magnetFromTorrent()` in magnet.c).
+
 - **DHT (BEP 5).** `-D` runs a DHT node on the UDP port with the same number
   as the listening port (IPv4 only). It looks up peers for the torrent at
   once and then every 15 minutes (5 while it finds fewer than 8), announces

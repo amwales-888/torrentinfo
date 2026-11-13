@@ -57,6 +57,14 @@ void magnetFree(parserContext *context, magnetLink *link);
 int32_t magnetBuildTorrent(parserContext *context, const magnetLink *link, const uint8_t *info,
                            uint64_t infoLength, uint8_t **torrent, uint64_t *length);
 
+/*
+ * The magnet link for a torrent: its info hash (xt), name (dn), trackers
+ * (tr: the announce-list, or else announce) and web seeds (ws), each
+ * percent-encoded. *uri is allocated from the context; release it with the
+ * allocator's free.
+ */
+int32_t magnetFromTorrent(parserContext *context, const parserTorrent *torrent, char **uri);
+
 #ifdef __cplusplus
 }
 #endif

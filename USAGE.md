@@ -14,6 +14,7 @@ torrentinfo -P [-T seconds] [-C certs.pem] [-I interface] file.torrent
 torrentinfo -D [-S] [-L port] [-N] [-X] [-O folder] [-i piece] [-T seconds] [-C certs.pem]
                [-I interface] file.torrent | magnet-link
 torrentinfo -V [-O folder] file.torrent
+torrentinfo -m file.torrent
 ```
 
 On Windows the program is called `torrentinfo.exe`; everything else is the
@@ -67,6 +68,10 @@ The program works in one of six ways, chosen by the first option.
   few seconds), checks them, keeps them (see FILES), and then downloads as
   usual. Running the same link again starts straight away. Links that name
   no tracker work too: the peers are found through the DHT.
+
+**Make a magnet link** (`-m`)
+: Prints the magnet link for a torrent file, with its name, trackers and
+  web seeds, ready to paste into a web page, a message or another client.
 
 **Check a download** (`-V`)
 : Checks the files on disk against the torrent, without using the network
@@ -282,6 +287,12 @@ Download from a magnet link (keep the quotes):
 
 ```
 torrentinfo -D -O ~/Downloads "magnet:?xt=urn:btih:3b245504cf5f11bbdbe1201cea6a6bf45aee1bc0&dn=ubuntu&tr=https://torrent.ubuntu.com/announce"
+```
+
+Turn a torrent file into a magnet link to share:
+
+```
+torrentinfo -m holiday.torrent
 ```
 
 Check whether a download is complete, and which pieces are missing:

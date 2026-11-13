@@ -95,6 +95,20 @@ extern "C" {
 /* Types                                                                    */
 /* ------------------------------------------------------------------------ */
 
+/* Announce events */
+#define TRACKER_EVENT_NONE          0u      /* a regular re-announce       */
+#define TRACKER_EVENT_STARTED       1u      /* the first announce          */
+#define TRACKER_EVENT_COMPLETED     2u      /* the download just finished  */
+#define TRACKER_EVENT_STOPPED       3u      /* we are leaving the swarm    */
+
+/* What trackerAnnounce() reports. Copied. */
+typedef struct trackerAnnounceParams {
+    uint32_t    event;          /* TRACKER_EVENT_*                          */
+    uint64_t    uploaded;       /* bytes sent to peers since 'started'      */
+    uint64_t    downloaded;     /* bytes received from peers since 'started' */
+    uint64_t    left;           /* bytes still needed (0: we are a seed)    */
+} trackerAnnounceParams;
+
 /* Called once when an announce finishes. Not called after trackerClose(). */
 typedef void (*trackerCallback)(void *privateArg, uint32_t uniqueId);
 
@@ -164,6 +178,16 @@ int32_t trackerConnect(const uint8_t infoHash[PARSER_SHA1_LENGTH],
                        const char *trackerUrl, uint32_t *uniqueId,
                        uint32_t timeoutSeconds, trackerCallback callback,
                        void *privateArg);
+
+/*
+ * As trackerConnect(), but reporting 'params': the event and our transfer
+ * statistics. trackerConnect() is this with event "started", no transfers
+ * and a small "left". A "stopped" announce asks for no peers.
+ */
+int32_t trackerAnnounce(const uint8_t infoHash[PARSER_SHA1_LENGTH], const char *trackerUrl,
+                        const trackerAnnounceParams *params, uint32_t *uniqueId,
+                        uint32_t timeoutSeconds, trackerCallback callback,
+                        void *privateArg);
 
 /*
  * Get the state of an announce. 'privateArg' must be the value given to

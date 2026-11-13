@@ -48,6 +48,8 @@
 #define PEER_BUFFER_INITIAL     16384u
 #ifndef PEER_TICK_SECONDS
 #define PEER_TICK_SECONDS       15u             /* keep-alive / idle check interval */
+#define PEER_INCOMING_SECONDS   30u             /* for an incoming peer's handshake */
+#define PEER_LISTEN_BACKLOG     64
 #endif
 
 /* One message (or our handshake) on its way to the socket. */
@@ -65,6 +67,9 @@ struct peerConnection {
     uint8_t                 dead;           /* network side ended              */
     uint8_t                 closed;         /* peerClose() called              */
     uint8_t                 inCallback;
+    uint8_t                 incoming;       /* accepted from a listener        */
+    uint8_t                 accepted;       /* ...and the user took it         */
+    struct peerListener    *listener;       /* while incoming && !accepted     */
     uint32_t                pending;        /* libuv callbacks still to come   */
     uint32_t                timeoutSeconds;
     uint32_t                pieceCount;
@@ -105,6 +110,15 @@ struct peerConnection {
     TAILQ_ENTRY(peerConnection) entries;
 };
 TAILQ_HEAD(peerConnectionList, peerConnection);
+
+struct peerListener {
+    uv_tcp_t                tcp;
+    peerIncomingCallback    callback;
+    void                   *privateArg;
+    uint16_t                port;
+    uint8_t                 closed;
+    uint32_t                pendingConnections; /* accepted, info hash not seen */
+};
 
 static struct {
     uv_loop_t                *loop;
@@ -194,6 +208,27 @@ static void closeAll(peerConnection *connection)
     }
 }
 
+/* A closed listener goes once its handle has closed and no connection still
+ * waiting for an info hash points at it. */
+static void maybeFreeListener(struct peerListener *listener)
+{
+    if (listener->closed && listener->tcp.data == NULL && listener->pendingConnections == 0) {
+        release(listener);
+    }
+}
+
+/* An incoming connection no longer waits on its listener. */
+static void detachListener(peerConnection *connection)
+{
+    struct peerListener *listener = connection->listener;
+
+    if (listener != NULL) {
+        connection->listener = NULL;
+        listener->pendingConnections--;
+        maybeFreeListener(listener);
+    }
+}
+
 /* Tell the user how the handshake went. */
 static void deliverHandshake(peerConnection *connection, int32_t status)
 {
@@ -235,6 +270,14 @@ static void terminate(peerConnection *connection, int32_t status)
     if (connection->closed) {
         return;
     }
+    if (connection->incoming && !connection->accepted) {
+        /* Nobody has the handle yet: nothing to report. */
+        detachListener(connection);
+        connection->closed = 1;
+        TAILQ_REMOVE(&peerModule.connections, connection, entries);
+        maybeFree(connection);
+        return;
+    }
 
     if (!connection->handshakeDone) {
         deliverHandshake(connection, status);
@@ -265,6 +308,14 @@ static void onWrite(uv_write_t *write, int status)
     if (status < 0) {
         setError(connection, "send failed: %s", uv_strerror(status));
         terminate(connection, PEER_ERROR);
+        return;
+    }
+    if (connection->handshakeDone && connection->callbacks.onDrain != NULL &&
+        uv_stream_get_write_queue_size((const uv_stream_t *)&connection->tcp) == 0) {
+        connection->inCallback = 1;
+        connection->callbacks.onDrain(connection->privateArg, connection);
+        connection->inCallback = 0;
+        maybeFree(connection);
     }
 }
 
@@ -554,6 +605,94 @@ static void onTimeout(uv_timer_t *timer)
     terminate(connection, PEER_ETIMEDOUT);
 }
 
+static void onRead(uv_stream_t *stream, ssize_t count, const uv_buf_t *buffer);
+
+/* Settings from peerConnectOptions, for either direction. */
+static void configure(peerConnection *connection, const peerConnectOptions *options)
+{
+    uint32_t bitfieldMessage;
+
+    connection->timeoutSeconds = options->timeoutSeconds;
+    connection->pieceCount = options->pieceCount;
+    memcpy(connection->infoHash, options->infoHash, PARSER_SHA1_LENGTH);
+    memcpy(connection->localPeerId, options->peerId, PEER_ID_LENGTH);
+    connection->amChoking = 1;                      /* BEP 3 initial state */
+    connection->peerChoking = 1;
+
+    /* Largest message accepted: a piece message with a 128 KiB block, or
+     * a bitfield for this torrent, whichever is bigger. */
+    connection->maxMessage = 1u + 8u + MESSAGE_MAX_BLOCK_LENGTH;
+    bitfieldMessage = 1u + messageBitfieldBytes(options->pieceCount);
+    if (bitfieldMessage > connection->maxMessage) {
+        connection->maxMessage = bitfieldMessage;
+    }
+
+    /* Our handshake. Reserved bytes are zero: no extensions yet. */
+    connection->handshake[0] = (uint8_t)PEER_PROTOCOL_LENGTH;
+    memcpy(connection->handshake + 1, PEER_PROTOCOL_NAME, PEER_PROTOCOL_LENGTH);
+    memcpy(connection->handshake + PEER_OFFSET_INFO_HASH, options->infoHash, PARSER_SHA1_LENGTH);
+    memcpy(connection->handshake + PEER_OFFSET_PEER_ID, options->peerId, PEER_ID_LENGTH);
+}
+
+/*
+ * An incoming connection: once its info hash has arrived, ask the listener's
+ * user whether to take it; if so, answer with our handshake. Returns PEER_OK
+ * (accepted), 1 (need more bytes) or an error.
+ */
+static int32_t routeIncoming(peerConnection *connection)
+{
+    struct peerListener *listener = connection->listener;
+    peerConnectOptions   options;
+    peerCallbacks        callbacks;
+    void                *privateArg = NULL;
+    uint8_t              infoHash[PARSER_SHA1_LENGTH];
+    int                  accept;
+    int32_t              result;
+
+    if (connection->received >= 1u && connection->buffer[0] != PEER_PROTOCOL_LENGTH) {
+        setError(connection, "not a BitTorrent peer");
+        return PEER_EPROTO;
+    }
+    if (connection->received < PEER_OFFSET_PEER_ID) {
+        return 1;
+    }
+    if (memcmp(connection->buffer + 1, PEER_PROTOCOL_NAME, PEER_PROTOCOL_LENGTH) != 0) {
+        setError(connection, "not a BitTorrent peer (unknown protocol name)");
+        return PEER_EPROTO;
+    }
+    memcpy(infoHash, connection->buffer + PEER_OFFSET_INFO_HASH, PARSER_SHA1_LENGTH);
+    connection->listener = NULL;
+    listener->pendingConnections--;
+    if (listener->closed || listener->callback == NULL) {
+        maybeFreeListener(listener);
+        setError(connection, "no longer accepting connections");
+        return PEER_EHASH;
+    }
+    memset(&options, 0, sizeof(options));
+    memset(&callbacks, 0, sizeof(callbacks));
+    accept = listener->callback(listener->privateArg, connection,
+                                (const struct sockaddr *)&connection->address, infoHash,
+                                &options, &callbacks, &privateArg);
+    if (!accept) {
+        setError(connection, "not serving that torrent");
+        return PEER_EHASH;
+    }
+    configure(connection, &options);
+    connection->callbacks = callbacks;
+    connection->privateArg = privateArg;
+    connection->accepted = 1;
+    uv_timer_stop(&connection->timer);
+    if (options.timeoutSeconds > 0) {
+        uv_timer_start(&connection->timer, onTimeout,
+                       (uint64_t)options.timeoutSeconds * 1000u, 0);
+    }
+    result = sendBytes(connection, connection->handshake, PEER_HANDSHAKE_LENGTH, NULL);
+    if (result != PEER_OK) {
+        setError(connection, "could not send the handshake");
+    }
+    return result;
+}
+
 static void onAlloc(uv_handle_t *handle, size_t suggested, uv_buf_t *buffer)
 {
     peerConnection *connection = handle->data;
@@ -580,6 +719,16 @@ static void onRead(uv_stream_t *stream, ssize_t count, const uv_buf_t *buffer)
             connection->bytesReceived += (uint64_t)count;
             processMessages(connection);
             return;
+        }
+        if (connection->incoming && !connection->accepted) {
+            result = routeIncoming(connection);
+            if (result == 1) {
+                return;                             /* wait for the info hash */
+            }
+            if (result != PEER_OK) {
+                terminate(connection, result);
+                return;
+            }
         }
         result = checkHandshake(connection);
         if (result == 1) {
@@ -640,6 +789,135 @@ static void onConnect(uv_connect_t *connect, int status)
 }
 
 /* ======================================================================== */
+/* Listening                                                                */
+/* ======================================================================== */
+
+static void onListenerClosed(uv_handle_t *handle)
+{
+    struct peerListener *listener = handle->data;
+
+    listener->tcp.data = NULL;
+    maybeFreeListener(listener);
+}
+
+static void onIncomingTimeout(uv_timer_t *timer)
+{
+    peerConnection *connection = timer->data;
+
+    setError(connection, "no handshake within %u seconds", (unsigned)PEER_INCOMING_SECONDS);
+    terminate(connection, PEER_ETIMEDOUT);
+}
+
+static void onConnection(uv_stream_t *server, int status)
+{
+    struct peerListener *listener = server->data;
+    peerConnection      *connection;
+    int                  length = (int)sizeof(struct sockaddr_storage);
+
+    if (status < 0 || listener->closed || peerModule.magic != PEER_STATE_MAGIC) {
+        return;
+    }
+    connection = allocate(sizeof(*connection));
+    if (connection == NULL) {
+        return;
+    }
+    connection->buffer = allocate(PEER_BUFFER_INITIAL);
+    if (connection->buffer == NULL) {
+        release(connection);
+        return;
+    }
+    connection->capacity = PEER_BUFFER_INITIAL;
+    connection->incoming = 1;
+    connection->amChoking = 1;
+    connection->peerChoking = 1;
+
+    uv_timer_init(peerModule.loop, &connection->timer);
+    connection->timer.data = connection;
+    connection->timerOpen = 1;
+    connection->pending++;
+    uv_tcp_init(peerModule.loop, &connection->tcp);
+    connection->tcp.data = connection;
+    connection->tcpOpen = 1;
+    connection->pending++;
+    TAILQ_INSERT_TAIL(&peerModule.connections, connection, entries);
+
+    if (uv_accept(server, (uv_stream_t *)&connection->tcp) != 0 ||
+        uv_tcp_getpeername(&connection->tcp, (struct sockaddr *)&connection->address,
+                           &length) != 0 ||
+        uv_read_start((uv_stream_t *)&connection->tcp, onAlloc, onRead) != 0) {
+        terminate(connection, PEER_ERROR);
+        return;
+    }
+    uv_tcp_nodelay(&connection->tcp, 1);
+    connection->listener = listener;
+    listener->pendingConnections++;
+    uv_timer_start(&connection->timer, onIncomingTimeout,
+                   (uint64_t)PEER_INCOMING_SECONDS * 1000u, 0);
+}
+
+int32_t peerListen(int family, uint16_t port, peerIncomingCallback callback, void *privateArg,
+                   peerListener **handle)
+{
+    struct peerListener *listener;
+    struct sockaddr_storage local;
+    int                  length = (int)sizeof(local);
+    int                  result;
+
+    if (handle != NULL) {
+        *handle = NULL;
+    }
+    if (peerModule.magic != PEER_STATE_MAGIC) {
+        return PEER_ENOTINIT;
+    }
+    if (handle == NULL || callback == NULL || (family != AF_INET && family != AF_INET6)) {
+        return PEER_EINVAL;
+    }
+    listener = allocate(sizeof(*listener));
+    if (listener == NULL) {
+        return PEER_ENOMEM;
+    }
+    listener->callback = callback;
+    listener->privateArg = privateArg;
+    result = netTcpInit(peerModule.loop, &listener->tcp, &peerModule.binding, family);
+    if (result != 0) {
+        release(listener);
+        return PEER_ERROR;
+    }
+    listener->tcp.data = listener;
+    result = netTcpListenBind(&listener->tcp, &peerModule.binding, family, port);
+    if (result == 0) {
+        result = uv_listen((uv_stream_t *)&listener->tcp, PEER_LISTEN_BACKLOG, onConnection);
+    }
+    if (result == 0) {
+        result = uv_tcp_getsockname(&listener->tcp, (struct sockaddr *)&local, &length);
+    }
+    if (result != 0) {
+        listener->closed = 1;
+        uv_close((uv_handle_t *)&listener->tcp, onListenerClosed);
+        return (result == UV_EADDRINUSE) ? PEER_EADDRINUSE : PEER_ERROR;
+    }
+    listener->port = ntohs((local.ss_family == AF_INET)
+                               ? ((struct sockaddr_in *)&local)->sin_port
+                               : ((struct sockaddr_in6 *)&local)->sin6_port);
+    *handle = listener;
+    return PEER_OK;
+}
+
+uint16_t peerListenerPort(const peerListener *listener)
+{
+    return (listener != NULL) ? listener->port : 0;
+}
+
+void peerListenerClose(peerListener *listener)
+{
+    if (listener == NULL || listener->closed) {
+        return;
+    }
+    listener->closed = 1;
+    uv_close((uv_handle_t *)&listener->tcp, onListenerClosed);
+}
+
+/* ======================================================================== */
 /* Public API                                                               */
 /* ======================================================================== */
 
@@ -674,7 +952,6 @@ int32_t peerConnect(const struct sockaddr *address, const peerConnectOptions *op
 {
     peerConnection *connection;
     size_t          addressLength;
-    uint32_t        bitfieldMessage;
     int             result;
 
     if (handle != NULL) {
@@ -708,27 +985,8 @@ int32_t peerConnect(const struct sockaddr *address, const peerConnectOptions *op
         connection->callbacks = *callbacks;
     }
     connection->privateArg = privateArg;
-    connection->timeoutSeconds = options->timeoutSeconds;
-    connection->pieceCount = options->pieceCount;
     memcpy(&connection->address, address, addressLength);
-    memcpy(connection->infoHash, options->infoHash, PARSER_SHA1_LENGTH);
-    memcpy(connection->localPeerId, options->peerId, PEER_ID_LENGTH);
-    connection->amChoking = 1;                      /* BEP 3 initial state */
-    connection->peerChoking = 1;
-
-    /* Largest message accepted: a piece message with a 128 KiB block, or
-     * a bitfield for this torrent, whichever is bigger. */
-    connection->maxMessage = 1u + 8u + MESSAGE_MAX_BLOCK_LENGTH;
-    bitfieldMessage = 1u + messageBitfieldBytes(options->pieceCount);
-    if (bitfieldMessage > connection->maxMessage) {
-        connection->maxMessage = bitfieldMessage;
-    }
-
-    /* Our handshake. Reserved bytes are zero: no extensions yet. */
-    connection->handshake[0] = (uint8_t)PEER_PROTOCOL_LENGTH;
-    memcpy(connection->handshake + 1, PEER_PROTOCOL_NAME, PEER_PROTOCOL_LENGTH);
-    memcpy(connection->handshake + PEER_OFFSET_INFO_HASH, options->infoHash, PARSER_SHA1_LENGTH);
-    memcpy(connection->handshake + PEER_OFFSET_PEER_ID, options->peerId, PEER_ID_LENGTH);
+    configure(connection, options);
 
     /* From here on, failures must close what has been opened. The timer is
      * always needed: handshake timeout first, keep-alive ticks later. */
@@ -828,6 +1086,9 @@ int32_t peerGetState(peerConnection *connection, peerRemoteState *state)
     state->bytesSent = connection->bytesSent;
     memcpy(state->peerId, connection->remotePeerId, PEER_ID_LENGTH);
     state->extensions = connection->extensions;
+    state->incoming = connection->incoming;
+    state->sendQueued = connection->tcpOpen
+        ? (uint64_t)uv_stream_get_write_queue_size((const uv_stream_t *)&connection->tcp) : 0u;
     return PEER_OK;
 }
 
@@ -838,6 +1099,7 @@ void peerClose(peerConnection *connection)
     }
     connection->closed = 1;
     connection->dead = 1;                           /* no callbacks from now on */
+    detachListener(connection);
     TAILQ_REMOVE(&peerModule.connections, connection, entries);
     closeAll(connection);
     maybeFree(connection);
@@ -869,6 +1131,7 @@ const char *peerStatusString(int32_t status)
     case PEER_ENOTINIT:  return "Peer module not initialised";
     case PEER_EHASH:     return "Different torrent";
     case PEER_ESELF:     return "Connected to ourselves";
+    case PEER_EADDRINUSE: return "Port already in use";
     case PEER_ECLOSED:   return "Connection closed";
     default:             return "Unknown status";
     }

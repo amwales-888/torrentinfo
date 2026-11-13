@@ -36,9 +36,9 @@
 #define TRACKER_PROTOCOL_UDP        2u
 #define TRACKER_CANCELLED           (-100)          /* internal only         */
 /*
- * Bytes left to download, as reported to the tracker. The announce API has
- * no per-torrent statistics yet, so report a small non-zero amount: this
- * marks us as a leecher, so trackers include seeders in the peer list.
+ * Bytes left to download, as trackerConnect() reports it (trackerAnnounce()
+ * reports real figures): a small non-zero amount marks us as a leecher, so
+ * trackers include seeders in the peer list.
  */
 #define TRACKER_ANNOUNCE_LEFT       16384u
 
@@ -56,6 +56,7 @@ typedef struct trackerRequest {
     uint8_t                 protocol;
     char                   *url;
     uint8_t                 infoHash[PARSER_SHA1_LENGTH];
+    trackerAnnounceParams   params;         /* event and statistics          */
 
     /* The transport request in http.c or udp.c, or NULL when not running */
     httpRequest            *http;
@@ -398,13 +399,20 @@ static char *buildAnnounceUrl(const trackerRequest *request, const httpUrl *part
         return NULL;
     }
     written = snprintf(url, (size_t)size,
-                       "%.*s%cinfo_hash=%s&peer_id=%s&port=%u&uploaded=0"
-                       "&downloaded=0&left=%u&compact=1&numwant=%" PRIu32
-                       "&key=%08" PRIx32 "&event=started",
+                       "%.*s%cinfo_hash=%s&peer_id=%s&port=%u&uploaded=%" PRIu64
+                       "&downloaded=%" PRIu64 "&left=%" PRIu64 "&compact=1&numwant=%" PRIu32
+                       "&key=%08" PRIx32 "%s",
                        (int)baseLength, request->url,
                        (memchr(parts->path, '?', parts->pathLength) != NULL) ? '&' : '?',
                        infoHashText, peerIdText, (unsigned)trackerState.config.port,
-                       (unsigned)TRACKER_ANNOUNCE_LEFT, numWant(), trackerState.key);
+                       request->params.uploaded, request->params.downloaded,
+                       request->params.left,
+                       (request->params.event == TRACKER_EVENT_STOPPED) ? 0u : numWant(),
+                       trackerState.key,
+                       (request->params.event == TRACKER_EVENT_STARTED)     ? "&event=started"
+                       : (request->params.event == TRACKER_EVENT_COMPLETED) ? "&event=completed"
+                       : (request->params.event == TRACKER_EVENT_STOPPED)   ? "&event=stopped"
+                                                                            : "");
     if (written < 0 || (uint64_t)written >= size) {
         release(url);
         return NULL;
@@ -732,6 +740,19 @@ int32_t trackerConnect(const uint8_t infoHash[PARSER_SHA1_LENGTH],
                        uint32_t timeoutSeconds, trackerCallback callback,
                        void *privateArg)
 {
+    trackerAnnounceParams params;
+
+    memset(&params, 0, sizeof(params));
+    params.event = TRACKER_EVENT_STARTED;
+    params.left = TRACKER_ANNOUNCE_LEFT;
+    return trackerAnnounce(infoHash, trackerUrl, &params, uniqueId, timeoutSeconds, callback,
+                           privateArg);
+}
+
+int32_t trackerAnnounce(const uint8_t infoHash[PARSER_SHA1_LENGTH], const char *trackerUrl,
+                        const trackerAnnounceParams *announceParams, uint32_t *uniqueId,
+                        uint32_t timeoutSeconds, trackerCallback callback, void *privateArg)
+{
     trackerRequest   *request;
     httpUrl           parts;
     udpAnnounceParams params;
@@ -741,7 +762,8 @@ int32_t trackerConnect(const uint8_t infoHash[PARSER_SHA1_LENGTH],
     if (trackerState.magic != TRACKER_STATE_MAGIC) {
         return TRACKER_ENOTINIT;
     }
-    if (infoHash == NULL || trackerUrl == NULL || uniqueId == NULL || timeoutSeconds == 0) {
+    if (infoHash == NULL || trackerUrl == NULL || uniqueId == NULL || timeoutSeconds == 0 ||
+        announceParams == NULL || announceParams->event > TRACKER_EVENT_STOPPED) {
         return TRACKER_EINVAL;
     }
     *uniqueId = 0;
@@ -757,6 +779,7 @@ int32_t trackerConnect(const uint8_t infoHash[PARSER_SHA1_LENGTH],
     request->privateArg = privateArg;
     request->timeoutSeconds = timeoutSeconds;
     memcpy(request->infoHash, infoHash, PARSER_SHA1_LENGTH);
+    request->params = *announceParams;
 
     result = parseUrl(request, trackerUrl, &parts);
     if (result == TRACKER_OK && request->protocol == TRACKER_PROTOCOL_HTTP) {
@@ -773,10 +796,16 @@ int32_t trackerConnect(const uint8_t infoHash[PARSER_SHA1_LENGTH],
         memset(&params, 0, sizeof(params));
         memcpy(params.infoHash, request->infoHash, PARSER_SHA1_LENGTH);
         memcpy(params.peerId, trackerState.config.peerId, TRACKER_PEER_ID_LENGTH);
-        params.left = TRACKER_ANNOUNCE_LEFT;
-        params.event = UDP_EVENT_STARTED;
+        params.downloaded = request->params.downloaded;
+        params.left = request->params.left;
+        params.uploaded = request->params.uploaded;
+        params.event = (request->params.event == TRACKER_EVENT_STARTED)     ? UDP_EVENT_STARTED
+                     : (request->params.event == TRACKER_EVENT_COMPLETED)   ? UDP_EVENT_COMPLETED
+                     : (request->params.event == TRACKER_EVENT_STOPPED)     ? UDP_EVENT_STOPPED
+                                                                            : UDP_EVENT_NONE;
         params.key = trackerState.key;
-        params.numWant = (int32_t)numWant();
+        params.numWant = (request->params.event == TRACKER_EVENT_STOPPED)
+                             ? 0 : (int32_t)numWant();
         params.port = trackerState.config.port;
         result = fromUdpStatus(udpAnnounce(trackerUrl, &params, 0, onUdpDone, request,
                                            &request->udp));

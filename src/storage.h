@@ -77,6 +77,15 @@ typedef void (*storageOpenCallback)(void *privateArg, storage *store, int32_t st
 typedef void (*storageWriteCallback)(void *privateArg, storage *store, uint32_t pieceIndex,
                                      int32_t status, const char *errorMessage);
 
+/*
+ * A block read has finished. On STORAGE_OK, 'data' holds the block and now
+ * belongs to the caller (release it with the parserContext's allocator);
+ * otherwise 'data' is NULL. Not called after storageClose().
+ */
+typedef void (*storageReadCallback)(void *privateArg, storage *store, uint32_t pieceIndex,
+                                    uint32_t begin, uint32_t length, uint8_t *data,
+                                    int32_t status, const char *errorMessage);
+
 /* ------------------------------------------------------------------------ */
 /* API                                                                      */
 /* ------------------------------------------------------------------------ */
@@ -102,6 +111,15 @@ int32_t storageOpen(uv_loop_t *loop, parserContext *context, const parserTorrent
  */
 int32_t storageWritePiece(storage *store, uint32_t pieceIndex, uint8_t *data,
                           storageWriteCallback callback, void *privateArg);
+
+/*
+ * Read 'length' bytes at offset 'begin' of a piece that is on disk (for
+ * uploading), on the thread pool. 'data' must come from the parserContext's
+ * allocator and hold 'length' bytes; storage takes ownership of it (even on
+ * failure) and hands it back through the callback.
+ */
+int32_t storageReadBlock(storage *store, uint32_t pieceIndex, uint32_t begin, uint32_t length,
+                         uint8_t *data, storageReadCallback callback, void *privateArg);
 
 /* Pieces complete on disk, as a bitfield (messageBitfieldGet), and their count. */
 const uint8_t *storageHave(const storage *store, uint32_t *haveCount);

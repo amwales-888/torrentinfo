@@ -50,6 +50,9 @@
     <ClCompile Include="src\download.c">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="src\announce.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="src\queue.h">
@@ -89,6 +92,9 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="src\download.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\announce.h">
       <Filter>Header Files</Filter>
     </ClInclude>
   </ItemGroup>

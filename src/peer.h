@@ -96,6 +96,7 @@ extern "C" {
 #define PEER_EHASH                  (-11)   /* Peer is not serving this torrent */
 #define PEER_ESELF                  (-12)   /* Connected to ourselves          */
 #define PEER_ECLOSED                (-13)   /* The connection has closed       */
+#define PEER_EADDRINUSE             (-14)   /* peerListen(): port already in use */
 
 /* ------------------------------------------------------------------------ */
 /* Types                                                                    */
@@ -143,6 +144,8 @@ typedef struct peerRemoteState {
     uint64_t        bytesSent;
     uint8_t         peerId[PEER_ID_LENGTH];
     uint32_t        extensions;     /* PEER_EXTENSION_*                      */
+    uint8_t         incoming;       /* the peer connected to us              */
+    uint64_t        sendQueued;     /* bytes given to peerSend() not yet sent */
 } peerRemoteState;
 
 /* Called once with the handshake's outcome. */
@@ -169,7 +172,26 @@ typedef struct peerCallbacks {
     peerHandshakeCallback   onHandshake;    /* may be NULL */
     peerMessageCallback     onMessage;      /* may be NULL */
     peerClosedCallback      onClosed;       /* may be NULL */
+    /* Everything queued with peerSend() has gone to the network; a good
+     * moment to queue more (uploading). May be NULL. */
+    void (*onDrain)(void *privateArg, peerConnection *connection);
 } peerCallbacks;
+
+typedef struct peerListener peerListener;
+
+/*
+ * Someone connected to a listener and sent the info hash of their
+ * handshake. To take the connection, fill in 'options' (the info hash's
+ * torrent, our peer id, ...), 'callbacks' and '*privateArg' and return 1:
+ * our handshake goes back, and onHandshake follows as for peerConnect().
+ * 'connection' is the handle (as peerConnect() would have returned it).
+ * Return 0 to refuse: the connection is closed and forgotten.
+ */
+typedef int (*peerIncomingCallback)(void *listenerArg, peerConnection *connection,
+                                    const struct sockaddr *address,
+                                    const uint8_t infoHash[PARSER_SHA1_LENGTH],
+                                    peerConnectOptions *options, peerCallbacks *callbacks,
+                                    void **privateArg);
 
 /* ------------------------------------------------------------------------ */
 /* API                                                                      */
@@ -217,6 +239,19 @@ void peerClose(peerConnection *connection);
  * memory is released.
  */
 void peerShutdown(void);
+
+/*
+ * Accept peers on 'port' (0: any free port) for IPv4 (AF_INET) or IPv6
+ * (AF_INET6), on the interface given to peerInit() if any, otherwise on all.
+ * peerListenerPort() gives the port actually used. PEER_EADDRINUSE if the
+ * port is taken.
+ */
+int32_t peerListen(int family, uint16_t port, peerIncomingCallback callback, void *privateArg,
+                   peerListener **listener);
+uint16_t peerListenerPort(const peerListener *listener);
+
+/* Stop accepting. Connections already taken are not affected. */
+void peerListenerClose(peerListener *listener);
 
 /* Human-readable description of a PEER_* status. Never NULL. */
 const char *peerStatusString(int32_t status);

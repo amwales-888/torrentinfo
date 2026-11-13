@@ -398,6 +398,42 @@ int netUdpBind(uv_udp_t *udp, const netBinding *binding, int family)
     return uv_udp_bind(udp, localAddress(binding, family), 0);
 }
 
+int netTcpListenBind(uv_tcp_t *tcp, const netBinding *binding, int family, uint16_t port)
+{
+    struct sockaddr_storage local;
+    uv_os_fd_t              fd;
+    int                     result;
+
+    memset(&local, 0, sizeof(local));
+    if (binding != NULL && binding->active) {
+        if ((result = checkFamily(binding, family)) != 0) {
+            return result;
+        }
+        if ((result = uv_fileno((const uv_handle_t *)tcp, &fd)) != 0) {
+            return result;
+        }
+        if ((result = tieToDevice(NET_SOCKET(fd), binding, family)) != 0) {
+            return result;
+        }
+        memcpy(&local, localAddress(binding, family),
+               (family == AF_INET) ? sizeof(struct sockaddr_in) : sizeof(struct sockaddr_in6));
+    } else if (family == AF_INET) {
+        uv_ip4_addr("0.0.0.0", 0, (struct sockaddr_in *)&local);
+    } else if (family == AF_INET6) {
+        uv_ip6_addr("::", 0, (struct sockaddr_in6 *)&local);
+    } else {
+        return UV_EAFNOSUPPORT;
+    }
+    if (family == AF_INET) {
+        ((struct sockaddr_in *)&local)->sin_port = htons(port);
+    } else {
+        ((struct sockaddr_in6 *)&local)->sin6_port = htons(port);
+    }
+    /* IPv6 listeners take IPv6 only; IPv4 has its own listener. */
+    return uv_tcp_bind(tcp, (const struct sockaddr *)&local,
+                       (family == AF_INET6) ? UV_TCP_IPV6ONLY : 0u);
+}
+
 const char *netStatusString(int32_t status)
 {
     switch (status) {

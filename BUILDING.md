@@ -69,6 +69,8 @@ cd build\x64\Release
 .\torrentinfo.exe -D -O C:\Downloads file.torrent   # download from all peers (re-run to resume)
 .\torrentinfo.exe -D -I "Ethernet 2" file.torrent   # ... only through that network interface
 .\torrentinfo.exe -D -i 42 file.torrent              # ... only piece 42
+.\torrentinfo.exe -D -S file.torrent                 # download, then keep seeding until Ctrl-C
+.\torrentinfo.exe -D -L 51413 file.torrent           # accept peers on port 51413 (default 6881)
 .\torrentinfo.exe -V -O C:\Downloads file.torrent   # check what is on disk (offline)
 ```
 
@@ -107,9 +109,40 @@ project's *Properties > Debugging > Command Arguments*.
   30 seconds or sends blocks it was not asked for is dropped, and one that
   disconnects is retried after 30 seconds (three connections at most). Near
   the end, slow blocks are also requested from a second peer ("endgame").
-  The download stops if no data arrives for 2 minutes. Progress is printed
-  every 2 seconds. DHT and peer exchange are not implemented yet, so the
-  trackers are the only source of peers.
+  The download stops if no data arrives for 2 minutes, or if there is no
+  peer at all for 1 minute. Progress is printed every 2 seconds. DHT and
+  peer exchange are not implemented yet, so the trackers (and peers that
+  connect to us) are the only source of peers.
+
+- **Trackers** are announced to throughout the download: every tracker the
+  torrent lists, all tiers at once, starting with "started" once the files
+  have been checked (so "left" is accurate), then again at the interval
+  each tracker asks for (60 seconds to 1 hour), reporting the bytes
+  uploaded, downloaded and left. New peers from re-announces join the
+  download. A tracker that fails is retried after 1, 2, 4... minutes (up
+  to 30). When the download completes the trackers are told "completed";
+  on Ctrl-C (or SIGTERM on Linux) they are told "stopped" (waiting at most
+  5 seconds; press Ctrl-C again not to wait).
+
+- **Uploading.** Peers are sent our bitfield and a "have" for each new
+  piece, and their requests are answered from disk. Every 10 seconds the
+  three interested peers that sent us the most (while seeding: that we sent
+  the most) are unchoked, plus one more chosen at random every 30 seconds,
+  so new peers get a chance; a free slot goes straight to a waiting peer.
+  A peer connected to us twice (once each way) keeps one connection.
+
+- **Incoming connections (`-L`).** `-D` listens on port 6881 for IPv4 and
+  IPv6 (or the next free port up to 6890; `-L port` picks another, `-L 0`
+  turns it off) and tells the trackers that port. With `-I` it listens on
+  that interface only. Peers outside your network can reach you only if the
+  port is open in your firewall and, behind a home router, forwarded to
+  this computer; Windows Firewall asks the first time. Without that,
+  downloading still works through outgoing connections.
+
+- **Seeding (`-S`).** Without `-S`, `-D` exits once the download is complete.
+  With it, the program keeps serving peers (dropping ones that are complete
+  too) until Ctrl-C; with a complete download already on disk it seeds
+  straight away.
 
 - **Trusted certificates for HTTPS trackers** come from the Windows
   certificate store (the "Trusted Root Certification Authorities"), loaded

@@ -28,6 +28,22 @@
  *     continues, and every connected peer is sent a "have".
  *   - We tell a peer we are interested only while it has a piece we need.
  *
+ *
+ * Uploading:
+ *   - Peers are sent our bitfield on connecting and a "have" for each piece
+ *     we finish, and their requests for pieces we have are answered from
+ *     disk (read on the thread pool, paced by the connection's send queue).
+ *   - Choking: every 10 seconds the peers interested in us are ranked - by
+ *     how fast they send to us while downloading, how fast we send to them
+ *     while seeding - and the best uploadSlots - 1 are unchoked, plus one
+ *     "optimistic" unchoke chosen at random every 30 seconds, so that new
+ *     peers get a chance to show what they can do.
+ *   - With a listen port, peers can connect to us (on the interface given
+ *     to peerInit(), if any).
+ *   - With 'seed' set, the download keeps running once complete, serving
+ *     other peers until downloadEnd(); peers that are complete themselves
+ *     are disconnected, since neither side needs the other.
+ *
  * The torrent passed to downloadBegin() must stay valid until downloadEnd().
  * Memory comes from the allocator in the parserContext. Call peerInit()
  * before downloadBegin(): the download uses the peer module.
@@ -60,6 +76,8 @@ extern "C" {
 #define DOWNLOAD_IDLE_SECONDS           120u    /* no data from anyone: give up  */
 #endif
 #define DOWNLOAD_MESSAGE_LENGTH         256u
+#define DOWNLOAD_DEFAULT_UPLOAD_SLOTS   4u      /* peers we upload to at once     */
+#define DOWNLOAD_LISTEN_ATTEMPTS        10u     /* listenPort, listenPort + 1, ... */
 
 /* Status codes */
 #define DOWNLOAD_OK                     0
@@ -82,6 +100,11 @@ typedef struct downloadOptions {
     uint32_t        pipeline;           /* requests per peer; 0 = default      */
     uint32_t        handshakeTimeoutSeconds;    /* 0 = no limit                */
     int64_t         onlyPiece;          /* download just this piece, or -1     */
+    uint16_t        listenPort;         /* accept peers on this port (or the
+                                           next free one of the following 9);
+                                           0: do not accept connections        */
+    uint32_t        uploadSlots;        /* peers unchoked at once; 0 = default */
+    uint8_t         seed;               /* keep serving peers once complete    */
 } downloadOptions;
 
 typedef struct downloadProgress {
@@ -99,6 +122,13 @@ typedef struct downloadProgress {
     uint32_t        peersQueued;        /* addresses waiting for a free slot   */
     uint32_t        piecesActive;       /* being assembled now                 */
     uint8_t         endgame;
+    uint8_t         seeding;            /* complete, and serving peers         */
+    uint64_t        left;               /* bytes of wanted pieces not on disk  */
+    uint64_t        bytesUploaded;      /* block data sent to peers            */
+    uint32_t        peersInterested;    /* connected peers wanting our pieces  */
+    uint32_t        peersUploading;     /* connected peers we are unchoking    */
+    uint32_t        peersIncoming;      /* connected peers that came to us     */
+    uint16_t        listenPort;         /* 0 if not accepting connections      */
 } downloadProgress;
 
 typedef struct downloadEvents {
@@ -109,6 +139,10 @@ typedef struct downloadEvents {
     /* The download has ended: DOWNLOAD_OK when everything is on disk. Runs
      * once; call downloadEnd() afterwards (it may be called from here). */
     void (*onFinished)(void *privateArg, download *transfer, int32_t status, const char *message);
+    /* Every wanted piece is on disk. With 'seed' the download keeps running
+     * (this is where to tell trackers "completed"); otherwise onFinished
+     * follows at once. May be NULL. */
+    void (*onComplete)(void *privateArg, download *transfer);
 } downloadEvents;
 
 /* ------------------------------------------------------------------------ */
@@ -128,6 +162,9 @@ int32_t downloadBegin(uv_loop_t *loop, parserContext *context, const parserTorre
 int32_t downloadAddPeer(download *transfer, const struct sockaddr *address);
 
 void downloadGetProgress(const download *transfer, downloadProgress *progress);
+
+/* The port peers can connect to, or 0 (not listening). */
+uint16_t downloadListenPort(const download *transfer);
 
 /* The download's top-level path (file, or directory of a multi-file torrent). */
 const char *downloadRoot(const download *transfer);

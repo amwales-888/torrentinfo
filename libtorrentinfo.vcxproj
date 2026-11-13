@@ -95,6 +95,7 @@
     <ClCompile Include="src\piece.c" />
     <ClCompile Include="src\storage.c" />
     <ClCompile Include="src\download.c" />
+    <ClCompile Include="src\announce.c" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="src\queue.h" />
@@ -110,6 +111,7 @@
     <ClInclude Include="src\piece.h" />
     <ClInclude Include="src\storage.h" />
     <ClInclude Include="src\download.h" />
+    <ClInclude Include="src\announce.h" />
   </ItemGroup>
   <ItemGroup>
     <None Include="vcpkg.json" />

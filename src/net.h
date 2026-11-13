@@ -91,6 +91,13 @@ int netUdpInit(uv_loop_t *loop, uv_udp_t *udp, const netBinding *binding, int fa
 int netTcpBind(uv_tcp_t *tcp, const netBinding *binding, int family);
 int netUdpBind(uv_udp_t *udp, const netBinding *binding, int family);
 
+/*
+ * For a listening socket: tie it to the binding's interface (if active) and
+ * bind it to the interface's address, or to any address, on 'port' (0 for
+ * any free port). IPv6 listeners accept IPv6 only. A libuv error code.
+ */
+int netTcpListenBind(uv_tcp_t *tcp, const netBinding *binding, int family, uint16_t port);
+
 const char *netStatusString(int32_t status);
 
 #ifdef __cplusplus

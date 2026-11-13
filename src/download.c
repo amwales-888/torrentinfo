@@ -60,6 +60,16 @@
 #define DOWNLOAD_ENDGAME_DELAY_MS   1500u   /* ...once the first is this old   */
 #define DOWNLOAD_MAX_ACTIVE_BYTES   (128u * 1024u * 1024u)
 #define DOWNLOAD_TICK_MS            1000u
+#define DOWNLOAD_UPLOAD_QUEUE       256u    /* requests a peer may queue with us */
+#define DOWNLOAD_UPLOAD_READS       4u      /* block reads in flight per peer    */
+#define DOWNLOAD_UPLOAD_BUFFERED    (256u * 1024u)  /* queued to send: wait     */
+#define DOWNLOAD_RECHOKE_SECONDS    10u
+#define DOWNLOAD_OPTIMISTIC_SECONDS 30u
+#define DOWNLOAD_INCOMING_EXTRA     10u     /* incoming peers beyond maxPeers    */
+#define DOWNLOAD_INCOMING_TIMEOUT   30u     /* seconds for their handshake       */
+#ifndef DOWNLOAD_NOPEERS_SECONDS
+#define DOWNLOAD_NOPEERS_SECONDS    60u     /* no peer at all this long: give up */
+#endif
 
 /* ------------------------------------------------------------------------ */
 /* Types                                                                    */
@@ -84,6 +94,12 @@ typedef struct downloadRequest {
     uint32_t        block;
 } downloadRequest;
 
+typedef struct uploadRequest {
+    uint32_t        index;
+    uint32_t        begin;
+    uint32_t        length;
+} uploadRequest;
+
 typedef struct downloadPeer {
     TAILQ_ENTRY(downloadPeer) entries;
     download               *owner;
@@ -105,6 +121,21 @@ typedef struct downloadPeer {
     uint64_t                lastBlock;      /* uv_now(): block, or first request */
     uint64_t                chokedSince;
     uint64_t                openedAt;
+
+    /* Uploading to the peer */
+    uint8_t                 incoming;       /* it connected to us           */
+    uint8_t                 peerInterested; /* it wants our pieces          */
+    uint8_t                 amChoking;      /* we are choking it            */
+    uint8_t                 selected;       /* scratch, for rechoke()       */
+    uint8_t                 remoteId[PEER_ID_LENGTH];
+    uint32_t                haveCount;      /* pieces it has                */
+    uploadRequest          *uploadQueue;    /* its requests, oldest first   */
+    uint32_t                queueCount;
+    uploadRequest          *reading;        /* blocks being read from disk  */
+    uint32_t                readingCount;
+    uint64_t                uploaded;       /* total sent to it             */
+    uint64_t                uploadedWindow; /* sent since the last rechoke  */
+    uint64_t                downloadedWindow;   /* received since then      */
 } downloadPeer;
 
 TAILQ_HEAD(activeList, activePiece);
@@ -144,6 +175,22 @@ struct download {
     uint32_t                hashFailures;
     uint64_t                lastProgress;   /* uv_now() of the last block   */
     uint64_t                random;         /* xorshift state               */
+
+    /* Uploading and seeding */
+    uint8_t                *onDisk;         /* pieces we can serve (bitfield) */
+    uint32_t                onDiskCount;
+    uint64_t                left;           /* wanted bytes not yet on disk */
+    uint64_t                bytesUploaded;
+    peerListener           *listeners[2];   /* IPv4, IPv6                   */
+    uint16_t                listenPort;
+    uint8_t                 seedOption;
+    uint8_t                 seeding;
+    uint32_t                uploadSlots;
+    uint32_t                uploadUnchoked; /* peers we are not choking     */
+    downloadPeer           *optimistic;
+    uint64_t                lastRechoke;
+    uint64_t                lastOptimistic;
+    uint64_t                noPeersSince;   /* 0 while there are peers      */
 
     uint8_t                 ready;          /* storage open                 */
     uint8_t                 endgame;
@@ -311,6 +358,7 @@ static void fillPeer(download *dl, downloadPeer *peer);
 static void fillAll(download *dl);
 static void connectMore(download *dl);
 static void finish(download *dl, int32_t status, const char *message);
+static void complete(download *dl);
 
 /* ------------------------------------------------------------------------ */
 /* Requests                                                                 */
@@ -618,6 +666,7 @@ static void peerHasPiece(download *dl, downloadPeer *peer, uint32_t index)
         return;
     }
     messageBitfieldSet(peer->have, index);
+    peer->haveCount++;
     dl->availability[index]++;
     if (dl->ready && pieceIsWanted(dl, index)) {
         peer->interesting++;
@@ -652,6 +701,260 @@ static void pieceNoLongerWanted(download *dl, uint32_t index)
 }
 
 /* ------------------------------------------------------------------------ */
+/* Uploading                                                                */
+/* ------------------------------------------------------------------------ */
+
+static void setChoking(download *dl, downloadPeer *peer, int choke)
+{
+    if (peer->state != DOWNLOAD_PEER_OPEN || peer->amChoking == (uint8_t)(choke != 0)) {
+        return;
+    }
+    peer->amChoking = (uint8_t)(choke != 0);
+    if (choke) {
+        peer->queueCount = 0;                       /* BEP 3: choking discards requests */
+        dl->uploadUnchoked--;
+        sendSimple(peer, MESSAGE_CHOKE);
+    } else {
+        dl->uploadUnchoked++;
+        sendSimple(peer, MESSAGE_UNCHOKE);
+    }
+}
+
+static void onBlockRead(void *privateArg, storage *store, uint32_t pieceIndex, uint32_t begin,
+                        uint32_t length, uint8_t *data, int32_t status, const char *errorMessage);
+
+/* Read queued requests from disk while the peer's send queue has room. */
+static void pumpUploads(download *dl, downloadPeer *peer)
+{
+    peerRemoteState state;
+    uploadRequest   request;
+    uint8_t        *data;
+
+    while (!stopped(dl) && dl->store != NULL && peer->state == DOWNLOAD_PEER_OPEN &&
+           !peer->amChoking && peer->queueCount > 0 &&
+           peer->readingCount < DOWNLOAD_UPLOAD_READS) {
+        if (peerGetState(peer->connection, &state) != PEER_OK ||
+            state.sendQueued >= DOWNLOAD_UPLOAD_BUFFERED) {
+            return;                                 /* onDrain will call again */
+        }
+        request = peer->uploadQueue[0];
+        peer->queueCount--;
+        memmove(peer->uploadQueue, peer->uploadQueue + 1,
+                sizeof(*peer->uploadQueue) * peer->queueCount);
+        data = dl->context->allocator.realloc(NULL, request.length);
+        if (data == NULL) {
+            return;
+        }
+        peer->reading[peer->readingCount++] = request;
+        if (storageReadBlock(dl->store, request.index, request.begin, request.length, data,
+                             onBlockRead, peer) != STORAGE_OK) {
+            peer->readingCount--;                   /* storage freed the buffer */
+        }
+    }
+}
+
+static void onBlockRead(void *privateArg, storage *store, uint32_t pieceIndex, uint32_t begin,
+                        uint32_t length, uint8_t *data, int32_t status, const char *errorMessage)
+{
+    downloadPeer *peer = privateArg;
+    download     *dl = peer->owner;
+    messageFrame  frame;
+    uint32_t      i;
+    int           found = 0;
+
+    (void)store;
+    /* Still wanted? A read from before a disconnect or a choke is not. */
+    for (i = 0; i < peer->readingCount; i++) {
+        if (peer->reading[i].index == pieceIndex && peer->reading[i].begin == begin &&
+            peer->reading[i].length == length) {
+            peer->reading[i] = peer->reading[--peer->readingCount];
+            found = 1;
+            break;
+        }
+    }
+    if (data == NULL) {
+        if (found && !stopped(dl)) {
+            emit(dl, "could not read piece %u for %s: %s", (unsigned)pieceIndex, peer->where,
+                 (errorMessage != NULL) ? errorMessage : storageStatusString(status));
+        }
+        return;
+    }
+    if (!found || stopped(dl) || peer->state != DOWNLOAD_PEER_OPEN || peer->amChoking) {
+        release(dl, data);
+        return;
+    }
+    memset(&frame, 0, sizeof(frame));
+    frame.id = MESSAGE_PIECE;
+    frame.index = pieceIndex;
+    frame.begin = begin;
+    frame.payload = data;
+    frame.payloadLength = length;
+    if (sendFrame(peer, &frame) == 0) {
+        peer->uploaded += length;
+        peer->uploadedWindow += length;
+        dl->bytesUploaded += length;
+    }
+    release(dl, data);
+    pumpUploads(dl, peer);
+}
+
+static void queueUpload(download *dl, downloadPeer *peer, const messageFrame *message)
+{
+    if (peer->amChoking || !messageBitfieldGet(dl->onDisk, message->index) ||
+        (uint64_t)message->begin + message->length >
+            pieceLengthOf(dl->torrent, message->index) ||
+        peer->queueCount >= DOWNLOAD_UPLOAD_QUEUE) {
+        return;                                     /* ignored, as BEP 3 allows */
+    }
+    peer->uploadQueue[peer->queueCount].index = message->index;
+    peer->uploadQueue[peer->queueCount].begin = message->begin;
+    peer->uploadQueue[peer->queueCount].length = message->length;
+    peer->queueCount++;
+    pumpUploads(dl, peer);
+}
+
+static void cancelUpload(downloadPeer *peer, const messageFrame *message)
+{
+    uint32_t i;
+
+    for (i = 0; i < peer->queueCount; i++) {
+        if (peer->uploadQueue[i].index == message->index &&
+            peer->uploadQueue[i].begin == message->begin &&
+            peer->uploadQueue[i].length == message->length) {
+            peer->queueCount--;
+            memmove(peer->uploadQueue + i, peer->uploadQueue + i + 1,
+                    sizeof(*peer->uploadQueue) * (peer->queueCount - i));
+            return;
+        }
+    }
+}
+
+static int canUpload(const downloadPeer *peer)
+{
+    return peer->state == DOWNLOAD_PEER_OPEN && peer->peerInterested && !peer->excluded;
+}
+
+/*
+ * Choose whom to upload to: the best uploadSlots - 1 interested peers (by
+ * what they sent us lately, or while seeding by what we sent them), plus
+ * one optimistic unchoke that rotates every DOWNLOAD_OPTIMISTIC_SECONDS.
+ */
+static void rechoke(download *dl, uint64_t now)
+{
+    downloadPeer *peer;
+    downloadPeer *best;
+    uint32_t      regular = (dl->uploadSlots > 1u) ? dl->uploadSlots - 1u : 1u;
+    uint32_t      chosen;
+    uint32_t      ties;
+
+    TAILQ_FOREACH(peer, &dl->peers, entries) {
+        peer->selected = 0;
+    }
+    for (chosen = 0; chosen < regular; chosen++) {
+        uint64_t bestScore = 0;
+
+        best = NULL;
+        TAILQ_FOREACH(peer, &dl->peers, entries) {
+            uint64_t score;
+
+            if (!canUpload(peer) || peer->selected) {
+                continue;
+            }
+            score = (dl->seeding ? peer->uploadedWindow : peer->downloadedWindow) * 2u +
+                    (peer->amChoking ? 0u : 1u);   /* ties: keep who we have */
+            if (best == NULL || score > bestScore) {
+                best = peer;
+                bestScore = score;
+            }
+        }
+        if (best == NULL) {
+            break;
+        }
+        best->selected = 1;
+    }
+
+    /* The optimistic unchoke: keep it for its period unless it went away. */
+    if (dl->optimistic != NULL &&
+        (!canUpload(dl->optimistic) || dl->optimistic->selected ||
+         now - dl->lastOptimistic >= (uint64_t)DOWNLOAD_OPTIMISTIC_SECONDS * 1000u)) {
+        dl->optimistic = NULL;
+    }
+    if (dl->optimistic == NULL) {
+        ties = 0;
+        TAILQ_FOREACH(peer, &dl->peers, entries) {
+            if (canUpload(peer) && !peer->selected && nextRandom(dl) % ++ties == 0) {
+                dl->optimistic = peer;
+            }
+        }
+        dl->lastOptimistic = now;
+    }
+    if (dl->optimistic != NULL) {
+        dl->optimistic->selected = 1;
+    }
+
+    TAILQ_FOREACH(peer, &dl->peers, entries) {
+        if (stopped(dl)) {
+            return;
+        }
+        if (peer->state == DOWNLOAD_PEER_OPEN) {
+            setChoking(dl, peer, !peer->selected);
+            peer->uploadedWindow = 0;
+            peer->downloadedWindow = 0;
+            pumpUploads(dl, peer);
+        }
+    }
+    dl->lastRechoke = now;
+}
+
+/* Give free upload slots to interested peers that are waiting. */
+static void fillUploadSlots(download *dl)
+{
+    downloadPeer *peer;
+
+    TAILQ_FOREACH(peer, &dl->peers, entries) {
+        if (stopped(dl) || dl->uploadUnchoked >= dl->uploadSlots) {
+            return;
+        }
+        if (canUpload(peer) && peer->amChoking) {
+            setChoking(dl, peer, 0);
+        }
+    }
+}
+
+static int someoneWaiting(const download *dl)
+{
+    const downloadPeer *peer;
+
+    TAILQ_FOREACH(peer, &dl->peers, entries) {
+        if (canUpload(peer) && peer->amChoking) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* Our bitfield, as the first message after the handshake. */
+static void sendBitfield(download *dl, downloadPeer *peer)
+{
+    messageFrame frame;
+
+    if (dl->onDiskCount == 0) {
+        return;                                     /* allowed to say nothing */
+    }
+    memset(&frame, 0, sizeof(frame));
+    frame.id = MESSAGE_BITFIELD;
+    frame.payload = dl->onDisk;
+    frame.payloadLength = messageBitfieldBytes(dl->torrent->pieceCount);
+    (void)sendFrame(peer, &frame);
+}
+
+/* When we are complete, a peer that is complete too is of no use. */
+static int bothComplete(const download *dl, const downloadPeer *peer)
+{
+    return dl->seeding && peer->haveCount >= dl->torrent->pieceCount;
+}
+
+/* ------------------------------------------------------------------------ */
 /* Peer lifetime                                                            */
 /* ------------------------------------------------------------------------ */
 
@@ -676,6 +979,17 @@ static void detachPeer(download *dl, downloadPeer *peer)
         memset(peer->have, 0, messageBitfieldBytes(dl->torrent->pieceCount));
     }
     peer->interesting = 0;
+    peer->haveCount = 0;
+    if (!peer->amChoking && dl->uploadUnchoked > 0) {
+        dl->uploadUnchoked--;
+    }
+    peer->amChoking = 1;
+    peer->peerInterested = 0;
+    peer->queueCount = 0;
+    peer->readingCount = 0;                         /* reads in flight are dropped */
+    if (dl->optimistic == peer) {
+        dl->optimistic = NULL;
+    }
     if (!peer->choked && dl->unchoking > 0) {
         dl->unchoking--;
     }
@@ -706,7 +1020,7 @@ static void dropPeer(downloadPeer *peer, const char *reason, int exclude)
     if (exclude) {
         peer->excluded = 1;
     }
-    if (!peer->excluded && wasOpen && peer->attempts < DOWNLOAD_MAX_ATTEMPTS) {
+    if (!peer->excluded && wasOpen && !peer->incoming && peer->attempts < DOWNLOAD_MAX_ATTEMPTS) {
         peer->state = DOWNLOAD_PEER_QUEUED;
         peer->retryAt = uv_now(dl->loop) + (uint64_t)DOWNLOAD_RETRY_SECONDS * 1000u;
     } else {
@@ -717,6 +1031,7 @@ static void dropPeer(downloadPeer *peer, const char *reason, int exclude)
     }
     if (!stopped(dl)) {
         fillAll(dl);                                /* its blocks are free again */
+        fillUploadSlots(dl);                        /* and its upload slot       */
         connectMore(dl);
     }
 }
@@ -729,7 +1044,14 @@ static int allocatePeerState(download *dl, downloadPeer *peer)
     if (peer->requests == NULL) {
         peer->requests = allocate(dl, sizeof(*peer->requests) * dl->pipeline);
     }
-    return (peer->have != NULL && peer->requests != NULL) ? 0 : -1;
+    if (peer->uploadQueue == NULL) {
+        peer->uploadQueue = allocate(dl, sizeof(*peer->uploadQueue) * DOWNLOAD_UPLOAD_QUEUE);
+    }
+    if (peer->reading == NULL) {
+        peer->reading = allocate(dl, sizeof(*peer->reading) * DOWNLOAD_UPLOAD_READS);
+    }
+    return (peer->have != NULL && peer->requests != NULL && peer->uploadQueue != NULL &&
+            peer->reading != NULL) ? 0 : -1;
 }
 
 static void onPeerHandshake(void *privateArg, peerConnection *connection,
@@ -766,7 +1088,30 @@ static void onPeerHandshake(void *privateArg, peerConnection *connection,
     peer->lastBlock = uv_now(dl->loop);
     peer->chokedSince = peer->lastBlock;
     peer->openedAt = peer->lastBlock;
+    peer->amChoking = 1;
+    peer->peerInterested = 0;
+    peer->haveCount = 0;
+    peer->queueCount = 0;
+    peer->readingCount = 0;
+    peer->uploadedWindow = 0;
+    peer->downloadedWindow = 0;
+    memcpy(peer->remoteId, result->peerId, PEER_ID_LENGTH);
     dl->open++;
+
+    /* The same client by another route (it connected to us as we to it). */
+    {
+        downloadPeer *other;
+
+        TAILQ_FOREACH(other, &dl->peers, entries) {
+            if (other != peer && other->state == DOWNLOAD_PEER_OPEN &&
+                memcmp(other->remoteId, peer->remoteId, PEER_ID_LENGTH) == 0) {
+                peer->attempts = DOWNLOAD_MAX_ATTEMPTS;     /* no retry */
+                dropPeer(peer, NULL, 0);
+                return;
+            }
+        }
+    }
+    sendBitfield(dl, peer);
 
     for (i = 0; i < PEER_ID_LENGTH; i++) {
         uint8_t c = result->peerId[i];
@@ -774,7 +1119,8 @@ static void onPeerHandshake(void *privateArg, peerConnection *connection,
         client[i] = (c >= 0x20 && c < 0x7f) ? (char)c : '.';
     }
     client[i < 8u ? i : 8u] = '\0';
-    emit(dl, "%s: connected (peer id %s...)", peer->where, client);
+    emit(dl, "%s: connected%s (peer id %s...)", peer->where,
+         peer->incoming ? " (incoming)" : "", client);
 }
 
 /* ------------------------------------------------------------------------ */
@@ -812,17 +1158,23 @@ static void onPieceWritten(void *privateArg, storage *store, uint32_t pieceIndex
     }
     dl->pieceState[pieceIndex] = DOWNLOAD_PIECE_DONE;
     dl->done++;
+    if (!messageBitfieldGet(dl->onDisk, pieceIndex)) {
+        messageBitfieldSet(dl->onDisk, pieceIndex);
+        dl->onDiskCount++;
+    }
+    dl->left -= (dl->left >= pieceLengthOf(dl->torrent, pieceIndex))
+                    ? pieceLengthOf(dl->torrent, pieceIndex) : dl->left;
 
     memset(&have, 0, sizeof(have));
     have.id = MESSAGE_HAVE;
     have.index = pieceIndex;
     TAILQ_FOREACH(peer, &dl->peers, entries) {
-        if (peer->state == DOWNLOAD_PEER_OPEN) {
+        if (peer->state == DOWNLOAD_PEER_OPEN && !messageBitfieldGet(peer->have, pieceIndex)) {
             (void)sendFrame(peer, &have);
         }
     }
     if (dl->done >= dl->wanted) {
-        finish(dl, DOWNLOAD_OK, "download complete");
+        complete(dl);
     }
 }
 
@@ -866,6 +1218,37 @@ static void blameCulprits(download *dl, activePiece *piece)
         snprintf(reason, sizeof(reason), "sent corrupt data for piece %u",
                  (unsigned)piece->piece.index);
         excludePeer(dl, peer, reason);
+    }
+}
+
+/* Everything wanted is on disk: stop, or carry on as a seed. */
+static void complete(download *dl)
+{
+    downloadPeer *peer;
+
+    if (stopped(dl) || dl->seeding) {
+        return;
+    }
+    if (dl->events.onComplete != NULL) {
+        dl->events.onComplete(dl->privateArg, dl);
+        if (stopped(dl)) {
+            return;
+        }
+    }
+    if (!dl->seedOption) {
+        finish(dl, DOWNLOAD_OK, "download complete");
+        return;
+    }
+    dl->seeding = 1;
+    emit(dl, "download complete; seeding");
+    TAILQ_FOREACH(peer, &dl->peers, entries) {
+        if (stopped(dl)) {
+            return;
+        }
+        if (peer->state == DOWNLOAD_PEER_OPEN && bothComplete(dl, peer)) {
+            peer->attempts = DOWNLOAD_MAX_ATTEMPTS;
+            dropPeer(peer, "complete, as we are", 0);
+        }
     }
 }
 
@@ -982,6 +1365,7 @@ static void receiveBlock(download *dl, downloadPeer *peer, const messageFrame *m
     int32_t       status;
 
     dl->bytesReceived += message->payloadLength;
+    peer->downloadedWindow += message->payloadLength;
     piece = findActive(dl, message->index);
     block = message->begin / PIECE_BLOCK_LENGTH;
     slot = (piece != NULL && message->begin % PIECE_BLOCK_LENGTH == 0)
@@ -1065,13 +1449,42 @@ static void onPeerMessage(void *privateArg, peerConnection *connection,
                 peerHasPiece(dl, peer, i);
             }
         }
+        if (bothComplete(dl, peer)) {
+            peer->attempts = DOWNLOAD_MAX_ATTEMPTS;
+            dropPeer(peer, "complete, as we are", 0);
+            break;
+        }
         updateInterest(peer);
         fillPeer(dl, peer);
         break;
     case MESSAGE_HAVE:
         peerHasPiece(dl, peer, message->index);
+        if (bothComplete(dl, peer)) {
+            peer->attempts = DOWNLOAD_MAX_ATTEMPTS;
+            dropPeer(peer, "complete, as we are", 0);
+            break;
+        }
         updateInterest(peer);
         fillPeer(dl, peer);
+        break;
+    case MESSAGE_INTERESTED:
+        peer->peerInterested = 1;
+        if (dl->uploadUnchoked < dl->uploadSlots) {
+            setChoking(dl, peer, 0);                /* a free slot: no need to wait */
+        }
+        break;
+    case MESSAGE_NOT_INTERESTED:
+        peer->peerInterested = 0;
+        if (!peer->amChoking && someoneWaiting(dl)) {
+            setChoking(dl, peer, 1);                /* its slot is wanted */
+            fillUploadSlots(dl);
+        }
+        break;
+    case MESSAGE_REQUEST:
+        queueUpload(dl, peer, message);
+        break;
+    case MESSAGE_CANCEL:
+        cancelUpload(peer, message);
         break;
     case MESSAGE_CHOKE:
         if (!peer->choked) {
@@ -1094,7 +1507,7 @@ static void onPeerMessage(void *privateArg, peerConnection *connection,
         receiveBlock(dl, peer, message);
         break;
     default:
-        break;                                      /* we do not upload yet */
+        break;                                      /* port, extensions */
     }
 }
 
@@ -1111,10 +1524,89 @@ static void onPeerClosed(void *privateArg, peerConnection *connection, int32_t s
     dropPeer(peer, (errorMessage != NULL) ? errorMessage : "connection closed", 0);
 }
 
+static void onPeerDrain(void *privateArg, peerConnection *connection)
+{
+    downloadPeer *peer = privateArg;
+
+    (void)connection;
+    pumpUploads(peer->owner, peer);
+}
+
+static int sameHost(const struct sockaddr_storage *a, const struct sockaddr *b)
+{
+    if (a->ss_family != b->sa_family) {
+        return 0;
+    }
+    if (b->sa_family == AF_INET) {
+        return memcmp(&((const struct sockaddr_in *)a)->sin_addr,
+                      &((const struct sockaddr_in *)b)->sin_addr, sizeof(struct in_addr)) == 0;
+    }
+    return memcmp(&((const struct sockaddr_in6 *)a)->sin6_addr,
+                  &((const struct sockaddr_in6 *)b)->sin6_addr, sizeof(struct in6_addr)) == 0;
+}
+
+/* Someone connected to us: take them if they want this torrent and there is room. */
+static int onIncoming(void *listenerArg, peerConnection *connection, const struct sockaddr *address,
+                      const uint8_t infoHash[PARSER_SHA1_LENGTH], peerConnectOptions *options,
+                      peerCallbacks *callbacks, void **privateArg)
+{
+    download     *dl = listenerArg;
+    downloadPeer *peer;
+    size_t        size;
+
+    if (stopped(dl) || !dl->ready ||
+        memcmp(infoHash, dl->torrent->infoHash, PARSER_SHA1_LENGTH) != 0 ||
+        dl->open + dl->connecting >= dl->maxPeers + DOWNLOAD_INCOMING_EXTRA ||
+        dl->peerCount >= DOWNLOAD_MAX_KNOWN_PEERS ||
+        (address->sa_family != AF_INET && address->sa_family != AF_INET6)) {
+        return 0;
+    }
+    TAILQ_FOREACH(peer, &dl->peers, entries) {
+        if (peer->excluded && sameHost(&peer->address, address)) {
+            return 0;                               /* misbehaved before */
+        }
+    }
+    peer = allocate(dl, sizeof(*peer));
+    if (peer == NULL) {
+        return 0;
+    }
+    size = (address->sa_family == AF_INET) ? sizeof(struct sockaddr_in)
+                                           : sizeof(struct sockaddr_in6);
+    memcpy(&peer->address, address, size);
+    formatAddress(address, peer->where, sizeof(peer->where));
+    peer->owner = dl;
+    peer->state = DOWNLOAD_PEER_CONNECTING;
+    peer->incoming = 1;
+    peer->choked = 1;
+    peer->amChoking = 1;
+    peer->attempts = 1;
+    peer->connection = connection;
+    TAILQ_INSERT_TAIL(&dl->peers, peer, entries);
+    dl->peerCount++;
+    dl->connecting++;
+
+    *options = dl->connectOptions;
+    options->timeoutSeconds = DOWNLOAD_INCOMING_TIMEOUT;
+    callbacks->onHandshake = onPeerHandshake;
+    callbacks->onMessage = onPeerMessage;
+    callbacks->onClosed = onPeerClosed;
+    callbacks->onDrain = onPeerDrain;
+    *privateArg = peer;
+    return 1;
+}
+
+static void closeListeners(download *dl)
+{
+    peerListenerClose(dl->listeners[0]);
+    peerListenerClose(dl->listeners[1]);
+    dl->listeners[0] = NULL;
+    dl->listeners[1] = NULL;
+}
+
 /* Fill free connection slots from the queue. */
 static void connectMore(download *dl)
 {
-    peerCallbacks callbacks = { onPeerHandshake, onPeerMessage, onPeerClosed };
+    peerCallbacks callbacks = { onPeerHandshake, onPeerMessage, onPeerClosed, onPeerDrain };
     downloadPeer *peer;
     uint64_t      now = uv_now(dl->loop);
     int32_t       status;
@@ -1159,6 +1651,7 @@ static void finish(download *dl, int32_t status, const char *message)
         return;
     }
     dl->finished = 1;
+    closeListeners(dl);
     TAILQ_FOREACH(peer, &dl->peers, entries) {
         peerClose(peer->connection);
         peer->connection = NULL;
@@ -1194,6 +1687,9 @@ static void onTick(uv_timer_t *timer)
     if (stopped(dl)) {
         return;
     }
+    if (dl->seeding) {
+        dl->lastProgress = now;                     /* nothing to wait for */
+    }
     if (now - dl->lastProgress >= (uint64_t)DOWNLOAD_IDLE_SECONDS * 1000u) {
         snprintf(dl->message, sizeof(dl->message), "no data received for %u seconds",
                  (unsigned)DOWNLOAD_IDLE_SECONDS);
@@ -1208,7 +1704,11 @@ static void onTick(uv_timer_t *timer)
             known++;
         }
     }
-    if (known == 0) {
+    if (known > 0 || dl->seeding) {
+        dl->noPeersSince = 0;
+    } else if (dl->noPeersSince == 0) {
+        dl->noPeersSince = now;                     /* trackers or incoming may bring more */
+    } else if (now - dl->noPeersSince >= (uint64_t)DOWNLOAD_NOPEERS_SECONDS * 1000u) {
         finish(dl, DOWNLOAD_ENOPEERS, "no peers left to download from");
         return;
     }
@@ -1221,11 +1721,11 @@ static void onTick(uv_timer_t *timer)
         if (peer->requestCount > 0 &&
             now - peer->lastBlock >= (uint64_t)DOWNLOAD_STALL_SECONDS * 1000u) {
             dropPeer(peer, "stopped sending blocks", 0);
-        } else if (waiting > 0 && peer->interesting == 0 &&
-                   now - peer->openedAt >= (uint64_t)DOWNLOAD_CHOKED_SECONDS * 1000u) {
+        } else if (waiting > 0 && peer->interesting == 0 && !peer->peerInterested &&
+                   !dl->seeding && now - peer->openedAt >= (uint64_t)DOWNLOAD_CHOKED_SECONDS * 1000u) {
             waiting--;
             dropPeer(peer, "has nothing we need; making room for another peer", 0);
-        } else if (waiting > 0 && peer->choked &&
+        } else if (waiting > 0 && peer->choked && !peer->peerInterested && !dl->seeding &&
                    now - peer->chokedSince >= (uint64_t)DOWNLOAD_CHOKED_SECONDS * 1000u) {
             waiting--;
             dropPeer(peer, "kept us choked; making room for another peer", 0);
@@ -1233,6 +1733,12 @@ static void onTick(uv_timer_t *timer)
     }
     if (stopped(dl)) {
         return;
+    }
+    if (now - dl->lastRechoke >= (uint64_t)DOWNLOAD_RECHOKE_SECONDS * 1000u) {
+        rechoke(dl, now);
+        if (stopped(dl)) {
+            return;
+        }
     }
     fillAll(dl);
     connectMore(dl);
@@ -1248,6 +1754,8 @@ static void onTimerClosed(uv_handle_t *handle)
         TAILQ_REMOVE(&dl->peers, peer, entries);
         release(dl, peer->have);
         release(dl, peer->requests);
+        release(dl, peer->uploadQueue);
+        release(dl, peer->reading);
         release(dl, peer);
     }
     while ((piece = TAILQ_FIRST(&dl->active)) != NULL) {
@@ -1256,6 +1764,7 @@ static void onTimerClosed(uv_handle_t *handle)
     }
     release(dl, dl->pieceState);
     release(dl, dl->availability);
+    release(dl, dl->onDisk);
     release(dl, dl);
 }
 
@@ -1282,6 +1791,8 @@ static void onStorageOpen(void *privateArg, storage *store, int32_t status,
         return;
     }
     have = storageHave(store, &haveCount);
+    memcpy(dl->onDisk, have, messageBitfieldBytes(dl->torrent->pieceCount));
+    dl->onDiskCount = haveCount;
     for (i = 0; i < dl->torrent->pieceCount; i++) {
         int wanted = (dl->onlyPiece < 0) || ((int64_t)i == dl->onlyPiece);
 
@@ -1296,6 +1807,7 @@ static void onStorageOpen(void *privateArg, storage *store, int32_t status,
             dl->pieceState[i] = DOWNLOAD_PIECE_NEEDED;
             dl->wanted++;
             dl->neededCount++;
+            dl->left += pieceLengthOf(dl->torrent, i);
         }
     }
     dl->ready = 1;
@@ -1306,9 +1818,13 @@ static void onStorageOpen(void *privateArg, storage *store, int32_t status,
             return;
         }
     }
-    if (dl->neededCount == 0) {
+    if (dl->neededCount == 0 && !dl->seedOption) {
         finish(dl, DOWNLOAD_OK, "nothing to download: already complete");
         return;
+    }
+    if (dl->neededCount == 0) {
+        dl->seeding = 1;                            /* complete before we started */
+        emit(dl, "already complete; seeding");
     }
     TAILQ_FOREACH(peer, &dl->peers, entries) {
         if (peer->state == DOWNLOAD_PEER_OPEN) {
@@ -1355,6 +1871,9 @@ int32_t downloadBegin(uv_loop_t *loop, parserContext *context, const parserTorre
     dl->maxPeers = (options->maxPeers != 0) ? options->maxPeers : DOWNLOAD_DEFAULT_MAX_PEERS;
     dl->pipeline = (options->pipeline != 0) ? options->pipeline : DOWNLOAD_DEFAULT_PIPELINE;
     dl->onlyPiece = (options->onlyPiece < 0) ? -1 : options->onlyPiece;
+    dl->seedOption = options->seed;
+    dl->uploadSlots = (options->uploadSlots != 0) ? options->uploadSlots
+                                                  : DOWNLOAD_DEFAULT_UPLOAD_SLOTS;
     TAILQ_INIT(&dl->active);
     TAILQ_INIT(&dl->peers);
 
@@ -1370,9 +1889,11 @@ int32_t downloadBegin(uv_loop_t *loop, parserContext *context, const parserTorre
 
     dl->pieceState = allocate(dl, torrent->pieceCount);
     dl->availability = allocate(dl, sizeof(*dl->availability) * torrent->pieceCount);
-    if (dl->pieceState == NULL || dl->availability == NULL) {
+    dl->onDisk = allocate(dl, messageBitfieldBytes(torrent->pieceCount) + 1u);
+    if (dl->pieceState == NULL || dl->availability == NULL || dl->onDisk == NULL) {
         release(dl, dl->pieceState);
         release(dl, dl->availability);
+        release(dl, dl->onDisk);
         release(dl, dl);
         return DOWNLOAD_ENOMEM;
     }
@@ -1383,12 +1904,35 @@ int32_t downloadBegin(uv_loop_t *loop, parserContext *context, const parserTorre
     if (status != STORAGE_OK) {
         release(dl, dl->pieceState);
         release(dl, dl->availability);
+        release(dl, dl->onDisk);
         release(dl, dl);
         return (status == STORAGE_ENOMEM) ? DOWNLOAD_ENOMEM
              : (status == STORAGE_EINVAL) ? DOWNLOAD_EINVAL : DOWNLOAD_EIO;
     }
     uv_timer_init(loop, &dl->timer);
     dl->timer.data = dl;
+
+    /* Accept connections: the given port, or the next free one. Either
+     * family may be missing (no IPv6, or an interface with one family). */
+    if (options->listenPort != 0) {
+        uint32_t attempt;
+
+        for (attempt = 0; attempt < DOWNLOAD_LISTEN_ATTEMPTS &&
+                          (uint32_t)options->listenPort + attempt <= 65535u; attempt++) {
+            uint16_t port = (uint16_t)(options->listenPort + attempt);
+            int32_t  v4 = peerListen(AF_INET, port, onIncoming, dl, &dl->listeners[0]);
+            int32_t  v6;
+
+            if (v4 == PEER_EADDRINUSE) {
+                continue;
+            }
+            v6 = peerListen(AF_INET6, port, onIncoming, dl, &dl->listeners[1]);
+            if (v4 == PEER_OK || v6 == PEER_OK) {
+                dl->listenPort = port;
+            }
+            break;
+        }
+    }
     *transfer = dl;
     return DOWNLOAD_OK;
 }
@@ -1450,6 +1994,10 @@ void downloadGetProgress(const download *dl, downloadProgress *progress)
     progress->hashFailures = dl->hashFailures;
     progress->piecesActive = dl->activeCount;
     progress->endgame = dl->endgame;
+    progress->seeding = dl->seeding;
+    progress->left = dl->left;
+    progress->bytesUploaded = dl->bytesUploaded;
+    progress->listenPort = dl->listenPort;
     TAILQ_FOREACH(peer, &dl->peers, entries) {
         switch (peer->state) {
         case DOWNLOAD_PEER_QUEUED:
@@ -1462,11 +2010,19 @@ void downloadGetProgress(const download *dl, downloadProgress *progress)
             progress->peersConnected++;
             progress->peersUnchoking += peer->choked ? 0u : 1u;
             progress->peersDownloading += (peer->requestCount > 0) ? 1u : 0u;
+            progress->peersInterested += peer->peerInterested ? 1u : 0u;
+            progress->peersUploading += peer->amChoking ? 0u : 1u;
+            progress->peersIncoming += peer->incoming ? 1u : 0u;
             break;
         default:
             break;
         }
     }
+}
+
+uint16_t downloadListenPort(const download *dl)
+{
+    return (dl != NULL) ? dl->listenPort : 0;
 }
 
 const char *downloadRoot(const download *dl)
@@ -1482,6 +2038,7 @@ void downloadEnd(download *dl)
         return;
     }
     dl->ended = 1;
+    closeListeners(dl);
     TAILQ_FOREACH(peer, &dl->peers, entries) {
         peerClose(peer->connection);
         peer->connection = NULL;

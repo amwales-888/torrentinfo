@@ -5,7 +5,8 @@
  * Create:   ./torrentinfo -o out.torrent [options] file1 [file2 ...]
  * Announce: ./torrentinfo -t [-T seconds] [-C ca.pem] file.torrent
  * Peers:    ./torrentinfo -P [-T seconds] [-C ca.pem] file.torrent
- * Download: ./torrentinfo -D [-O dir] [-i piece] [-T seconds] [-C ca.pem] file.torrent
+ * Download: ./torrentinfo -D [-S] [-L port] [-O dir] [-i piece] [-T seconds] [-C ca.pem]
+ *           [-I interface] file.torrent
  *
  * Options come before the file names.
  *
@@ -24,6 +25,7 @@
 #include <string.h>
 #include <time.h>
 
+#include "announce.h"
 #include "download.h"
 #include "encoder.h"
 #include "net.h"
@@ -1008,7 +1010,7 @@ static uint32_t handshakePeers(uv_loop_t *loop, peerAttempt *attempts, uint32_t 
     static const int32_t failures[] = {
         PEER_ETIMEDOUT, PEER_ERROR, PEER_ECLOSED, PEER_EPROTO, PEER_EHASH, PEER_ESELF, PEER_ENOMEM
     };
-    peerCallbacks           callbacks = { onHandshake, onMessage, onPeerClosed };
+    peerCallbacks           callbacks = { onHandshake, onMessage, onPeerClosed, NULL };
     peerConnectOptions      options;
     struct sockaddr_storage address;
     peerRun                 run;
@@ -1092,7 +1094,7 @@ static uint32_t handshakePeers(uv_loop_t *loop, peerAttempt *attempts, uint32_t 
 }
 
 /* ------------------------------------------------------------------------ */
-/* Download mode: ./torrentinfo -D [-O dir] [-i piece] file.torrent         */
+/* Download mode: ./torrentinfo -D [-S] [-L port] [-O dir] [-i piece] ...   */
 /*                                                                          */
 /* The download module does the work: it opens the files (hashing existing  */
 /* data, so an interrupted download resumes), connects to the peers the     */
@@ -1101,14 +1103,24 @@ static uint32_t handshakePeers(uv_loop_t *loop, peerAttempt *attempts, uint32_t 
 /* ------------------------------------------------------------------------ */
 
 typedef struct downloadRun {
-    download   *transfer;
-    uv_timer_t  timer;
-    uint8_t     timerStarted;
-    int         result;             /* 0 once everything is on disk     */
-    uint64_t    startedAt;          /* uv_hrtime() when the files were ready */
-    uint64_t    lastReport;         /* uv_now() of the last progress line */
-    uint64_t    reportBytes;        /* bytes received at that line       */
-    uint32_t    peerCount;
+    uv_loop_t      *loop;
+    download       *transfer;
+    announce       *trackers;           /* NULL if the torrent lists none   */
+    uv_timer_t      timer;              /* progress line                    */
+    uv_signal_t     interrupt;          /* Ctrl-C                           */
+#ifndef _WIN32
+    uv_signal_t     terminate;          /* SIGTERM                          */
+#endif
+    uint8_t         trackerUp;          /* trackerInit() succeeded          */
+    parserContext  *context;
+    const parserTorrent *torrent;
+    uint8_t         stopping;           /* telling the trackers we leave    */
+    uint8_t         complete;           /* everything wanted is on disk     */
+    uint8_t         failed;
+    uint64_t        startedAt;          /* uv_hrtime() when the files were ready */
+    uint64_t        lastReport;         /* uv_now() of the last progress line */
+    uint64_t        reportReceived;     /* bytes received at that line       */
+    uint64_t        reportSent;         /* bytes uploaded at that line       */
 } downloadRun;
 
 static void formatBytes(uint64_t bytes, char *out, size_t size)
@@ -1130,23 +1142,165 @@ static void onProgressTick(uv_timer_t *timer)
     downloadProgress progress;
     uint64_t         now = uv_now(timer->loop);
     uint64_t         elapsed = now - run->lastReport;
-    char             speed[32];
+    char             down[32];
+    char             up[32];
 
     if (run->transfer == NULL || elapsed == 0) {
         return;
     }
     downloadGetProgress(run->transfer, &progress);
-    formatBytes((progress.bytesReceived - run->reportBytes) * 1000u / elapsed, speed, sizeof(speed));
-    printf("  %5.1f%%  %" PRIu32 "/%" PRIu32 " pieces  %9s/s  peers %" PRIu32 " connected,"
-           " %" PRIu32 " unchoking, %" PRIu32 " sending%s\n",
-           (progress.wanted > 0) ? 100.0 * progress.done / progress.wanted : 100.0,
-           progress.done, progress.wanted, speed, progress.peersConnected,
-           progress.peersUnchoking, progress.peersDownloading,
-           progress.endgame ? "  [endgame]" : "");
+    formatBytes((progress.bytesReceived - run->reportReceived) * 1000u / elapsed, down,
+                sizeof(down));
+    formatBytes((progress.bytesUploaded - run->reportSent) * 1000u / elapsed, up, sizeof(up));
+    if (progress.seeding) {
+        printf("  seeding  up %9s/s  peers %" PRIu32 " connected (%" PRIu32 " incoming),"
+               " %" PRIu32 " interested, uploading to %" PRIu32 "\n",
+               up, progress.peersConnected, progress.peersIncoming, progress.peersInterested,
+               progress.peersUploading);
+    } else {
+        printf("  %5.1f%%  %" PRIu32 "/%" PRIu32 "  down %9s/s  up %9s/s  peers %" PRIu32
+               " (%" PRIu32 " in), %" PRIu32 " unchoking us, %" PRIu32 " sending, uploading to %"
+               PRIu32 "%s\n",
+               (progress.wanted > 0) ? 100.0 * progress.done / progress.wanted : 100.0,
+               progress.done, progress.wanted, down, up, progress.peersConnected,
+               progress.peersIncoming, progress.peersUnchoking, progress.peersDownloading,
+               progress.peersUploading, progress.endgame ? "  [endgame]" : "");
+    }
     fflush(stdout);
     run->lastReport = now;
-    run->reportBytes = progress.bytesReceived;
+    run->reportReceived = progress.bytesReceived;
+    run->reportSent = progress.bytesUploaded;
 }
+
+/* --- Trackers ----------------------------------------------------------- */
+
+static void getAnnounceStats(void *privateArg, announceStats *stats)
+{
+    downloadRun     *run = privateArg;
+    downloadProgress progress;
+
+    downloadGetProgress(run->transfer, &progress);
+    stats->uploaded = progress.bytesUploaded;
+    stats->downloaded = progress.bytesReceived;
+    stats->left = progress.left;
+}
+
+static void onAnnouncePeers(void *privateArg, const trackerPeer *peers, uint32_t count)
+{
+    downloadRun            *run = privateArg;
+    struct sockaddr_storage address;
+    uint32_t                i;
+
+    for (i = 0; i < count && run->transfer != NULL; i++) {
+        toSocketAddress(&peers[i], &address);
+        downloadAddPeer(run->transfer, (const struct sockaddr *)&address);
+    }
+}
+
+static void onAnnounceResult(void *privateArg, const char *url, uint32_t event, int32_t status,
+                             const trackerResult *result)
+{
+    static const char *events[] = { "", " (started)", " (completed)", " (stopped)" };
+
+    (void)privateArg;
+    printf("  tracker %s%s: ", url, events[event <= TRACKER_EVENT_STOPPED ? event : 0]);
+    if (result == NULL) {
+        printf("could not announce: %s\n", trackerStatusString(status));
+    } else if (status != TRACKER_OK) {
+        printf("%s\n", (result->failureReason != NULL) ? result->failureReason
+                       : (result->errorMessage != NULL) ? result->errorMessage
+                                                         : trackerStatusString(status));
+    } else {
+        printf("%" PRIu32 " peer%s", result->peerCount, (result->peerCount == 1u) ? "" : "s");
+        if (result->seeders >= 0 && result->leechers >= 0) {
+            printf(" (%" PRId64 " seeders, %" PRId64 " leechers)", result->seeders,
+                   result->leechers);
+        }
+        printf(", next in %" PRIu32 " s\n", result->interval);
+    }
+    fflush(stdout);
+}
+
+/* --- Shutting down ------------------------------------------------------ */
+
+static void closeRun(downloadRun *run)
+{
+    if (run->trackers != NULL) {
+        announceEnd(run->trackers);
+        run->trackers = NULL;
+    }
+    if (run->transfer != NULL) {
+        downloadEnd(run->transfer);
+        run->transfer = NULL;
+    }
+    uv_timer_stop(&run->timer);
+    uv_signal_stop(&run->interrupt);
+#ifndef _WIN32
+    uv_signal_stop(&run->terminate);
+#endif
+}
+
+static void onTrackersStopped(void *privateArg)
+{
+    closeRun(privateArg);
+}
+
+/* Leave the swarm: tell the trackers (a few seconds at most), then stop. */
+static void stopRun(downloadRun *run)
+{
+    if (run->stopping) {
+        return;
+    }
+    run->stopping = 1;
+    if (run->trackers != NULL) {
+        printf("Telling the trackers we are leaving...\n");
+        fflush(stdout);
+        announceStop(run->trackers, 5u, onTrackersStopped, run);
+    } else {
+        closeRun(run);
+    }
+}
+
+static int downloadIsSeeding(const download *transfer)
+{
+    downloadProgress progress;
+
+    downloadGetProgress(transfer, &progress);
+    return progress.seeding;
+}
+
+static void onInterrupt(uv_signal_t *signal, int number)
+{
+    downloadRun *run = signal->data;
+
+    (void)number;
+    if (run->stopping) {
+        printf("\nStopping now.\n");
+        closeRun(run);                              /* second Ctrl-C: do not wait */
+        return;
+    }
+    if (run->transfer != NULL && !run->complete && !downloadIsSeeding(run->transfer)) {
+        downloadProgress progress;
+        char             sent[32];
+
+        downloadGetProgress(run->transfer, &progress);
+        formatBytes(progress.bytesUploaded, sent, sizeof(sent));
+        printf("\nInterrupted: %" PRIu32 " of %" PRIu32 " pieces on disk, %s uploaded;"
+               " run again to resume.\n", progress.done, progress.wanted, sent);
+    } else if (run->transfer != NULL) {
+        downloadProgress progress;
+        char             sent[32];
+
+        downloadGetProgress(run->transfer, &progress);
+        formatBytes(progress.bytesUploaded, sent, sizeof(sent));
+        printf("\nStopped seeding: %s uploaded in total.\n", sent);
+    } else {
+        printf("\nInterrupted.\n");
+    }
+    stopRun(run);
+}
+
+/* --- Download events ---------------------------------------------------- */
 
 static void onDownloadReady(void *privateArg, download *transfer, int32_t status,
                             const char *message)
@@ -1154,6 +1308,7 @@ static void onDownloadReady(void *privateArg, download *transfer, int32_t status
     downloadRun     *run = privateArg;
     downloadProgress progress;
 
+    (void)message;
     if (status != DOWNLOAD_OK) {
         return;                                     /* onDownloadFinished reports it */
     }
@@ -1164,15 +1319,27 @@ static void onDownloadReady(void *privateArg, download *transfer, int32_t status
                progress.resumed, progress.pieceCount);
     }
     if (progress.done < progress.wanted) {
-        printf("\nDownloading %" PRIu32 " piece(s) from up to %" PRIu32 " peer(s)\n",
-               progress.wanted - progress.done, run->peerCount);
+        printf("\nDownloading %" PRIu32 " piece(s); Ctrl-C to stop\n",
+               progress.wanted - progress.done);
     }
     fflush(stdout);
-    (void)message;
     run->startedAt = uv_hrtime();
-    run->lastReport = uv_now(run->timer.loop);
+    run->lastReport = uv_now(run->loop);
     uv_timer_start(&run->timer, onProgressTick, 2000u, 2000u);
-    run->timerStarted = 1;
+
+    /* Announce now that "left" is known. */
+    if (run->trackerUp && run->trackers == NULL) {
+        static const announceEvents callbacks = { getAnnounceStats, onAnnouncePeers,
+                                                  onAnnounceResult };
+
+        status = announceBegin(run->loop, run->context, run->torrent, &callbacks, run,
+                               &run->trackers);
+        if (status == ANNOUNCE_ENOTRACKERS) {
+            printf("The torrent lists no trackers.\n");
+        } else if (status != ANNOUNCE_OK) {
+            printf("Could not start announcing.\n");
+        }
+    }
 }
 
 static void onDownloadEvent(void *privateArg, download *transfer, const char *message)
@@ -1183,55 +1350,75 @@ static void onDownloadEvent(void *privateArg, download *transfer, const char *me
     fflush(stdout);
 }
 
+static void reportDownload(downloadRun *run, download *transfer)
+{
+    downloadProgress progress;
+    double           seconds = (double)(uv_hrtime() - run->startedAt) / 1e9;
+    char             size[32];
+    char             wasted[32];
+    char             sent[32];
+
+    downloadGetProgress(transfer, &progress);
+    formatBytes(progress.bytesReceived, size, sizeof(size));
+    formatBytes(progress.bytesWasted, wasted, sizeof(wasted));
+    formatBytes(progress.bytesUploaded, sent, sizeof(sent));
+    printf("\nDownload complete: %s\n  %" PRIu32 " piece(s), %s received in %.1f s"
+           " (%.1f KiB/s)", downloadRoot(transfer), progress.done - progress.resumed, size,
+           seconds, (seconds > 0.0) ? (double)progress.bytesReceived / 1024.0 / seconds : 0.0);
+    if (progress.bytesWasted > 0 || progress.hashFailures > 0) {
+        printf("; %s wasted, %" PRIu32 " piece(s) failed verification", wasted,
+               progress.hashFailures);
+    }
+    printf("; %s uploaded\n", sent);
+    fflush(stdout);
+}
+
+static void onDownloadComplete(void *privateArg, download *transfer)
+{
+    downloadRun *run = privateArg;
+
+    run->complete = 1;
+    reportDownload(run, transfer);
+    if (run->trackers != NULL) {
+        announceCompleted(run->trackers);
+    }
+}
+
 static void onDownloadFinished(void *privateArg, download *transfer, int32_t status,
                                const char *message)
 {
     downloadRun     *run = privateArg;
     downloadProgress progress;
-    double           seconds;
-    char             size[32];
-    char             wasted[32];
 
     downloadGetProgress(transfer, &progress);
-    if (status == DOWNLOAD_OK && progress.done > progress.resumed) {
-        seconds = (double)(uv_hrtime() - run->startedAt) / 1e9;
-        formatBytes(progress.bytesReceived, size, sizeof(size));
-        formatBytes(progress.bytesWasted, wasted, sizeof(wasted));
-        printf("\nDownload complete: %s\n  %" PRIu32 " piece(s), %s received in %.1f s"
-               " (%.1f KiB/s)", downloadRoot(transfer), progress.done - progress.resumed,
-               size, seconds, (seconds > 0.0) ? (double)progress.bytesReceived / 1024.0 / seconds : 0.0);
-        if (progress.bytesWasted > 0 || progress.hashFailures > 0) {
-            printf("; %s wasted, %" PRIu32 " piece(s) failed verification", wasted,
-                   progress.hashFailures);
-        }
-        printf("\n");
-    } else if (status == DOWNLOAD_OK) {
+    if (status == DOWNLOAD_OK && !run->complete) {
         printf("\nNothing to download: %s\n", message);
-    } else {
+        run->complete = 1;
+    } else if (status != DOWNLOAD_OK) {
         printf("\nDownload failed: %s (%" PRIu32 " of %" PRIu32 " pieces on disk)\n", message,
                progress.done, progress.wanted);
+        run->failed = 1;
     }
     fflush(stdout);
-    run->result = (status == DOWNLOAD_OK) ? 0 : -1;
-    if (run->timerStarted) {
-        uv_timer_stop(&run->timer);
-    }
-    downloadEnd(transfer);
-    run->transfer = NULL;
+    stopRun(run);
 }
 
-/* Download the torrent (or piece 'wanted') into 'directory'. */
+/*
+ * Download the torrent (or piece 'wanted') into 'directory' from the peers
+ * the trackers give, re-announcing as they ask, accepting connections on
+ * 'listenPort' (0: none), and, with 'seed', serving peers once complete
+ * until Ctrl-C.
+ */
 static int downloadTorrent(uv_loop_t *loop, parserContext *context, const parserTorrent *torrent,
-                           const peerAttempt *found, uint32_t count,
-                           const uint8_t peerId[PEER_ID_LENGTH], uint32_t timeoutSeconds,
-                           int64_t wanted, const char *directory)
+                           const trackerConfig *config, uint32_t timeoutSeconds, int64_t wanted,
+                           const char *directory, uint16_t listenPort, uint8_t seed)
 {
-    downloadEvents          events = { onDownloadReady, onDownloadEvent, onDownloadFinished };
-    downloadOptions         options;
-    downloadRun             run;
-    struct sockaddr_storage address;
-    uint32_t                i;
-    int32_t                 status;
+    downloadEvents  events = { onDownloadReady, onDownloadEvent, onDownloadFinished,
+                               onDownloadComplete };
+    downloadOptions options;
+    trackerConfig   trackerSettings = *config;
+    downloadRun     run;
+    int32_t         status;
 
     if (wanted >= (int64_t)torrent->pieceCount) {
         printf("\nPiece %" PRId64 " does not exist: the torrent has %" PRIu32 " pieces.\n",
@@ -1239,33 +1426,74 @@ static int downloadTorrent(uv_loop_t *loop, parserContext *context, const parser
         return -1;
     }
     memset(&run, 0, sizeof(run));
-    run.result = -1;
+    run.loop = loop;
+    run.context = context;
+    run.torrent = torrent;
     memset(&options, 0, sizeof(options));
-    memcpy(options.peerId, peerId, PEER_ID_LENGTH);
+    memcpy(options.peerId, config->peerId, PEER_ID_LENGTH);
     options.directory = directory;
     options.handshakeTimeoutSeconds = timeoutSeconds;
     options.onlyPiece = wanted;
+    options.listenPort = listenPort;
+    options.seed = seed;
 
     uv_timer_init(loop, &run.timer);
     run.timer.data = &run;
+    uv_signal_init(loop, &run.interrupt);
+    run.interrupt.data = &run;
+#ifndef _WIN32
+    uv_signal_init(loop, &run.terminate);
+    run.terminate.data = &run;
+#endif
 
+    if (peerInit(loop, context, config->binding) != PEER_OK) {
+        printf("Could not start the peer module.\n");
+        run.failed = 1;
+        goto done;
+    }
     printf("\nChecking files...\n");
     fflush(stdout);
     status = downloadBegin(loop, context, torrent, &options, &events, &run, &run.transfer);
     if (status != DOWNLOAD_OK) {
         printf("Could not start the download: %s\n", downloadStatusString(status));
-    } else {
-        for (i = 0; i < count; i++) {
-            toSocketAddress(&found[i].peer, &address);
-            if (downloadAddPeer(run.transfer, (const struct sockaddr *)&address) == DOWNLOAD_OK) {
-                run.peerCount++;
-            }
-        }
-        uv_run(loop, UV_RUN_DEFAULT);               /* until onDownloadFinished */
+        run.failed = 1;
+        peerShutdown();
+        goto done;
     }
+    if (listenPort != 0) {
+        if (downloadListenPort(run.transfer) != 0) {
+            printf("Listening:  port %u\n", (unsigned)downloadListenPort(run.transfer));
+            trackerSettings.port = downloadListenPort(run.transfer);
+        } else {
+            printf("Listening:  could not open ports %u-%u; outgoing connections only\n",
+                   (unsigned)listenPort, (unsigned)(listenPort + DOWNLOAD_LISTEN_ATTEMPTS - 1u));
+        }
+    }
+    status = trackerInit(loop, context, &trackerSettings);
+    if (status == TRACKER_OK) {
+        run.trackerUp = 1;                          /* announcing starts once ready */
+    } else {
+        printf("trackerInit: %s\n", trackerStatusString(status));
+    }
+    uv_signal_start(&run.interrupt, onInterrupt, SIGINT);
+#ifndef _WIN32
+    uv_signal_start(&run.terminate, onInterrupt, SIGTERM);
+#endif
+
+    uv_run(loop, UV_RUN_DEFAULT);                   /* until closeRun() */
+    peerShutdown();
+    if (run.trackerUp) {
+        trackerShutdown();
+    }
+
+done:
     uv_close((uv_handle_t *)&run.timer, NULL);
+    uv_close((uv_handle_t *)&run.interrupt, NULL);
+#ifndef _WIN32
+    uv_close((uv_handle_t *)&run.terminate, NULL);
+#endif
     uv_run(loop, UV_RUN_DEFAULT);                   /* closing handles */
-    return run.result;
+    return (run.complete && !run.failed) ? 0 : -1;
 }
 
 /* ------------------------------------------------------------------------ */
@@ -1522,7 +1750,7 @@ done:
 static int announceTorrent(parserContext *context, const parserAllocator *allocator,
                            const char *path, uint32_t timeoutSeconds, const char *caFile,
                            uint32_t mode, int64_t wanted, const char *outputDirectory,
-                           const netBinding *binding)
+                           const netBinding *binding, uint16_t listenPort, uint8_t seed)
 {
     static const char alphabet[] = "0123456789abcdefghijklmnopqrstuvwxyz";
     const parserTier *tier;
@@ -1568,11 +1796,18 @@ static int announceTorrent(parserContext *context, const parserAllocator *alloca
     for (i = 0; i < sizeof(randomBytes); i++) {
         config.peerId[8 + i] = (uint8_t)alphabet[randomBytes[i] % (sizeof(alphabet) - 1u)];
     }
-    config.port = 6881;
+    config.port = (listenPort != 0) ? listenPort : 6881;
     config.caFile = caFile;
     config.binding = binding;
 
     uv_loop_init(&loop);
+    if (mode == MODE_DOWNLOAD) {
+        downloaded = (downloadTorrent(&loop, context, &torrent, &config, timeoutSeconds, wanted,
+                                      outputDirectory, listenPort, seed) == 0);
+        uv_loop_close(&loop);
+        parserFree(context, &torrent);
+        return downloaded ? 0 : -1;
+    }
     status = trackerInit(&loop, context, &config);
     if (status != TRACKER_OK) {
         fprintf(stderr, "trackerInit: %s\n", trackerStatusString(status));
@@ -1639,10 +1874,6 @@ static int announceTorrent(parserContext *context, const parserAllocator *alloca
             if (mode == MODE_PEERS) {
                 handshakes = handshakePeers(&loop, attempts, attemptCount, infoHash,
                                             config.peerId, pieceCount, timeoutSeconds);
-            } else {
-                downloaded = (downloadTorrent(&loop, context, &torrent, attempts,
-                                              attemptCount, config.peerId, timeoutSeconds,
-                                              wanted, outputDirectory) == 0);
             }
             peerShutdown();
         }
@@ -1654,9 +1885,6 @@ static int announceTorrent(parserContext *context, const parserAllocator *alloca
     parserFree(context, &torrent);
     if (mode == MODE_PEERS) {
         return (handshakes > 0) ? 0 : -1;
-    }
-    if (mode == MODE_DOWNLOAD) {
-        return downloaded ? 0 : -1;
     }
     return (succeeded > 0) ? 0 : -1;
 }
@@ -1771,8 +1999,8 @@ static void usage(const char *program)
             "       %s -o <output.torrent> [options] <file>...\n"
             "       %s -t [-T seconds] [-C ca.pem] [-I interface] <file.torrent>\n"
             "       %s -P [-T seconds] [-C ca.pem] [-I interface] <file.torrent>\n"
-            "       %s -D [-O dir] [-i piece] [-T seconds] [-C ca.pem] [-I interface]\n"
-            "            <file.torrent>\n"
+            "       %s -D [-S] [-L port] [-O dir] [-i piece] [-T seconds] [-C ca.pem]\n"
+            "            [-I interface] <file.torrent>\n"
             "       %s -V [-O dir] <file.torrent>\n"
             "\n"
             "  -o file   create a torrent from the given files and write it to 'file'\n"
@@ -1787,8 +2015,12 @@ static void usage(const char *program)
             "  -t        announce to every tracker in the torrent and list the peers\n"
             "  -P        announce, then contact each peer found (up to 200): handshake,\n"
             "            send interested, report its pieces and whether it unchokes us\n"
-            "  -D        announce, then download the torrent from all the peers found\n"
-            "            at once (up to 50 connected); re-run to resume\n"
+            "  -D        download the torrent from the peers the trackers give (up to 50\n"
+            "            at once), uploading to peers too; trackers are re-announced to\n"
+            "            as they ask; Ctrl-C stops and tells them; re-run to resume\n"
+            "  -S        with -D: keep running once complete, seeding until Ctrl-C\n"
+            "  -L port   with -D: accept peer connections on this port, or the next\n"
+            "            free one of the 9 after it (default 6881; 0: do not listen)\n"
             "  -V        verify downloaded data against the torrent (no network, changes\n"
             "            nothing): each file's state, bytes verified, missing pieces;\n"
             "            exit status 0 if complete, 2 if not, 1 on error\n"
@@ -1812,8 +2044,11 @@ int main(int argc, char **argv)
     const char    **webSeeds = NULL;
     const char     *outputPath = NULL;
     uint8_t         createOnly = 0;     /* an option that only makes sense with -o */
-    uint8_t         announce = 0;
+    uint8_t         announceMode = 0;
     uint8_t         verify = 0;         /* -V */
+    uint8_t         seed = 0;           /* -S */
+    uint32_t        listenPort = 6881;  /* -L */
+    uint8_t         downloadOnly = 0;   /* -S or -L given */
     const char     *interfaceSpec = NULL;   /* -I */
     netBinding      binding;
     uint8_t         directoryGiven = 0; /* -O */
@@ -1864,7 +2099,7 @@ int main(int argc, char **argv)
     options.trackers = (const char *const *)trackers;
     options.webSeeds = (const char *const *)webSeeds;
 
-    while ((option = nextOption(argc, argv, "o:a:w:c:n:l:ptPDVO:i:T:C:I:h")) != -1) {
+    while ((option = nextOption(argc, argv, "o:a:w:c:n:l:ptPDVSL:O:i:T:C:I:h")) != -1) {
         switch (option) {
         case 'o':
             outputPath = optionValue;
@@ -1898,16 +2133,32 @@ int main(int argc, char **argv)
             createOnly = 1;
             break;
         case 't':
-            announce = 1;
+            announceMode = 1;
             break;
         case 'P':
-            announce = 1;
+            announceMode = 1;
             mode = MODE_PEERS;
             break;
         case 'D':
-            announce = 1;
+            announceMode = 1;
             mode = MODE_DOWNLOAD;
             break;
+        case 'S':
+            seed = 1;
+            downloadOnly = 1;
+            break;
+        case 'L': {
+            char         *portEnd;
+            unsigned long value = strtoul(optionValue, &portEnd, 10);
+
+            if (*portEnd != '\0' || portEnd == optionValue || value > 65535u) {
+                fprintf(stderr, "-L: not a port number: %s\n", optionValue);
+                goto cleanup;
+            }
+            listenPort = (uint32_t)value;
+            downloadOnly = 1;
+            break;
+        }
         case 'V':
             verify = 1;
             break;
@@ -1951,23 +2202,24 @@ int main(int argc, char **argv)
         }
     }
 
-    if ((announceOnly && !announce) || (directoryGiven && !verify && mode != MODE_DOWNLOAD)) {
+    if ((announceOnly && !announceMode) || (directoryGiven && !verify && mode != MODE_DOWNLOAD) ||
+        (downloadOnly && mode != MODE_DOWNLOAD)) {
         usage(argv[0]);
         goto cleanup;
     }
 
     if (verify) {
-        if (announce || announceOnly || outputPath != NULL || createOnly || argc - optionIndex != 1) {
+        if (announceMode || announceOnly || outputPath != NULL || createOnly || argc - optionIndex != 1) {
             usage(argv[0]);
             goto cleanup;
         }
         status = verifyTorrent(&context, &allocator, argv[optionIndex], outputDirectory);
-    } else if (announce) {
+    } else if (announceMode) {
         if (outputPath != NULL || createOnly || argc - optionIndex != 1) {
             usage(argv[0]);
             goto cleanup;
         }
-        if ((wanted >= 0 || outputDirectory[0] != '\0') && mode != MODE_DOWNLOAD) {
+        if ((wanted >= 0 || outputDirectory[0] != '\0' || downloadOnly) && mode != MODE_DOWNLOAD) {
             usage(argv[0]);
             goto cleanup;
         }
@@ -1988,7 +2240,8 @@ int main(int argc, char **argv)
             printf("            (DNS lookups still use the system's resolver)\n");
         }
         status = announceTorrent(&context, &allocator, argv[optionIndex], timeoutSeconds, caFile,
-                                 mode, wanted, outputDirectory, &binding);
+                                 mode, wanted, outputDirectory, &binding, (uint16_t)listenPort,
+                                 seed);
     } else if (outputPath != NULL) {
         if (optionIndex >= argc) {
             usage(argv[0]);

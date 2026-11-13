@@ -69,6 +69,19 @@ struct storage {
     uint8_t                 closed;
 };
 
+typedef struct storageRead {
+    uv_work_t               work;
+    storage                *store;
+    uint32_t                index;
+    uint32_t                begin;
+    uint32_t                length;
+    uint8_t                *data;
+    storageReadCallback     callback;
+    void                   *privateArg;
+    int32_t                 result;
+    char                    message[STORAGE_ERROR_MESSAGE_LENGTH];
+} storageRead;
+
 typedef struct storageWrite {
     uv_work_t               work;
     storage                *store;
@@ -208,11 +221,10 @@ static uint32_t findFile(const storage *store, uint64_t position)
  * For reads, *missing is set if a file is absent or too short. Returns
  * STORAGE_OK or STORAGE_EIO with 'message' describing the failure.
  */
-static int32_t pieceIo(const storage *store, uint32_t index, uint8_t *buffer, uint8_t write,
-                       char *message, size_t messageSize, uint8_t *missing)
+static int32_t rangeIo(const storage *store, uint64_t position, uint32_t remaining,
+                       uint8_t *buffer, uint8_t write, char *message, size_t messageSize,
+                       uint8_t *missing)
 {
-    uint64_t     position = (uint64_t)index * store->pieceLength;
-    uint32_t     remaining = pieceSize(store, index);
     uint32_t     fileIndex = findFile(store, position);
     uint32_t     done;
     uint32_t     count;
@@ -275,6 +287,13 @@ static int32_t pieceIo(const storage *store, uint32_t index, uint8_t *buffer, ui
         remaining -= chunk;
     }
     return STORAGE_OK;
+}
+
+static int32_t pieceIo(const storage *store, uint32_t index, uint8_t *buffer, uint8_t write,
+                       char *message, size_t messageSize, uint8_t *missing)
+{
+    return rangeIo(store, (uint64_t)index * store->pieceLength, pieceSize(store, index), buffer,
+                   write, message, messageSize, missing);
 }
 
 /* Worker thread: does piece 'index' lie entirely in data that existed before? */
@@ -696,6 +715,85 @@ int32_t storageGetFile(const storage *store, uint32_t index, storageFileState *s
 const char *storageRoot(const storage *store)
 {
     return (store != NULL) ? store->root : NULL;
+}
+
+static void readWork(uv_work_t *work)
+{
+    storageRead *job = work->data;
+    uint8_t      missing = 0;
+
+    job->result = rangeIo(job->store, (uint64_t)job->index * job->store->pieceLength + job->begin,
+                          job->length, job->data, 0, job->message, sizeof(job->message),
+                          &missing);
+    if (job->result == STORAGE_OK && missing) {
+        snprintf(job->message, sizeof(job->message), "piece %u is no longer on disk",
+                 (unsigned)job->index);
+        job->result = STORAGE_EIO;
+    }
+}
+
+static void readDone(uv_work_t *work, int status)
+{
+    storageRead   *job = work->data;
+    storage       *store = job->store;
+    parserContext *context = store->context;
+
+    if (status == UV_ECANCELED) {
+        job->result = STORAGE_ECANCELLED;
+    }
+    if (!store->closed && job->callback != NULL) {
+        uint8_t *data = (job->result == STORAGE_OK) ? job->data : NULL;
+
+        if (data == NULL) {
+            release(context, job->data);
+        }
+        job->callback(job->privateArg, store, job->index, job->begin, job->length, data,
+                      job->result,
+                      (job->result == STORAGE_OK) ? NULL
+                      : (job->message[0] != '\0') ? job->message
+                                                  : storageStatusString(job->result));
+    } else {
+        release(context, job->data);
+    }
+    release(context, job);
+    store->jobs--;
+    maybeFree(store);
+}
+
+int32_t storageReadBlock(storage *store, uint32_t pieceIndex, uint32_t begin, uint32_t length,
+                         uint8_t *data, storageReadCallback callback, void *privateArg)
+{
+    storageRead *job;
+
+    if (store == NULL || data == NULL) {
+        return STORAGE_EINVAL;
+    }
+    if (!store->opened || store->closed || pieceIndex >= store->pieceCount || length == 0 ||
+        (uint64_t)begin + length > pieceSize(store, pieceIndex) ||
+        !messageBitfieldGet(store->have, pieceIndex)) {
+        release(store->context, data);
+        return STORAGE_EINVAL;
+    }
+    job = allocate(store->context, sizeof(*job));
+    if (job == NULL) {
+        release(store->context, data);
+        return STORAGE_ENOMEM;
+    }
+    job->store = store;
+    job->index = pieceIndex;
+    job->begin = begin;
+    job->length = length;
+    job->data = data;
+    job->callback = callback;
+    job->privateArg = privateArg;
+    job->work.data = job;
+    if (uv_queue_work(store->loop, &job->work, readWork, readDone) != 0) {
+        release(store->context, data);
+        release(store->context, job);
+        return STORAGE_EIO;
+    }
+    store->jobs++;
+    return STORAGE_OK;
 }
 
 void storageClose(storage *store)

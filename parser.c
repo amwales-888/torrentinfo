@@ -41,13 +41,6 @@
 #define PARSER_KEY_PATH             (1u << 6)
 #define PARSER_KEY_ATTR             (1u << 7)
 
-typedef struct parserCursor {
-    const uint8_t *buffer;
-    uint64_t       length;
-    uint64_t       position;
-    uint32_t       depth;
-} parserCursor;
-
 /* ======================================================================== */
 /* SHA-1 (FIPS 180-1), used for the info hash                               */
 /* ======================================================================== */
@@ -213,7 +206,7 @@ static void resetTorrent(parserTorrent *torrent)
 /* Bencode primitives                                                       */
 /* ======================================================================== */
 
-static int32_t cursorPeek(const parserCursor *cursor)
+int32_t parserCursorPeek(const parserCursor *cursor)
 {
     if (cursor->position >= cursor->length) {
         return -1;
@@ -228,7 +221,7 @@ static uint8_t isDigit(int32_t c)
 
 static int32_t expectByte(parserCursor *cursor, uint8_t value)
 {
-    int32_t c = cursorPeek(cursor);
+    int32_t c = parserCursorPeek(cursor);
 
     if (c < 0) {
         return PARSER_ERROR_TRUNCATED;
@@ -241,7 +234,7 @@ static int32_t expectByte(parserCursor *cursor, uint8_t value)
 }
 
 /* i<digits>e  - no leading zeros, no "-0" */
-static int32_t readInteger(parserCursor *cursor, int64_t *value)
+int32_t parserReadInteger(parserCursor *cursor, int64_t *value)
 {
     uint64_t magnitude = 0;
     uint64_t digits = 0;
@@ -251,13 +244,13 @@ static int32_t readInteger(parserCursor *cursor, int64_t *value)
 
     PARSER_TRY(expectByte(cursor, 'i'));
 
-    if (cursorPeek(cursor) == '-') {
+    if (parserCursorPeek(cursor) == '-') {
         negative = 1;
         cursor->position++;
     }
     limit = negative ? (uint64_t)INT64_MAX + 1u : (uint64_t)INT64_MAX;
 
-    while (isDigit(c = cursorPeek(cursor))) {
+    while (isDigit(c = parserCursorPeek(cursor))) {
         uint64_t digit = (uint64_t)(c - '0');
 
         if (digits > 0 && magnitude == 0) {
@@ -290,13 +283,13 @@ static int32_t readInteger(parserCursor *cursor, int64_t *value)
 }
 
 /* <length>:<bytes>  - returns a pointer into the buffer, nothing copied */
-static int32_t readString(parserCursor *cursor, const uint8_t **data, uint64_t *length)
+int32_t parserReadString(parserCursor *cursor, const uint8_t **data, uint64_t *length)
 {
     uint64_t magnitude = 0;
     uint64_t digits = 0;
     int32_t  c;
 
-    while (isDigit(c = cursorPeek(cursor))) {
+    while (isDigit(c = parserCursorPeek(cursor))) {
         uint64_t digit = (uint64_t)(c - '0');
 
         if (digits > 0 && magnitude == 0) {
@@ -325,7 +318,7 @@ static int32_t readString(parserCursor *cursor, const uint8_t **data, uint64_t *
 }
 
 /* Consume 'l' or 'd' and enter a container. */
-static int32_t containerBegin(parserCursor *cursor, uint8_t type)
+int32_t parserContainerBegin(parserCursor *cursor, uint8_t type)
 {
     PARSER_TRY(expectByte(cursor, type));
     if (++cursor->depth > PARSER_MAX_DEPTH) {
@@ -335,9 +328,9 @@ static int32_t containerBegin(parserCursor *cursor, uint8_t type)
 }
 
 /* Sets *more to 0 and consumes 'e' at the end of a container, else sets 1. */
-static int32_t containerNext(parserCursor *cursor, uint8_t *more)
+int32_t parserContainerNext(parserCursor *cursor, uint8_t *more)
 {
-    int32_t c = cursorPeek(cursor);
+    int32_t c = parserCursorPeek(cursor);
 
     if (c < 0) {
         return PARSER_ERROR_TRUNCATED;
@@ -353,34 +346,34 @@ static int32_t containerNext(parserCursor *cursor, uint8_t *more)
 }
 
 /* Skip over any single bencoded value. */
-static int32_t skipValue(parserCursor *cursor)
+int32_t parserSkipValue(parserCursor *cursor)
 {
     const uint8_t *data;
     uint64_t       length;
     int64_t        integer;
     uint8_t        more;
-    int32_t        c = cursorPeek(cursor);
+    int32_t        c = parserCursorPeek(cursor);
 
     if (c < 0) {
         return PARSER_ERROR_TRUNCATED;
     }
     if (c == 'i') {
-        return readInteger(cursor, &integer);
+        return parserReadInteger(cursor, &integer);
     }
     if (isDigit(c)) {
-        return readString(cursor, &data, &length);
+        return parserReadString(cursor, &data, &length);
     }
     if (c == 'l' || c == 'd') {
-        PARSER_TRY(containerBegin(cursor, (uint8_t)c));
+        PARSER_TRY(parserContainerBegin(cursor, (uint8_t)c));
         for (;;) {
-            PARSER_TRY(containerNext(cursor, &more));
+            PARSER_TRY(parserContainerNext(cursor, &more));
             if (!more) {
                 break;
             }
             if (c == 'd') {
-                PARSER_TRY(readString(cursor, &data, &length));
+                PARSER_TRY(parserReadString(cursor, &data, &length));
             }
-            PARSER_TRY(skipValue(cursor));
+            PARSER_TRY(parserSkipValue(cursor));
         }
         return PARSER_OK;
     }
@@ -413,7 +406,7 @@ static int32_t readOwnedString(parserContext *context, parserCursor *cursor, cha
     const uint8_t *data;
     uint64_t       length;
 
-    PARSER_TRY(readString(cursor, &data, &length));
+    PARSER_TRY(parserReadString(cursor, &data, &length));
     return copyString(context, data, length, out);
 }
 
@@ -508,13 +501,13 @@ static int32_t parseUrlList(parserContext *context, parserCursor *cursor,
     uint64_t       length;
     uint8_t        more;
 
-    PARSER_TRY(containerBegin(cursor, 'l'));
+    PARSER_TRY(parserContainerBegin(cursor, 'l'));
     for (;;) {
-        PARSER_TRY(containerNext(cursor, &more));
+        PARSER_TRY(parserContainerNext(cursor, &more));
         if (!more) {
             break;
         }
-        PARSER_TRY(readString(cursor, &data, &length));
+        PARSER_TRY(parserReadString(cursor, &data, &length));
         PARSER_TRY(appendUrl(context, list, count, data, length));
     }
     return PARSER_OK;
@@ -527,9 +520,9 @@ static int32_t parseAnnounceList(parserContext *context, parserCursor *cursor,
     parserTier *tier;
     uint8_t     more;
 
-    PARSER_TRY(containerBegin(cursor, 'l'));
+    PARSER_TRY(parserContainerBegin(cursor, 'l'));
     for (;;) {
-        PARSER_TRY(containerNext(cursor, &more));
+        PARSER_TRY(parserContainerNext(cursor, &more));
         if (!more) {
             break;
         }
@@ -561,8 +554,8 @@ static int32_t parseWebSeeds(parserContext *context, parserCursor *cursor,
     const uint8_t *data;
     uint64_t       length;
 
-    if (isDigit(cursorPeek(cursor))) {
-        PARSER_TRY(readString(cursor, &data, &length));
+    if (isDigit(parserCursorPeek(cursor))) {
+        PARSER_TRY(parserReadString(cursor, &data, &length));
         return appendUrl(context, &torrent->webSeeds, &torrent->webSeedCount,
                          data, length);
     }
@@ -575,13 +568,13 @@ static int32_t parsePath(parserContext *context, parserCursor *cursor, parserFil
     uint64_t       length;
     uint8_t        more;
 
-    PARSER_TRY(containerBegin(cursor, 'l'));
+    PARSER_TRY(parserContainerBegin(cursor, 'l'));
     for (;;) {
-        PARSER_TRY(containerNext(cursor, &more));
+        PARSER_TRY(parserContainerNext(cursor, &more));
         if (!more) {
             break;
         }
-        PARSER_TRY(readString(cursor, &data, &length));
+        PARSER_TRY(parserReadString(cursor, &data, &length));
         PARSER_TRY(appendPathComponent(context, file, data, length));
     }
     return PARSER_OK;
@@ -599,17 +592,17 @@ static int32_t parseFileEntry(parserContext *context, parserCursor *cursor,
     uint32_t       seen = 0;
     uint8_t        more;
 
-    PARSER_TRY(containerBegin(cursor, 'd'));
+    PARSER_TRY(parserContainerBegin(cursor, 'd'));
     for (;;) {
-        PARSER_TRY(containerNext(cursor, &more));
+        PARSER_TRY(parserContainerNext(cursor, &more));
         if (!more) {
             break;
         }
-        PARSER_TRY(readString(cursor, &key, &keyLength));
+        PARSER_TRY(parserReadString(cursor, &key, &keyLength));
 
         if (keyEquals(key, keyLength, "length")) {
             PARSER_TRY(markSeen(&seen, PARSER_KEY_LENGTH));
-            PARSER_TRY(readInteger(cursor, &value));
+            PARSER_TRY(parserReadInteger(cursor, &value));
             if (value < 0) {
                 return PARSER_ERROR_INVALID_FIELD;
             }
@@ -619,12 +612,12 @@ static int32_t parseFileEntry(parserContext *context, parserCursor *cursor,
             PARSER_TRY(parsePath(context, cursor, file));
         } else if (keyEquals(key, keyLength, "attr")) {
             PARSER_TRY(markSeen(&seen, PARSER_KEY_ATTR));
-            PARSER_TRY(readString(cursor, &data, &length));
+            PARSER_TRY(parserReadString(cursor, &data, &length));
             if (length > 0 && memchr(data, 'p', (size_t)length) != NULL) {
                 file->isPadding = 1;
             }
         } else {
-            PARSER_TRY(skipValue(cursor));
+            PARSER_TRY(parserSkipValue(cursor));
         }
     }
 
@@ -643,9 +636,9 @@ static int32_t parseFiles(parserContext *context, parserCursor *cursor,
     parserFile *file;
     uint8_t     more;
 
-    PARSER_TRY(containerBegin(cursor, 'l'));
+    PARSER_TRY(parserContainerBegin(cursor, 'l'));
     for (;;) {
-        PARSER_TRY(containerNext(cursor, &more));
+        PARSER_TRY(parserContainerNext(cursor, &more));
         if (!more) {
             break;
         }
@@ -673,31 +666,31 @@ static int32_t parseInfo(parserContext *context, parserCursor *cursor,
     uint8_t        more;
     parserFile    *file;
 
-    PARSER_TRY(containerBegin(cursor, 'd'));
+    PARSER_TRY(parserContainerBegin(cursor, 'd'));
     for (;;) {
-        PARSER_TRY(containerNext(cursor, &more));
+        PARSER_TRY(parserContainerNext(cursor, &more));
         if (!more) {
             break;
         }
-        PARSER_TRY(readString(cursor, &key, &keyLength));
+        PARSER_TRY(parserReadString(cursor, &key, &keyLength));
 
         if (keyEquals(key, keyLength, "name")) {
             PARSER_TRY(markSeen(&seen, PARSER_KEY_NAME));
-            PARSER_TRY(readString(cursor, &data, &length));
+            PARSER_TRY(parserReadString(cursor, &data, &length));
             if (!isSafeComponent(data, length)) {
                 return PARSER_ERROR_INVALID_FIELD;
             }
             PARSER_TRY(copyString(context, data, length, &torrent->name));
         } else if (keyEquals(key, keyLength, "piece length")) {
             PARSER_TRY(markSeen(&seen, PARSER_KEY_PIECE_LENGTH));
-            PARSER_TRY(readInteger(cursor, &value));
+            PARSER_TRY(parserReadInteger(cursor, &value));
             if (value <= 0) {
                 return PARSER_ERROR_INVALID_FIELD;
             }
             torrent->pieceLength = (uint64_t)value;
         } else if (keyEquals(key, keyLength, "pieces")) {
             PARSER_TRY(markSeen(&seen, PARSER_KEY_PIECES));
-            PARSER_TRY(readString(cursor, &data, &length));
+            PARSER_TRY(parserReadString(cursor, &data, &length));
             if (length % PARSER_SHA1_LENGTH != 0 ||
                 length / PARSER_SHA1_LENGTH > UINT32_MAX) {
                 return PARSER_ERROR_INVALID_FIELD;
@@ -712,11 +705,11 @@ static int32_t parseInfo(parserContext *context, parserCursor *cursor,
             torrent->pieceCount = (uint32_t)(length / PARSER_SHA1_LENGTH);
         } else if (keyEquals(key, keyLength, "private")) {
             PARSER_TRY(markSeen(&seen, PARSER_KEY_PRIVATE));
-            PARSER_TRY(readInteger(cursor, &value));
+            PARSER_TRY(parserReadInteger(cursor, &value));
             torrent->isPrivate = (uint8_t)(value == 1);
         } else if (keyEquals(key, keyLength, "length")) {
             PARSER_TRY(markSeen(&seen, PARSER_KEY_LENGTH));
-            PARSER_TRY(readInteger(cursor, &value));
+            PARSER_TRY(parserReadInteger(cursor, &value));
             if (value < 0) {
                 return PARSER_ERROR_INVALID_FIELD;
             }
@@ -725,7 +718,7 @@ static int32_t parseInfo(parserContext *context, parserCursor *cursor,
             PARSER_TRY(markSeen(&seen, PARSER_KEY_FILES));
             PARSER_TRY(parseFiles(context, cursor, torrent));
         } else {
-            PARSER_TRY(skipValue(cursor));
+            PARSER_TRY(parserSkipValue(cursor));
         }
     }
 
@@ -787,17 +780,17 @@ static int32_t parseRoot(parserContext *context, parserCursor *cursor,
     uint32_t       seen = 0;
     uint8_t        more;
 
-    PARSER_TRY(containerBegin(cursor, 'd'));
+    PARSER_TRY(parserContainerBegin(cursor, 'd'));
     for (;;) {
-        PARSER_TRY(containerNext(cursor, &more));
+        PARSER_TRY(parserContainerNext(cursor, &more));
         if (!more) {
             break;
         }
-        PARSER_TRY(readString(cursor, &key, &keyLength));
+        PARSER_TRY(parserReadString(cursor, &key, &keyLength));
 
         if (keyEquals(key, keyLength, "announce")) {
             PARSER_TRY(markSeen(&seen, PARSER_KEY_ANNOUNCE));
-            PARSER_TRY(readString(cursor, &data, &length));
+            PARSER_TRY(parserReadString(cursor, &data, &length));
             if (length > 0) {
                 PARSER_TRY(copyString(context, data, length, &torrent->announce));
             }
@@ -812,7 +805,7 @@ static int32_t parseRoot(parserContext *context, parserCursor *cursor,
             PARSER_TRY(readOwnedString(context, cursor, &torrent->createdBy));
         } else if (keyEquals(key, keyLength, "creation date")) {
             PARSER_TRY(markSeen(&seen, PARSER_KEY_CREATION_DATE));
-            PARSER_TRY(readInteger(cursor, &torrent->creationDate));
+            PARSER_TRY(parserReadInteger(cursor, &torrent->creationDate));
             torrent->hasCreationDate = 1;
         } else if (keyEquals(key, keyLength, "encoding")) {
             PARSER_TRY(markSeen(&seen, PARSER_KEY_ENCODING));
@@ -829,7 +822,7 @@ static int32_t parseRoot(parserContext *context, parserCursor *cursor,
             PARSER_TRY(markSeen(&seen, PARSER_KEY_URL_LIST));
             PARSER_TRY(parseWebSeeds(context, cursor, torrent));
         } else {
-            PARSER_TRY(skipValue(cursor));
+            PARSER_TRY(parserSkipValue(cursor));
         }
     }
 

@@ -190,6 +190,26 @@ void parserFree(parserContext *context, parserTorrent *torrent);
 /* Human-readable description of a PARSER_* return code. Never NULL. */
 const char *parserErrorString(int32_t error);
 
+/* ------------------------------------------------------------------------ */
+/* Low-level bencode reading, shared with other modules (e.g. tracker.c).   */
+/* Strings are returned as pointers into the buffer; nothing is allocated.  */
+/* All functions return PARSER_OK or a PARSER_ERROR_* code.                 */
+/* ------------------------------------------------------------------------ */
+
+typedef struct parserCursor {
+    const uint8_t *buffer;
+    uint64_t       length;
+    uint64_t       position;
+    uint32_t       depth;
+} parserCursor;
+
+int32_t parserCursorPeek(const parserCursor *cursor);  /* Next byte, or -1 at end */
+int32_t parserReadInteger(parserCursor *cursor, int64_t *value);
+int32_t parserReadString(parserCursor *cursor, const uint8_t **data, uint64_t *length);
+int32_t parserContainerBegin(parserCursor *cursor, uint8_t type);  /* 'l' or 'd' */
+int32_t parserContainerNext(parserCursor *cursor, uint8_t *more);  /* 0 at 'e'   */
+int32_t parserSkipValue(parserCursor *cursor);
+
 /* One-shot SHA-1 of 'length' bytes. Used for info hashes and piece hashes. */
 void parserSha1(const uint8_t *data, uint64_t length,
                 uint8_t digest[PARSER_SHA1_LENGTH]);

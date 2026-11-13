@@ -3,8 +3,10 @@
  *
  * Inspect:  ./torrentinfo file.torrent
  * Create:   ./torrentinfo -o out.torrent [options] file1 [file2 ...]
+ * Announce: ./torrentinfo -t [-T seconds] file.torrent
  *
- * Build:    cc -std=c99 -Wall -Wextra -O2 -o torrentinfo main.c parser.c encoder.c
+ * Build:    cc -std=c99 -Wall -Wextra -O2 -o torrentinfo main.c parser.c encoder.c \
+ *               tracker.c $(pkg-config --cflags --libs libuv)
  */
 #define _POSIX_C_SOURCE 200809L
 
@@ -21,9 +23,13 @@
 
 #include "encoder.h"
 #include "parser.h"
+#include "tracker.h"
 
 static const uint64_t maxTorrentSize = 64u * 1024u * 1024u;
 static const uint32_t piecePreviewCount = 3u;
+static const uint32_t peerPreviewCount = 10u;
+static const uint32_t defaultAnnounceTimeout = 15u;
+static int            announceTag;  /* privateArg for tracker requests */
 
 /* ------------------------------------------------------------------------ */
 /* Allocator hooks: wrap the C library and count live allocations so we can */
@@ -493,12 +499,228 @@ static int createTorrent(parserContext *context, const char *outputPath,
 }
 
 /* ------------------------------------------------------------------------ */
+/* Announce mode: ./torrentinfo -t file.torrent                             */
+/* ------------------------------------------------------------------------ */
+
+static void formatPeer(const trackerPeer *peer, char *out, size_t size)
+{
+    char address[64] = "?";
+
+    if (peer->family == TRACKER_FAMILY_IPV4) {
+        uv_inet_ntop(AF_INET, peer->address, address, sizeof(address));
+        snprintf(out, size, "%s:%u", address, (unsigned)peer->port);
+    } else {
+        uv_inet_ntop(AF_INET6, peer->address, address, sizeof(address));
+        snprintf(out, size, "[%s]:%u", address, (unsigned)peer->port);
+    }
+}
+
+static void printCount(const char *label, int64_t value)
+{
+    if (value >= 0) {
+        printf("  %-15s %" PRId64 "\n", label, value);
+    } else {
+        printField(label, NULL);
+    }
+}
+
+static void printTrackerResult(const trackerResult *result, int32_t status)
+{
+    char     peerText[80];
+    uint32_t i;
+
+    printf("\n%s\n", result->url);
+    printField("Status:", trackerStatusString(status));
+    if (result->errorMessage != NULL) {
+        printField("Error:", result->errorMessage);
+    }
+    if (result->failureReason != NULL) {
+        printField("Failure:", result->failureReason);
+    }
+    if (result->warningMessage != NULL) {
+        printField("Warning:", result->warningMessage);
+    }
+    if (status != TRACKER_OK) {
+        return;
+    }
+    printf("  %-15s %" PRIu32 " s", "Interval:", result->interval);
+    if (result->minInterval != 0) {
+        printf(" (minimum %" PRIu32 " s)", result->minInterval);
+    }
+    putchar('\n');
+    printCount("Seeders:", result->seeders);
+    printCount("Leechers:", result->leechers);
+    printf("  %-15s %" PRIu32 "\n", "Peers:", result->peerCount);
+    for (i = 0; i < result->peerCount && i < peerPreviewCount; i++) {
+        formatPeer(&result->peers[i], peerText, sizeof(peerText));
+        printf("    %s\n", peerText);
+    }
+    if (result->peerCount > peerPreviewCount) {
+        printf("    ... and %" PRIu32 " more\n", result->peerCount - peerPreviewCount);
+    }
+}
+
+/* Runs from the libuv loop as each tracker answers (or fails). */
+static void onAnnounceDone(void *privateArg, uint32_t uniqueId)
+{
+    trackerResult result;
+    int32_t       status = trackerInfo(privateArg, uniqueId, &result);
+
+    printTrackerResult(&result, status);
+    fflush(stdout);
+}
+
+/* Start an announce to every distinct tracker URL in the torrent. */
+static uint32_t startAnnounces(const parserTorrent *torrent, const char **seen,
+                               uint32_t timeoutSeconds)
+{
+    const parserTier *tier;
+    const parserUrl  *url;
+    const char       *candidate;
+    uint32_t          seenCount = 0;
+    uint32_t          started = 0;
+    uint32_t          i;
+    uint32_t          id;
+    int32_t           result;
+
+    tier = TAILQ_FIRST(&torrent->announceList);
+    url = NULL;
+    candidate = torrent->announce;
+    for (;;) {
+        if (candidate != NULL) {
+            for (i = 0; i < seenCount && strcmp(seen[i], candidate) != 0; i++) {
+            }
+            if (i == seenCount) {
+                seen[seenCount++] = candidate;
+                result = trackerConnect(torrent->infoHash, candidate, &id, timeoutSeconds,
+                                        onAnnounceDone, &announceTag);
+                if (result == TRACKER_OK) {
+                    started++;
+                } else {
+                    printf("\n%s\n", candidate);
+                    printField("Status:", trackerStatusString(result));
+                    printField("Error:", "not started");
+                }
+            }
+        }
+        /* Next URL: walk each tier's URLs, then move to the next tier. */
+        url = (url != NULL) ? TAILQ_NEXT(url, entries) : NULL;
+        while (url == NULL && tier != NULL) {
+            url = TAILQ_FIRST(&tier->urls);
+            tier = TAILQ_NEXT(tier, entries);
+        }
+        if (url == NULL) {
+            break;
+        }
+        candidate = url->url;
+    }
+    return started;
+}
+
+static int announceTorrent(parserContext *context, const parserAllocator *allocator,
+                           const char *path, uint32_t timeoutSeconds)
+{
+    static const char alphabet[] = "0123456789abcdefghijklmnopqrstuvwxyz";
+    const parserTier *tier;
+    parserTorrent     torrent;
+    trackerConfig     config;
+    trackerResult     result;
+    uv_loop_t         loop;
+    const char      **seen;
+    uint32_t         *ids = NULL;
+    uint8_t          *buffer = NULL;
+    uint8_t           randomBytes[12];
+    uint64_t          length = 0;
+    uint32_t          urlCount = 1;
+    uint32_t          count = 0;
+    uint32_t          succeeded = 0;
+    uint32_t          i;
+    int32_t           status;
+
+    if (readFile(allocator, path, &buffer, &length) != 0) {
+        return -1;
+    }
+    status = parserParse(context, buffer, length, &torrent);
+    allocator->free(buffer);
+    if (status != PARSER_OK) {
+        fprintf(stderr, "%s: parse failed: %s\n", path, parserErrorString(status));
+        return -1;
+    }
+
+    /* Peer id in the common "-XX0000-" client style, then random characters. */
+    memset(&config, 0, sizeof(config));
+    memcpy(config.peerId, "-TI0001-", 8);
+    if (uv_random(NULL, NULL, randomBytes, sizeof(randomBytes), 0, NULL) != 0) {
+        memset(randomBytes, 0, sizeof(randomBytes));
+    }
+    for (i = 0; i < sizeof(randomBytes); i++) {
+        config.peerId[8 + i] = (uint8_t)alphabet[randomBytes[i] % (sizeof(alphabet) - 1u)];
+    }
+    config.port = 6881;
+
+    uv_loop_init(&loop);
+    status = trackerInit(&loop, context, &config);
+    if (status != TRACKER_OK) {
+        fprintf(stderr, "trackerInit: %s\n", trackerStatusString(status));
+        parserFree(context, &torrent);
+        uv_loop_close(&loop);
+        return -1;
+    }
+
+    printf("Announcing: ");
+    printEscaped(torrent.name);
+    printf("\nInfo hash:  ");
+    printHex(torrent.infoHash, PARSER_SHA1_LENGTH);
+    printf("\nTimeout:    %" PRIu32 " s\n", timeoutSeconds);
+
+    TAILQ_FOREACH(tier, &torrent.announceList, entries) {
+        urlCount += tier->urlCount;
+    }
+    seen = allocator->realloc(NULL, sizeof(*seen) * urlCount);
+    if (seen == NULL) {
+        fprintf(stderr, "out of memory\n");
+    } else if (startAnnounces(&torrent, seen, timeoutSeconds) == 0) {
+        printf("\nNo trackers could be contacted.\n");
+    }
+    allocator->free((void *)seen);
+    parserFree(context, &torrent);      /* trackerConnect() copied what it needs */
+
+    uv_run(&loop, UV_RUN_DEFAULT);      /* returns when every announce is done */
+
+    /* Every request has finished: summarise them by iterating the ids. */
+    trackerList(NULL, 0, &count);
+    if (count > 0) {
+        ids = allocator->realloc(NULL, sizeof(*ids) * count);
+    }
+    if (ids != NULL) {
+        trackerList(ids, count, &count);
+        printf("\nSummary\n");
+        for (i = 0; i < count; i++) {
+            status = trackerInfo(&announceTag, ids[i], &result);
+            printf("  %-28s %6" PRIu32 " peers  %s\n", trackerStatusString(status),
+                   result.peerCount, result.url);
+            if (status == TRACKER_OK) {
+                succeeded++;
+            }
+            trackerClose(ids[i]);
+        }
+        allocator->free(ids);
+    }
+
+    trackerShutdown();
+    uv_run(&loop, UV_RUN_DEFAULT);      /* let any closing handles finish */
+    uv_loop_close(&loop);
+    return (succeeded > 0) ? 0 : -1;
+}
+
+/* ------------------------------------------------------------------------ */
 
 static void usage(const char *program)
 {
     fprintf(stderr,
             "usage: %s <file.torrent>\n"
             "       %s -o <output.torrent> [options] <file>...\n"
+            "       %s -t [-T seconds] <file.torrent>\n"
             "\n"
             "  -o file   create a torrent from the given files and write it to 'file'\n"
             "  -a url    tracker announce URL (repeat for more; one tier each)\n"
@@ -507,8 +729,11 @@ static void usage(const char *program)
             "  -n name   torrent name (default: the file name, or for several\n"
             "            files the output name without .torrent)\n"
             "  -l size   piece length, e.g. 262144, 256K or 1M (default: automatic)\n"
-            "  -p        mark the torrent private\n",
-            program, program);
+            "  -p        mark the torrent private\n"
+            "\n"
+            "  -t        announce to every tracker in the torrent and list the peers\n"
+            "  -T secs   announce timeout (default 15)\n",
+            program, program, program);
 }
 
 int main(int argc, char **argv)
@@ -520,6 +745,11 @@ int main(int argc, char **argv)
     const char    **webSeeds = NULL;
     const char     *outputPath = NULL;
     uint8_t         createOnly = 0;     /* an option that only makes sense with -o */
+    uint8_t         announce = 0;
+    uint8_t         timeoutGiven = 0;  /* -T only makes sense with -t */
+    uint32_t        timeoutSeconds = defaultAnnounceTimeout;
+    unsigned long   number;
+    char           *end;
     int32_t         result;
     int             option;
     int             status = -1;
@@ -542,7 +772,7 @@ int main(int argc, char **argv)
     options.trackers = (const char *const *)trackers;
     options.webSeeds = (const char *const *)webSeeds;
 
-    while ((option = getopt(argc, argv, "o:a:w:c:n:l:ph")) != -1) {
+    while ((option = getopt(argc, argv, "o:a:w:c:n:l:ptT:h")) != -1) {
         switch (option) {
         case 'o':
             outputPath = optarg;
@@ -575,6 +805,18 @@ int main(int argc, char **argv)
             options.isPrivate = 1;
             createOnly = 1;
             break;
+        case 't':
+            announce = 1;
+            break;
+        case 'T':
+            number = strtoul(optarg, &end, 10);
+            if (*optarg < '0' || *optarg > '9' || *end != '\0' || number == 0 || number > 3600u) {
+                fprintf(stderr, "invalid timeout '%s': use 1 to 3600 seconds\n", optarg);
+                goto cleanup;
+            }
+            timeoutSeconds = (uint32_t)number;
+            timeoutGiven = 1;
+            break;
         case 'h':
             usage(argv[0]);
             status = 0;
@@ -585,7 +827,18 @@ int main(int argc, char **argv)
         }
     }
 
-    if (outputPath != NULL) {
+    if (timeoutGiven && !announce) {
+        usage(argv[0]);
+        goto cleanup;
+    }
+
+    if (announce) {
+        if (outputPath != NULL || createOnly || argc - optind != 1) {
+            usage(argv[0]);
+            goto cleanup;
+        }
+        status = announceTorrent(&context, &allocator, argv[optind], timeoutSeconds);
+    } else if (outputPath != NULL) {
         if (optind >= argc) {
             usage(argv[0]);
             goto cleanup;

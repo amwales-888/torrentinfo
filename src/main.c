@@ -1325,6 +1325,21 @@ static int dataFilePath(const char *subdirectory, const char *name, char *path, 
 
 static int saveFile(const char *path, const uint8_t *data, uint64_t length);
 
+static uint8_t recheckAll;                  /* -R: ignore the resume file once */
+
+/* Where the torrent's fast-resume file lives: resume/<info hash>.resume. */
+static int resumeFilePath(const uint8_t infoHash[PARSER_SHA1_LENGTH], char *out, size_t size)
+{
+    char     name[PARSER_SHA1_LENGTH * 2u + 16u];
+    uint32_t i;
+
+    for (i = 0; i < PARSER_SHA1_LENGTH; i++) {
+        snprintf(name + 2u * i, 3, "%02x", infoHash[i]);
+    }
+    snprintf(name + 2u * PARSER_SHA1_LENGTH, 16, ".resume");
+    return dataFilePath("resume", name, out, size);
+}
+
 /* Start a DHT node, loading the table saved last time. NULL if it cannot. */
 static dht *startDht(uv_loop_t *loop, parserContext *context, const parserAllocator *allocator,
                      uint16_t port, const netBinding *binding)
@@ -1709,6 +1724,19 @@ static void onDownloadReady(void *privateArg, download *transfer, int32_t status
                progress.resumed, progress.wanted,
                (progress.wanted < progress.pieceCount) ? " wanted" : "");
     }
+    if (progress.resumeUsed) {
+        printf("            fast resume: %" PRIu32 " piece%s taken from the resume file without "
+               "checking", progress.resumeTrusted, (progress.resumeTrusted == 1u) ? "" : "s");
+        if (progress.resumeChanged > 0) {
+            printf("; %" PRIu32 " file%s changed since, so checked", progress.resumeChanged,
+                   (progress.resumeChanged == 1u) ? "" : "s");
+        }
+        printf("\n");
+    }
+    if (progress.resumeBlocks > 0) {
+        printf("            %" PRIu32 " block%s of unfinished pieces kept from last time\n",
+               progress.resumeBlocks, (progress.resumeBlocks == 1u) ? "" : "s");
+    }
     if (progress.done < progress.wanted) {
         printf("\nDownloading %" PRIu32 " piece(s); Ctrl-C to stop\n",
                progress.wanted - progress.done);
@@ -1817,6 +1845,7 @@ static int downloadTorrent(uv_loop_t *loop, parserContext *context, const parser
     downloadRun     run;
     uint8_t        *fileWanted = NULL;
     httpConfig      httpSettings;
+    char            resumePath[1024];
     int32_t         status;
 
     if (wanted >= (int64_t)torrent->pieceCount) {
@@ -1844,6 +1873,10 @@ static int downloadTorrent(uv_loop_t *loop, parserContext *context, const parser
     options.maxDownloadRate = maxDownloadRate;
     options.maxUploadRate = maxUploadRate;
     options.noWebSeeds = (uint8_t)!useWebSeeds;
+    if (resumeFilePath(torrent->infoHash, resumePath, sizeof(resumePath)) == 0) {
+        options.resumePath = resumePath;            /* fast resume */
+        options.resumeRecheck = recheckAll;
+    }
     memset(&httpSettings, 0, sizeof(httpSettings));
     httpSettings.caFile = config->caFile;
     httpSettings.binding = config->binding;
@@ -2153,7 +2186,7 @@ static int verifyTorrent(parserContext *context, const parserAllocator *allocato
 
     memset(&run, 0, sizeof(run));
     uv_loop_init(&loop);
-    status = storageOpen(&loop, context, &torrent, directory, STORAGE_READ_ONLY, fileWanted,
+    status = storageOpen(&loop, context, &torrent, directory, STORAGE_READ_ONLY, fileWanted, NULL,
                          onVerifyOpen, &run, &store);
     if (status != STORAGE_OK) {
         printf("Could not check the files: %s\n", storageStatusString(status));
@@ -3136,7 +3169,7 @@ static void usage(const char *program)
             "       %s -o <output.torrent> [options] <file>...\n"
             "       %s -t [-T seconds] [-C ca.pem] [-I interface] <file.torrent>\n"
             "       %s -P [-T seconds] [-C ca.pem] [-I interface] <file.torrent>\n"
-            "       %s -D [-S] [-L port] [-N] [-X] [-W] [-E mode] [-d rate] [-u rate] [-f list]\n"
+            "       %s -D [-S] [-L port] [-N] [-X] [-W] [-R] [-E mode] [-d rate] [-u rate] [-f list]\n"
             "            [-F glob]... [-O dir] [-i piece]\n"
             "            [-T seconds] [-C ca.pem] [-I interface] <file.torrent | magnet-link>\n"
             "       %s -V [-O dir] [-f list] [-F glob]... <file.torrent>\n"
@@ -3169,6 +3202,8 @@ static void usage(const char *program)
             "  -F glob   with -D or -V: only files whose path or name matches, like\n"
             "            '*.mkv' (any case; may be repeated, and combined with -f)\n"
             "  -W        with -D: do not download from the torrent's web seeds\n"
+            "  -R        with -D: check every piece already on disk, ignoring the\n"
+            "            fast-resume file kept from last time\n"
             "  -E mode   with -D: protocol encryption: prefer (the default: fall back\n"
             "            to plain for peers without it), require, or off\n"
             "  -d rate   with -D: download no faster than this, in KiB/s or with a\n"
@@ -3263,7 +3298,7 @@ int main(int argc, char **argv)
     options.trackers = (const char *const *)trackers;
     options.webSeeds = (const char *const *)webSeeds;
 
-    while ((option = nextOption(argc, argv, "o:a:w:c:n:l:ptPDVSNXWmL:O:i:T:C:I:d:u:f:F:E:h")) != -1) {
+    while ((option = nextOption(argc, argv, "o:a:w:c:n:l:ptPDVSNXWRmL:O:i:T:C:I:d:u:f:F:E:h")) != -1) {
         switch (option) {
         case 'o':
             outputPath = optionValue;
@@ -3351,6 +3386,10 @@ int main(int argc, char **argv)
             break;
         case 'f':
             selectList = optionValue;
+            break;
+        case 'R':
+            recheckAll = 1;
+            downloadOnly = 1;
             break;
         case 'W':
             useWebSeeds = 0;

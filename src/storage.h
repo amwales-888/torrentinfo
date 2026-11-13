@@ -94,18 +94,47 @@ typedef void (*storageReadCallback)(void *privateArg, storage *store, uint32_t p
 /* ------------------------------------------------------------------------ */
 
 /*
+ * Fast resume: what was known when the download last stopped. A file whose
+ * size and modification time (platformFileStamp()) are still the same is
+ * trusted: the pieces lying wholly in trusted files are taken as verified
+ * or missing as 'have' says, without reading them. Every other piece in
+ * existing data is hashed as usual.
+ */
+typedef struct storageResume {
+    const uint8_t  *have;           /* bitfield of verified pieces         */
+    const uint64_t *fileSizes;      /* per file, in torrent order          */
+    const int64_t  *fileTimes;      /* per file: modification time         */
+    uint32_t        fileCount;      /* must be the torrent's file count    */
+} storageResume;
+
+/*
  * Prepare the files for 'torrent' under 'directory' (created if needed;
  * "" means the current directory). With STORAGE_CHECK_EXISTING, data
  * already present is hashed piece by piece and storageHave() reports the
- * pieces that match. 'wanted' (one byte per file, in torrent order; NULL:
+ * pieces that match; 'resume' (or NULL) lets most of that be skipped (see
+ * storageResume). 'wanted' (one byte per file, in torrent order; NULL:
  * all) says which files to create: see storage.c about the part file that
- * holds the edges of pieces shared with skipped files. On STORAGE_OK the work is under way and 'callback'
- * will run once; *store receives the handle, which stays valid until
- * storageClose(). The torrent is not needed after this call returns.
+ * holds the edges of pieces shared with skipped files. On STORAGE_OK the
+ * work is under way and 'callback' will run once; *store receives the
+ * handle, which stays valid until storageClose(). The torrent and 'resume'
+ * are not needed after this call returns.
  */
 int32_t storageOpen(uv_loop_t *loop, parserContext *context, const parserTorrent *torrent,
                     const char *directory, uint32_t flags, const uint8_t *wanted,
-                    storageOpenCallback callback, void *privateArg, storage **store);
+                    const storageResume *resume, storageOpenCallback callback,
+                    void *privateArg, storage **store);
+
+/* After the open: pieces taken from the resume data without checking, and
+ * files whose size or time had changed (so their pieces were checked). */
+void storageResumeStats(const storage *store, uint32_t *trustedPieces, uint32_t *changedFiles);
+
+/*
+ * The files' sizes and modification times now, for saving with the pieces
+ * on disk (storageResume). Files not on disk (and padding) get 0 and 0.
+ * Safe to call from a thread-pool thread while the storage is open (it only
+ * reads the file system); 'sizes' and 'times' hold storageFileCount() each.
+ */
+void storageFileStamps(const storage *store, uint64_t *sizes, int64_t *times);
 
 /*
  * Write piece 'pieceIndex'. 'data' must hold the whole piece and must have

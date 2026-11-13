@@ -1,18 +1,22 @@
 /*
- * platform.h - The few things that differ between Linux, FreeBSD and Windows.
+ * platform.h - The few things that differ between Linux, FreeBSD, macOS and
+ * Windows.
  *
  * Everything else in the library is portable C or goes through libuv.
  *
  *   - (Lists come from the bundled 4.4BSD queue.h on every platform.)
- *   - File access with UTF-8 paths: POSIX calls on Linux and FreeBSD, the
- *     wide-character Win32 calls on Windows (so non-ASCII paths work without
+ *   - File access with UTF-8 paths: POSIX calls on Linux, FreeBSD and macOS,
+ *     the wide-character Win32 calls on Windows (so non-ASCII paths work without
  *     any code page settings).
  *   - Tying a socket to a network interface: SO_BINDTODEVICE on Linux,
- *     IP_UNICAST_IF / IPV6_UNICAST_IF on Windows. FreeBSD has no such
- *     option; sockets there can only be bound to the interface's address.
+ *     IP_BOUND_IF / IPV6_BOUND_IF on macOS, IP_UNICAST_IF / IPV6_UNICAST_IF
+ *     on Windows. FreeBSD has no such option; sockets there can only be
+ *     bound to the interface's address.
  *   - Finding the default gateway (for NAT-PMP): /proc/net/route on Linux,
- *     the routing sysctl (NET_RT_FLAGS) on FreeBSD, GetIpForwardTable() on
- *     Windows.
+ *     the routing sysctl (NET_RT_FLAGS) on FreeBSD and macOS,
+ *     GetIpForwardTable() on Windows.
+ *   - Where lasting data goes: ~/.torrentinfo, ~/Library/Application
+ *     Support/torrentinfo on macOS, %APPDATA%\\torrentinfo on Windows.
  *   - Where the system keeps its trusted CA certificates.
  *
  * The file functions never allocate memory and keep no shared state, so
@@ -57,6 +61,22 @@ typedef struct platformFile {
 /* Size of a file, and whether it is a regular file (not a directory or device). */
 int32_t platformFileStat(const char *path, uint64_t *size, uint8_t *isRegular);
 
+/*
+ * platformFileStat() plus the time the file's data was last modified, in
+ * nanoseconds since some fixed point (the Unix epoch on Linux and FreeBSD,
+ * 1601 on Windows, in 100 ns steps): only for comparing with an earlier
+ * value from the same call, as fast resume does.
+ */
+int32_t platformFileStamp(const char *path, uint64_t *size, uint8_t *isRegular,
+                          int64_t *modified);
+
+/* Replace 'to' with 'from' in one step (rename, overwriting): readers see the
+ * old file or the new one, never half of one. Both on the same disk. */
+int32_t platformFileReplace(const char *from, const char *to);
+
+/* Delete a file. */
+int32_t platformFileRemove(const char *path);
+
 /* Open an existing file for reading. */
 int32_t platformFileOpenRead(const char *path, platformFile *file);
 
@@ -81,7 +101,8 @@ int32_t platformMakeDirectory(const char *path);
 
 /*
  * The directory for the program's own lasting data, created if missing:
- * ~/.torrentinfo on Linux and FreeBSD, %APPDATA%\\torrentinfo on Windows; with a
+ * ~/.torrentinfo on Linux and FreeBSD, ~/Library/Application Support/torrentinfo
+ * on macOS, %APPDATA%\\torrentinfo on Windows; with a
  * 'subdirectory' (or NULL), that directory inside it, created too. The
  * UTF-8 path goes to 'path'. Returns 0 or a libuv error code.
  */
@@ -106,8 +127,8 @@ int32_t platformFileWriteAt(platformFile *file, uint64_t offset, const void *buf
 /*
  * Can sockets be tied to the interface (name, or index on Windows)? 0 if
  * so; UV_EPERM if the system refuses (Linux before 5.7 needs CAP_NET_RAW);
- * UV_ENODEV if the interface's index is unknown (Windows); UV_ENOTSUP where
- * there is no such option (FreeBSD, others). In every case but 0 the
+ * UV_ENODEV if the interface's index is unknown (Windows, macOS); UV_ENOTSUP
+ * where there is no such option (FreeBSD, others). In every case but 0 the
  * caller can still bind sockets to the interface's address.
  */
 int32_t platformInterfaceTieCheck(const char *name, uint32_t index);
@@ -122,7 +143,7 @@ int32_t platformInterfaceTie(uv_os_sock_t sock, int family, const char *name, ui
  * interface if 'name' (or, on Windows, 'index') is set.
  *
  * 'scratch' is working memory from the caller (the routing table is read
- * into it on FreeBSD and Windows; Linux needs none), *size its length. If
+ * into it on FreeBSD, macOS and Windows; Linux needs none), *size its length. If
  * it is too small the call fails with UV_ENOBUFS and sets *size to what is
  * needed; call again with that much. Returns 0, UV_ENOENT if there is no
  * default route, or another libuv error.

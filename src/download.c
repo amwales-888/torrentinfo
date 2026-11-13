@@ -32,6 +32,7 @@
 #include "piece.h"
 #include "storage.h"
 #include "queue.h"
+#include "resume.h"
 #include "webseed.h"
 
 /* ------------------------------------------------------------------------ */
@@ -54,6 +55,12 @@
 #endif
 #define DOWNLOAD_WEB_MAX_FAILURES   5u      /* in a row: give the web seed up    */
 #define DOWNLOAD_WEB_MAX_BAD        2u      /* pieces failing their check        */
+
+/* Fast resume */
+#ifndef DOWNLOAD_RESUME_SECONDS
+#define DOWNLOAD_RESUME_SECONDS     30u     /* save at most this often           */
+#endif
+#define DOWNLOAD_RESUME_PARTIAL_LIMIT (64u * 1024u * 1024u)  /* partial data saved */
 
 #define DOWNLOAD_PEER_QUEUED        0u
 #define DOWNLOAD_PEER_CONNECTING    1u
@@ -279,6 +286,21 @@ struct download {
     uint64_t                uploadTurns;    /* counter for uploadTurn      */
     uint64_t                pumpPasses;     /* counter for pumpPass        */
     uint64_t                lastTick;       /* uv_now() of the last 1 s tick */
+
+    /* Fast resume (resume.h) */
+    char                   *resumePath;     /* NULL: not used                */
+    resumeData              resumeLoaded;   /* read at the start, until used */
+    uint8_t                 resumeHaveLoaded;
+    uint8_t                 resumeDirty;    /* pieces written since the save */
+    uint8_t                 resumeSaving;   /* a save is on the thread pool  */
+    uint8_t                 resumeFinalPending; /* the final save, after it  */
+    uint8_t                 resumeFinalDone;
+    uint8_t                 resumeWarned;
+    uint8_t                 storeCloseDeferred; /* close after the save      */
+    uint64_t                resumeLastSave;
+    uint32_t                resumeBlocks;   /* partial blocks restored       */
+    uint32_t                saveJobs;
+    char                    resumeNote[DOWNLOAD_MESSAGE_LENGTH];
 
     uint32_t                verifyJobs;     /* piece checks on the thread pool */
     uint8_t                 timerClosed;    /* waiting only for those to end */
@@ -1626,6 +1648,7 @@ static void onPieceWritten(void *privateArg, storage *store, uint32_t pieceIndex
         messageBitfieldSet(dl->onDisk, pieceIndex);
         dl->onDiskCount++;
     }
+    dl->resumeDirty = 1;
     dl->left -= (dl->left >= pieceLengthOf(dl->torrent, pieceIndex))
                     ? pieceLengthOf(dl->torrent, pieceIndex) : dl->left;
 
@@ -1731,6 +1754,9 @@ static void pieceChecked(download *dl, activePiece *piece, int32_t result);
 static void webPieceFailed(download *dl, struct dlWebSeed *web, uint32_t index);
 static int webSeedsUsable(const download *dl);
 static void webStopAll(download *dl);
+static int resumeStartSave(download *dl, int final);
+static void resumeFinal(download *dl);
+static void closeStore(download *dl);
 
 static void verifyDone(uv_work_t *work, int status)
 {
@@ -1740,7 +1766,7 @@ static void verifyDone(uv_work_t *work, int status)
     dl->verifyJobs--;
     piece->verifying = 0;
     if (dl->ended) {
-        if (dl->timerClosed && dl->verifyJobs == 0) {
+        if (dl->timerClosed && dl->verifyJobs == 0 && dl->saveJobs == 0) {
             releaseDownload(dl);                    /* the last thing we waited for */
         }
         return;
@@ -2203,8 +2229,10 @@ static void finish(download *dl, int32_t status, const char *message)
     dl->connecting = 0;
     dl->unchoking = 0;
     if (status != DOWNLOAD_OK) {
-        storageClose(dl->store);                    /* writes in flight are dropped */
-        dl->store = NULL;
+        resumeFinal(dl);                            /* what we have, for next time */
+        closeStore(dl);                             /* writes in flight are dropped */
+    } else {
+        (void)resumeStartSave(dl, 0);               /* complete: record it now */
     }
     uv_timer_stop(&dl->timer);
     if (dl->events.onFinished != NULL) {
@@ -2428,9 +2456,12 @@ static void webStart(download *dl, dlWebSeed *web)
     if (dl->downLimit.rate != 0 && dl->downLimit.rate < maxBytes) {
         maxBytes = dl->downLimit.rate;              /* about a second's worth */
     }
-    if ((uint64_t)dl->neededCount * dl->torrent->pieceLength < 4u * maxBytes ||
-        web->failures > 0) {
-        maxBytes = 1;           /* near the end, or after a failure: a piece at a time */
+    if (web->failures > 0) {
+        maxBytes = 1;                               /* after a failure: a piece at a time */
+    } else if ((uint64_t)dl->neededCount * dl->torrent->pieceLength < 4u * maxBytes) {
+        /* Near the end: a quarter of what is left, so that peers and other
+         * web seeds can share the last of it. */
+        maxBytes = (uint64_t)dl->neededCount * dl->torrent->pieceLength / 4u;
     }
     for (i = 0; i < pieceCount; i++) {
         start = (web->cursor + i) % pieceCount;
@@ -2485,6 +2516,239 @@ static void webStartAll(download *dl)
     }
 }
 
+/* ------------------------------------------------------------------------ */
+/* Fast resume                                                              */
+/* ------------------------------------------------------------------------ */
+
+/* A save on the thread pool: encoded here, stamped and written there. */
+typedef struct resumeJob {
+    uv_work_t   work;
+    download   *dl;
+    storage    *store;
+    uint8_t    *text;
+    uint64_t    size;
+    uint64_t   *sizes;
+    int64_t    *times;
+    uint32_t    fileCount;
+    char       *temporary;
+    int32_t     result;
+    int32_t     systemError;
+} resumeJob;
+
+static void releaseDownload(download *dl);
+
+static void freeResumeJob(download *dl, resumeJob *job)
+{
+    release(dl, job->text);
+    release(dl, job->sizes);
+    release(dl, job->times);
+    release(dl, job->temporary);
+    release(dl, job);
+}
+
+/* Thread pool: the files' stamps now, then write. Allocates nothing. */
+static void resumeWork(uv_work_t *work)
+{
+    resumeJob *job = work->data;
+
+    storageFileStamps(job->store, job->sizes, job->times);
+    resumeSeal(job->text, job->size, job->fileCount, job->sizes, job->times);
+    job->result = resumeWrite(job->dl->resumePath, job->temporary, job->text, job->size,
+                              &job->systemError);
+}
+
+static int resumeStartSave(download *dl, int final);
+
+/* Close the storage, unless a resume save still needs it (then after). */
+static void closeStore(download *dl)
+{
+    if (dl->store == NULL) {
+        return;
+    }
+    if (dl->resumeSaving || dl->resumeFinalPending) {
+        dl->storeCloseDeferred = 1;
+        return;
+    }
+    storageClose(dl->store);
+    dl->store = NULL;
+    dl->storeCloseDeferred = 0;
+}
+
+static void resumeDone(uv_work_t *work, int status)
+{
+    resumeJob *job = work->data;
+    download  *dl = job->dl;
+
+    dl->saveJobs--;
+    dl->resumeSaving = 0;
+    if ((status != 0 || job->result != RESUME_OK) && !dl->resumeWarned && !dl->ended) {
+        dl->resumeWarned = 1;
+        emit(dl, "could not save the resume file %s: %s", dl->resumePath,
+             (job->result == RESUME_EIO && job->systemError != 0)
+                 ? uv_strerror(job->systemError) : "error");
+    }
+    freeResumeJob(dl, job);
+    if (dl->resumeFinalPending) {
+        dl->resumeFinalPending = 0;
+        if (resumeStartSave(dl, 1)) {
+            return;                                 /* the final save is under way */
+        }
+    }
+    if (dl->storeCloseDeferred) {
+        closeStore(dl);
+    }
+    if (dl->ended && dl->timerClosed && dl->verifyJobs == 0 && dl->saveJobs == 0) {
+        releaseDownload(dl);                        /* the last thing we waited for */
+    }
+}
+
+/*
+ * Save what is on disk (and, for the final save, the blocks of partly
+ * downloaded pieces) to the resume file, on the thread pool. 1 if a save
+ * was started or queued after the one in progress.
+ */
+static int resumeStartSave(download *dl, int final)
+{
+    resumeData     data;
+    resumePartial *partials = NULL;
+    resumeJob     *job;
+    activePiece   *piece;
+    uint64_t       partialBytes = 0;
+    size_t         pathLength;
+    uint32_t       i;
+    int32_t        status;
+
+    if (dl->resumePath == NULL || dl->store == NULL || !dl->ready) {
+        return 0;
+    }
+    if (dl->resumeSaving) {
+        if (final) {
+            dl->resumeFinalPending = 1;
+        }
+        return final;
+    }
+    memset(&data, 0, sizeof(data));
+    memcpy(data.infoHash, dl->torrent->infoHash, PARSER_SHA1_LENGTH);
+    data.pieceCount = dl->torrent->pieceCount;
+    data.fileCount = storageFileCount(dl->store);
+    data.have = dl->onDisk;                         /* copied by resumeEncode() */
+    if (final && dl->activeCount > 0) {
+        partials = allocate(dl, sizeof(*partials) * dl->activeCount);
+        TAILQ_FOREACH(piece, &dl->active, entries) {
+            pieceAssembly *assembly = &piece->piece;
+            uint32_t       block;
+
+            if (partials == NULL || piece->verifying || assembly->receivedCount == 0 ||
+                assembly->receivedCount == assembly->blockCount ||
+                partialBytes + assembly->length > DOWNLOAD_RESUME_PARTIAL_LIMIT) {
+                continue;
+            }
+            partials[data.partialCount].blocks = allocate(dl, (assembly->blockCount + 7u) / 8u);
+            if (partials[data.partialCount].blocks == NULL) {
+                continue;
+            }
+            for (block = 0; block < assembly->blockCount; block++) {
+                if (assembly->blocks[block] == PIECE_BLOCK_RECEIVED) {
+                    messageBitfieldSet(partials[data.partialCount].blocks, block);
+                }
+            }
+            partials[data.partialCount].index = assembly->index;
+            partials[data.partialCount].length = assembly->length;
+            partials[data.partialCount].blockCount = assembly->blockCount;
+            partials[data.partialCount].data = assembly->data;  /* copied by resumeEncode() */
+            partialBytes += assembly->length;
+            data.partialCount++;
+        }
+        data.partials = partials;
+    }
+    job = allocate(dl, sizeof(*job));
+    status = (job != NULL) ? resumeEncode(dl->context, &data, &job->text, &job->size)
+                           : RESUME_ENOMEM;
+    for (i = 0; i < data.partialCount; i++) {
+        release(dl, partials[i].blocks);
+    }
+    release(dl, partials);
+    if (status != RESUME_OK) {
+        release(dl, job);
+        return 0;
+    }
+    pathLength = strlen(dl->resumePath);
+    job->dl = dl;
+    job->store = dl->store;
+    job->fileCount = data.fileCount;
+    job->sizes = allocate(dl, sizeof(uint64_t) * (data.fileCount + 1u));
+    job->times = allocate(dl, sizeof(int64_t) * (data.fileCount + 1u));
+    job->temporary = allocate(dl, pathLength + 5u);
+    if (job->sizes == NULL || job->times == NULL || job->temporary == NULL) {
+        freeResumeJob(dl, job);
+        return 0;
+    }
+    memcpy(job->temporary, dl->resumePath, pathLength);
+    memcpy(job->temporary + pathLength, ".tmp", 5u);
+    job->work.data = job;
+    if (uv_queue_work(dl->loop, &job->work, resumeWork, resumeDone) != 0) {
+        freeResumeJob(dl, job);
+        return 0;
+    }
+    dl->saveJobs++;
+    dl->resumeSaving = 1;
+    dl->resumeDirty = 0;
+    dl->resumeLastSave = uv_now(dl->loop);
+    return 1;
+}
+
+/* The download is stopping: one last save, with the partial pieces. */
+static void resumeFinal(download *dl)
+{
+    if (!dl->resumeFinalDone) {
+        dl->resumeFinalDone = 1;
+        (void)resumeStartSave(dl, 1);
+    }
+}
+
+/* Put back the blocks of pieces that were partly downloaded last time. */
+static void resumeRestorePartials(download *dl)
+{
+    uint32_t i;
+
+    for (i = 0; i < dl->resumeLoaded.partialCount && !stopped(dl); i++) {
+        const resumePartial *partial = &dl->resumeLoaded.partials[i];
+        activePiece         *piece;
+        messageFrame         request;
+        messageFrame         frame;
+        uint32_t             blocks = 0;
+
+        if (partial->index >= dl->torrent->pieceCount ||
+            dl->pieceState[partial->index] != DOWNLOAD_PIECE_NEEDED ||
+            partial->length != pieceLengthOf(dl->torrent, partial->index)) {
+            continue;
+        }
+        piece = startPiece(dl, NULL, partial->index);   /* no owner: peers take it over */
+        if (piece == NULL) {
+            continue;
+        }
+        while (pieceNextRequest(&piece->piece, &request) == PIECE_OK) {
+            if (!messageBitfieldGet(partial->blocks, request.begin / PIECE_BLOCK_LENGTH)) {
+                continue;
+            }
+            memset(&frame, 0, sizeof(frame));
+            frame.id = MESSAGE_PIECE;
+            frame.index = partial->index;
+            frame.begin = request.begin;
+            frame.payload = partial->data + request.begin;
+            frame.payloadLength = request.length;
+            (void)pieceReceive(&piece->piece, &frame);
+            blocks++;
+        }
+        pieceCancelRequests(&piece->piece);         /* the rest are still missing */
+        dl->resumeBlocks += blocks;
+        if (piece->piece.receivedCount == piece->piece.blockCount) {
+            completePiece(dl, piece);               /* checked like any other */
+        }
+    }
+    resumeFree(dl->context, &dl->resumeLoaded);
+}
+
 static void onTick(uv_timer_t *timer)
 {
     download     *dl = timer->data;
@@ -2512,6 +2776,10 @@ static void onTick(uv_timer_t *timer)
         return;
     }
     dl->lastTick = now;
+    if (dl->resumeDirty && !dl->resumeSaving &&
+        now - dl->resumeLastSave >= (uint64_t)DOWNLOAD_RESUME_SECONDS * 1000u) {
+        (void)resumeStartSave(dl, 0);
+    }
     if (dl->seeding) {
         dl->lastProgress = now;                     /* nothing to wait for */
     }
@@ -2582,8 +2850,8 @@ static void onTimerClosed(uv_handle_t *handle)
     download *dl = handle->data;
 
     dl->timerClosed = 1;
-    if (dl->verifyJobs == 0) {
-        releaseDownload(dl);                        /* else the last check does it */
+    if (dl->verifyJobs == 0 && dl->saveJobs == 0) {
+        releaseDownload(dl);                        /* else the last job does it */
     }
 }
 
@@ -2615,6 +2883,8 @@ static void releaseDownload(download *dl)
     if (dl->httpUp) {
         httpShutdown();
     }
+    resumeFree(dl->context, &dl->resumeLoaded);
+    release(dl, dl->resumePath);
     release(dl, dl->pieceState);
     release(dl, dl->availability);
     release(dl, dl->onDisk);
@@ -2667,6 +2937,14 @@ static void onStorageOpen(void *privateArg, storage *store, int32_t status,
     }
     dl->ready = 1;
     dl->lastProgress = uv_now(dl->loop);
+    dl->resumeLastSave = dl->lastProgress;
+    if (dl->resumeNote[0] != '\0') {
+        emit(dl, "%s", dl->resumeNote);
+    }
+    resumeRestorePartials(dl);
+    if (stopped(dl)) {
+        return;
+    }
     if (dl->events.onReady != NULL) {
         dl->events.onReady(dl->privateArg, dl, DOWNLOAD_OK, NULL);
         if (stopped(dl)) {
@@ -2699,6 +2977,7 @@ int32_t downloadBegin(uv_loop_t *loop, parserContext *context, const parserTorre
                       const downloadOptions *options, const downloadEvents *events,
                       void *privateArg, download **transfer)
 {
+    storageResume resumeInput;
     download *dl;
     uint64_t  seed = 0;
     int32_t   status;
@@ -2805,20 +3084,53 @@ int32_t downloadBegin(uv_loop_t *loop, parserContext *context, const parserTorre
         release(dl, dl->pieceState);
         release(dl, dl->availability);
         release(dl, dl->onDisk);
-    release(dl, dl->wantedPieces);
+        release(dl, dl->wantedPieces);
         release(dl, dl);
         return DOWNLOAD_ENOMEM;
     }
 
+    /* Fast resume: what was known when this torrent last stopped. */
+    if (options->resumePath != NULL && options->resumePath[0] != '\0') {
+        size_t length = strlen(options->resumePath);
+
+        dl->resumePath = allocate(dl, length + 1u);
+        if (dl->resumePath != NULL) {
+            memcpy(dl->resumePath, options->resumePath, length + 1u);
+        }
+    }
+    if (dl->resumePath != NULL && !options->resumeRecheck) {
+        int32_t systemError = 0;
+        int32_t loaded = resumeLoad(context, dl->resumePath, torrent->infoHash,
+                                    torrent->pieceCount, torrent->fileCount, &dl->resumeLoaded,
+                                    &systemError);
+
+        if (loaded == RESUME_OK) {
+            dl->resumeHaveLoaded = 1;
+            resumeInput.have = dl->resumeLoaded.have;
+            resumeInput.fileSizes = dl->resumeLoaded.fileSizes;
+            resumeInput.fileTimes = dl->resumeLoaded.fileTimes;
+            resumeInput.fileCount = dl->resumeLoaded.fileCount;
+        } else if (!(loaded == RESUME_EIO && systemError == UV_ENOENT)) {
+            snprintf(dl->resumeNote, sizeof(dl->resumeNote),
+                     "the resume file %s was not usable (%s); every piece was checked",
+                     dl->resumePath,
+                     (loaded == RESUME_EINVAL) ? "damaged, or for another version of the torrent"
+                     : (loaded == RESUME_EIO) ? uv_strerror(systemError) : "out of memory");
+        }
+    }
+
     status = storageOpen(loop, context, torrent,
                          (options->directory != NULL) ? options->directory : "",
-                         STORAGE_CHECK_EXISTING, options->fileWanted, onStorageOpen, dl,
+                         STORAGE_CHECK_EXISTING, options->fileWanted,
+                         dl->resumeHaveLoaded ? &resumeInput : NULL, onStorageOpen, dl,
                          &dl->store);
     if (status != STORAGE_OK) {
+        resumeFree(context, &dl->resumeLoaded);
+        release(dl, dl->resumePath);
         release(dl, dl->pieceState);
         release(dl, dl->availability);
         release(dl, dl->onDisk);
-    release(dl, dl->wantedPieces);
+        release(dl, dl->wantedPieces);
         release(dl, dl);
         return (status == STORAGE_ENOMEM) ? DOWNLOAD_ENOMEM
              : (status == STORAGE_EINVAL) ? DOWNLOAD_EINVAL : DOWNLOAD_EIO;
@@ -2924,6 +3236,11 @@ void downloadGetProgress(const download *dl, downloadProgress *progress)
     progress->wanted = dl->wanted;
     progress->done = dl->done;
     progress->resumed = dl->resumed;
+    progress->resumeUsed = dl->resumeHaveLoaded;
+    if (dl->store != NULL) {
+        storageResumeStats(dl->store, &progress->resumeTrusted, &progress->resumeChanged);
+    }
+    progress->resumeBlocks = dl->resumeBlocks;
     progress->bytesReceived = dl->bytesReceived;
     progress->bytesWasted = dl->bytesWasted;
     progress->hashFailures = dl->hashFailures;
@@ -3008,8 +3325,8 @@ void downloadEnd(download *dl)
         peerClose(peer->connection);
         peer->connection = NULL;
     }
-    storageClose(dl->store);
-    dl->store = NULL;
+    resumeFinal(dl);                                /* before the storage closes */
+    closeStore(dl);
     uv_timer_stop(&dl->timer);
     uv_close((uv_handle_t *)&dl->timer, onTimerClosed);
 }

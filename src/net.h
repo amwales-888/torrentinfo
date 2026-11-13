@@ -9,7 +9,8 @@
  *
  *   - the socket is bound to the interface's address (port 0), and
  *   - it is tied to the interface itself: SO_BINDTODEVICE on Linux,
- *     IP_UNICAST_IF / IPV6_UNICAST_IF on Windows (platform.c). On Linux
+ *     IP_BOUND_IF / IPV6_BOUND_IF on macOS, IP_UNICAST_IF / IPV6_UNICAST_IF
+ *     on Windows (platform.c). On Linux
  *     the address alone is not enough, since packets may still be routed
  *     out of another interface. FreeBSD has no such option: there only the
  *     address is bound (binding.device is 0, and netBindingResolve() says

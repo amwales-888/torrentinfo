@@ -53,6 +53,10 @@ typedef struct storageFile {
     uint8_t     handleOpen;
     uint8_t     skipped;        /* not wanted by the caller                  */
     uint8_t     inPart;         /* not on disk: its bytes are in the part file */
+    uint8_t     resumeKnown;    /* the resume data has a stamp for it        */
+    uint8_t     trusted;        /* ...which still matches: no need to check  */
+    uint64_t    resumeSize;
+    int64_t     resumeTime;
 } storageFile;
 
 #define STORAGE_PART_HEADER     8u      /* "TIP1" + piece index             */
@@ -90,6 +94,9 @@ struct storage {
     uint32_t               *partSlot;       /* per piece: record + 1, or 0        */
     uint32_t                partSlots;      /* records in the part file           */
     uint8_t                 anyInPart;      /* some file is kept in the part file */
+    uint8_t                *resumeHave;     /* storageResume.have, or NULL        */
+    uint32_t                resumeTrusted;  /* pieces taken from it               */
+    uint32_t                resumeChanged;  /* files whose stamp did not match    */
 
     /* The open job, then the check jobs */
     uv_work_t               openWork;
@@ -185,6 +192,7 @@ static void freeStorage(storage *store)
     }
     release(context, store->part.path);
     release(context, store->partSlot);
+    release(context, store->resumeHave);
     if (store->lockReady) {
         uv_mutex_destroy(&store->lock);
     }
@@ -509,8 +517,43 @@ static void removeFile(const char *path)
     uv_fs_req_cleanup(&request);
 }
 
-/* Worker thread: does piece 'index' lie entirely in data that existed before? */
+static uint8_t pieceDataExists(const storage *store, uint32_t index);
+
+/*
+ * What the resume data says about piece 'index': 1 verified, 0 missing (both
+ * without reading it), or -1 if it must be checked (no resume data, or some
+ * file it touches has changed).
+ */
+static int pieceFromResume(const storage *store, uint32_t index)
+{
+    uint64_t start = (uint64_t)index * store->pieceLength;
+    uint64_t end = start + pieceSize(store, index);
+    uint32_t i;
+
+    if (store->resumeHave == NULL) {
+        return -1;
+    }
+    for (i = findFile(store, start); i < store->fileCount && store->files[i].offset < end; i++) {
+        const storageFile *entry = &store->files[i];
+
+        if (entry->length > 0 && !entry->padding && !entry->trusted) {
+            return -1;
+        }
+    }
+    return messageBitfieldGet(store->resumeHave, index) ? 1 : 0;
+}
+
+/* Worker thread: does piece 'index' lie entirely in data that existed before,
+ * and is not settled by the resume data? */
 static uint8_t pieceInExistingData(const storage *store, uint32_t index)
+{
+    if (pieceFromResume(store, index) >= 0) {
+        return 0;                                   /* known: nothing to check */
+    }
+    return pieceDataExists(store, index);
+}
+
+static uint8_t pieceDataExists(const storage *store, uint32_t index)
 {
     uint64_t start = (uint64_t)index * store->pieceLength;
     uint64_t end = start + pieceSize(store, index);
@@ -609,7 +652,18 @@ static void openWork(uv_work_t *work)
             return;
         }
 
-        result = platformFileStat(entry->path, &size, &isRegular);
+        {
+            int64_t modified = 0;
+
+            result = platformFileStamp(entry->path, &size, &isRegular, &modified);
+            /* Compare with the resume data before anything below changes it. */
+            entry->trusted = (uint8_t)(entry->resumeKnown && result == 0 && isRegular &&
+                                       size == entry->length && size == entry->resumeSize &&
+                                       modified == entry->resumeTime);
+            if (entry->resumeKnown && !entry->trusted && entry->length > 0) {
+                store->resumeChanged++;
+            }
+        }
         if (result == 0 && !isRegular) {
             snprintf(store->openMessage, sizeof(store->openMessage),
                      "%s exists and is not a regular file", entry->path);
@@ -803,9 +857,19 @@ static void finishOpen(storage *store)
 static void openDone(uv_work_t *work, int status)
 {
     storage *store = work->data;
+    uint32_t i;
 
     if (status == UV_ECANCELED) {
         store->openResult = STORAGE_ECANCELLED;
+    }
+    if (store->openResult == STORAGE_OK && store->checkExisting && store->resumeHave != NULL) {
+        for (i = 0; i < store->pieceCount; i++) {
+            if (pieceFromResume(store, i) == 1) {   /* verified last time, unchanged */
+                messageBitfieldSet(store->have, i);
+                store->haveCount++;
+                store->resumeTrusted++;
+            }
+        }
     }
     if (store->openResult != STORAGE_OK || store->closed || !store->checkExisting ||
         !store->anyExisted || startChecks(store) != 0) {
@@ -945,7 +1009,8 @@ static void writeDone(uv_work_t *work, int status)
 
 int32_t storageOpen(uv_loop_t *loop, parserContext *context, const parserTorrent *torrent,
                     const char *directory, uint32_t flags, const uint8_t *wanted,
-                    storageOpenCallback callback, void *privateArg, storage **handle)
+                    const storageResume *resume, storageOpenCallback callback,
+                    void *privateArg, storage **handle)
 {
     storage *store;
     uint64_t hashBytes;
@@ -1000,6 +1065,23 @@ int32_t storageOpen(uv_loop_t *loop, parserContext *context, const parserTorrent
             memcpy(store->hashes, torrent->pieces, (size_t)hashBytes);
         }
         result = buildFiles(store, torrent, directory, wanted);
+    }
+    /* Resume data is only used if it describes this torrent's files. */
+    if (result == STORAGE_OK && resume != NULL && resume->have != NULL &&
+        resume->fileCount == store->fileCount && !store->readOnly && store->pieceCount > 0) {
+        uint32_t i;
+
+        store->resumeHave = allocate(context, messageBitfieldBytes(store->pieceCount));
+        if (store->resumeHave == NULL) {
+            result = STORAGE_ENOMEM;
+        } else {
+            memcpy(store->resumeHave, resume->have, messageBitfieldBytes(store->pieceCount));
+            for (i = 0; i < store->fileCount; i++) {
+                store->files[i].resumeKnown = 1;
+                store->files[i].resumeSize = resume->fileSizes[i];
+                store->files[i].resumeTime = resume->fileTimes[i];
+            }
+        }
     }
     if (result == STORAGE_OK) {
         store->openWork.data = store;
@@ -1063,6 +1145,35 @@ const uint8_t *storageHave(const storage *store, uint32_t *haveCount)
         *haveCount = (store != NULL) ? store->haveCount : 0;
     }
     return (store != NULL) ? store->have : NULL;
+}
+
+void storageResumeStats(const storage *store, uint32_t *trustedPieces, uint32_t *changedFiles)
+{
+    if (trustedPieces != NULL) {
+        *trustedPieces = (store != NULL) ? store->resumeTrusted : 0u;
+    }
+    if (changedFiles != NULL) {
+        *changedFiles = (store != NULL) ? store->resumeChanged : 0u;
+    }
+}
+
+void storageFileStamps(const storage *store, uint64_t *sizes, int64_t *times)
+{
+    uint32_t i;
+
+    for (i = 0; i < store->fileCount; i++) {
+        const storageFile *entry = &store->files[i];
+        uint8_t            isRegular = 0;
+
+        sizes[i] = 0;
+        times[i] = 0;
+        if (!entry->padding && !entry->inPart &&
+            (platformFileStamp(entry->path, &sizes[i], &isRegular, &times[i]) != 0 ||
+             !isRegular)) {
+            sizes[i] = 0;
+            times[i] = 0;
+        }
+    }
 }
 
 void storageCheckProgress(storage *store, uint32_t *checked, uint32_t *total)

@@ -133,6 +133,11 @@ typedef struct downloadOptions {
     uint32_t        webSeedCount;
     uint8_t         noWebSeeds;
     const httpConfig *http;
+    /* Fast resume: the resume file to read at the start and keep up to date
+     * (see resume.h), or NULL for none. With resumeRecheck the file is not
+     * read (every piece on disk is checked) but is still written. */
+    const char     *resumePath;
+    uint8_t         resumeRecheck;
 } downloadOptions;
 
 typedef struct downloadProgress {
@@ -166,6 +171,10 @@ typedef struct downloadProgress {
     uint32_t        webSeeds;           /* web seeds still in use              */
     uint32_t        webSeedsActive;     /* ...fetching right now               */
     uint64_t        bytesFromWeb;       /* received from web seeds             */
+    uint8_t         resumeUsed;         /* a resume file was read              */
+    uint32_t        resumeTrusted;      /* pieces it vouched for, unchecked    */
+    uint32_t        resumeChanged;      /* files changed since: checked        */
+    uint32_t        resumeBlocks;       /* blocks of partial pieces restored   */
     uint64_t        maxDownloadRate;    /* the limits in force (0: none)       */
     uint64_t        maxUploadRate;
 } downloadProgress;

@@ -11,7 +11,7 @@ torrentinfo file.torrent | magnet-link
 torrentinfo -o new.torrent [-a url]... [-w url]... [-c text] [-n name] [-l size] [-p] file...
 torrentinfo -t [-T seconds] [-C certs.pem] [-I interface] file.torrent
 torrentinfo -P [-T seconds] [-C certs.pem] [-I interface] file.torrent
-torrentinfo -D [-S] [-L port] [-N] [-X] [-W] [-E mode] [-d speed] [-u speed] [-f list] [-F pattern]...
+torrentinfo -D [-S] [-L port] [-N] [-X] [-W] [-R] [-E mode] [-d speed] [-u speed] [-f list] [-F pattern]...
                [-O folder] [-i piece] [-T seconds] [-C certs.pem] [-I interface]
                file.torrent | magnet-link
 torrentinfo -V [-O folder] [-f list] [-F pattern]... file.torrent
@@ -161,6 +161,12 @@ The program works in one of six ways, chosen by the first option.
   shell does not expand it. With a magnet link, use `-F`: the file numbers
   are not known until the torrent has been fetched.
 
+`-R`
+: Check every piece already on disk, as if starting afresh, instead of
+  trusting the resume file kept from last time (see "Fast resume" under
+  NOTES). Use it if you think the files were changed behind the program's
+  back.
+
 `-W`
 : Do not download from web seeds (see "Web seeds" under NOTES).
 
@@ -192,7 +198,8 @@ The program works in one of six ways, chosen by the first option.
 
 `-I interface`
 : Send all traffic through one network connection, for example a VPN. Give
-  the connection's name (such as `tun0` or `wg0` on Linux and FreeBSD, or
+  the connection's name (such as `tun0` or `wg0` on Linux and FreeBSD,
+  `en0` or `utun3` on macOS, or
   the name shown in Windows' *Network Connections*, such as
   `"Ethernet 2"`), or its IP address. Nothing is sent any other way; if that
   connection goes down, the program cannot reach anyone until it comes
@@ -255,6 +262,17 @@ from people who connect to you, and from the peers themselves, which tell
 each other about the other peers they know ("peer exchange"). Private
 torrents only use their trackers.
 
+**Fast resume.** When a download stops (finished, interrupted with Ctrl-C,
+or given up), and every 30 seconds while it runs, the program notes which
+pieces are on disk, the size and time of last change of each file, and, at
+the end, the parts of pieces it had only half downloaded. The next start
+reads that instead of checking all the data again, so even a very large
+download carries on at once ("fast resume: N pieces taken from the resume
+file without checking"). Any file that has been changed since (its size
+or time differs) is checked as before, and so is everything if the resume
+file is missing or damaged. `-R` checks everything regardless; `-V` always
+checks everything.
+
 **Web seeds.** Some torrents (and magnet links, with `ws=`) list web
 servers that hold the same files, such as a project's download mirror or
 the Internet Archive. The program downloads from them as well as from
@@ -314,8 +332,8 @@ minute, so that newcomers get a chance.
 ## FILES
 
 The program keeps a little data between runs, in `~/.torrentinfo` on Linux
-and FreeBSD and in `%APPDATA%\torrentinfo` on Windows (made when first
-needed):
+and FreeBSD, in `~/Library/Application Support/torrentinfo` on macOS, and in
+`%APPDATA%\torrentinfo` on Windows (made when first needed):
 
 `config`
 : Your settings, one `name = value` per line. The first time the program
@@ -367,6 +385,11 @@ needed):
 
 `dht.dat`
 : The DHT nodes it knew last time, so the next start finds peers sooner.
+
+`resume/`
+: One small file per torrent (named after its info hash) recording what
+  has been downloaded, for fast resume. Deleting them is harmless: the
+  next start just checks the data instead.
 
 `torrents/`
 : The torrent files fetched for magnet links, named after each link's info
@@ -487,12 +510,13 @@ torrentinfo -o photos.torrent -n "Summer photos" -c "From the trip" \
 ```
 
 Block a range of addresses and download to your Downloads folder by
-default (Linux and FreeBSD; on Windows edit the same files in
+default (Linux and FreeBSD; on macOS the files are in
+`~/Library/Application Support/torrentinfo`, on Windows in
 `%APPDATA%\torrentinfo`):
 
 ```
 echo "198.51.100.0/24" >> ~/.torrentinfo/blocklist.txt
-sed -i 's|^#download_directory.*|download_directory = ~/Downloads|' ~/.torrentinfo/config
+echo "download_directory = ~/Downloads" >> ~/.torrentinfo/config
 torrentinfo -D ubuntu.torrent
 ```
 
@@ -510,5 +534,5 @@ torrentinfo -D -S -O . photos.torrent
 
 ## SEE ALSO
 
-*BUILDING.md*, which explains how to build the program on Linux, FreeBSD
-and Windows.
+*BUILDING.md*, which explains how to build the program on Linux, FreeBSD,
+macOS (experimental) and Windows.

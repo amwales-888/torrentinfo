@@ -1,0 +1,147 @@
+# Makefile-macOS - torrentinfo for macOS (EXPERIMENTAL, not yet tested on a Mac)
+#
+#   make -f Makefile-macOS             build the library and the torrentinfo program
+#   make -f Makefile-macOS debug       build with AddressSanitizer and UBSan in
+#                                      build/macos/debug
+#   make -f Makefile-macOS lib         build only libtorrentinfo.a
+#   make -f Makefile-macOS install     install program, library and headers under
+#                                      $(PREFIX)
+#   make -f Makefile-macOS uninstall   remove what 'install' installed
+#   make -f Makefile-macOS clean       remove the macOS build output (build/macos);
+#                                      other systems' builds in build/ are left alone
+#
+# Needs the Xcode Command Line Tools (xcode-select --install) and, from
+# Homebrew:  brew install libuv openssl@3 pkg-config
+#
+# Variables you can override:  CC, CFLAGS, PREFIX, DESTDIR, V=1 (show full
+# commands), OPENSSL_PREFIX (where OpenSSL 3 is; asked of Homebrew by
+# default), ARCHFLAGS (e.g. "-arch arm64 -arch x86_64" for a universal
+# binary, which needs universal builds of libuv and OpenSSL as well; see
+# BUILDING.md).
+#
+# Written for the GNU make 3.81 that comes with macOS: no feature newer than
+# that is used.
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+CC         ?= cc
+PKG_CONFIG ?= pkg-config
+PREFIX     ?= /usr/local
+DESTDIR    ?=
+ARCHFLAGS  ?=
+
+BINDIR     := $(PREFIX)/bin
+LIBDIR     := $(PREFIX)/lib
+INCLUDEDIR := $(PREFIX)/include/torrentinfo
+
+PROGRAM    := torrentinfo
+LIBRARY    := libtorrentinfo.a
+
+SRCDIR      := src
+
+LIB_SOURCES := platform.c net.c extension.c parser.c encoder.c http.c udp.c tracker.c message.c peer.c piece.c storage.c download.c announce.c portmap.c magnet.c metadata.c dht.c blocklist.c config.c crypto.c webseed.c resume.c
+APP_SOURCES := main.c
+HEADERS     := queue.h platform.h net.h extension.h parser.h encoder.h http.h udp.h tracker.h message.h peer.h piece.h storage.h download.h announce.h portmap.h magnet.h metadata.h dht.h blocklist.h config.h crypto.h webseed.h resume.h
+
+PKGS := libuv openssl
+
+# Homebrew installs OpenSSL 3 "keg-only" (not on pkg-config's usual path),
+# so ask Homebrew where it is. The path is given to pkg-config in the same
+# command, since make 3.81 does not pass exported variables to $(shell).
+OPENSSL_PREFIX ?= $(shell brew --prefix openssl@3 2>/dev/null)
+PKG_ENV := PKG_CONFIG_PATH="$(OPENSSL_PREFIX)/lib/pkgconfig:$$PKG_CONFIG_PATH"
+
+# Fail early with a clear message if a dependency is missing.
+ifeq ($(filter clean uninstall,$(MAKECMDGOALS)),)
+  ifneq ($(shell $(PKG_ENV) $(PKG_CONFIG) --exists $(PKGS) && echo yes),yes)
+    $(error Missing libuv, OpenSSL 3 or pkg-config. With Homebrew: \
+            brew install libuv openssl@3 pkg-config)
+  endif
+  PKG_CFLAGS := $(shell $(PKG_ENV) $(PKG_CONFIG) --cflags $(PKGS))
+  PKG_LIBS   := $(shell $(PKG_ENV) $(PKG_CONFIG) --libs $(PKGS))
+endif
+
+# No _POSIX_C_SOURCE here (unlike Makefile-Linux): on macOS it hides the BSD
+# interfaces that the system headers rely on. _DARWIN_C_SOURCE keeps them
+# visible even in the sources that define _POSIX_C_SOURCE themselves.
+CPPFLAGS += -D_DARWIN_C_SOURCE
+CFLAGS   ?= -O2 -g
+CFLAGS   += -std=c99 -Wall -Wextra -Wpedantic -Wshadow -Wconversion
+CFLAGS   += -MMD -MP $(ARCHFLAGS) $(PKG_CFLAGS)
+LDFLAGS  += $(ARCHFLAGS)
+LDLIBS   += $(PKG_LIBS)
+
+# Output goes under build/macos (release builds in build/macos/release, debug
+# builds in build/macos/debug), apart from other systems' builds.
+BUILDROOT := build/macos
+BUILD := $(BUILDROOT)/release
+ifeq ($(MAKECMDGOALS),debug)
+  BUILD   := $(BUILDROOT)/debug
+  CFLAGS  += -O1 -fno-omit-frame-pointer -fsanitize=address,undefined
+  LDFLAGS += -fsanitize=address,undefined
+endif
+
+LIB_OBJECTS := $(LIB_SOURCES:%.c=$(BUILD)/%.o)
+APP_OBJECTS := $(APP_SOURCES:%.c=$(BUILD)/%.o)
+DEPENDS     := $(LIB_OBJECTS:.o=.d) $(APP_OBJECTS:.o=.d)
+
+# Quiet output; 'make V=1' shows full commands.
+ifeq ($(V),1)
+  Q :=
+  say :=
+else
+  Q := @
+  say = @printf '  %-6s %s\n' $(1) $(2);
+endif
+
+# ---------------------------------------------------------------------------
+# Targets
+# ---------------------------------------------------------------------------
+
+.PHONY: all debug lib install uninstall clean
+
+all: $(BUILD)/$(PROGRAM)
+	$(Q)ln -sf $(BUILD)/$(PROGRAM) $(PROGRAM)
+
+debug: $(BUILD)/$(PROGRAM)
+	@echo "Debug build: $(BUILD)/$(PROGRAM)"
+
+lib: $(BUILD)/$(LIBRARY)
+
+$(BUILD)/$(PROGRAM): $(APP_OBJECTS) $(BUILD)/$(LIBRARY)
+	$(call say,LINK,$@)
+	$(Q)$(CC) $(LDFLAGS) -o $@ $(APP_OBJECTS) $(BUILD)/$(LIBRARY) $(LDLIBS)
+
+$(BUILD)/$(LIBRARY): $(LIB_OBJECTS)
+	$(call say,AR,$@)
+	$(Q)rm -f $@
+	$(Q)$(AR) rcs $@ $^
+
+$(BUILD)/%.o: $(SRCDIR)/%.c | $(BUILD)
+	$(call say,CC,$<)
+	$(Q)$(CC) $(CPPFLAGS) $(CFLAGS) -c -o $@ $<
+
+$(BUILD):
+	$(Q)mkdir -p $@
+
+install: all
+	install -d $(DESTDIR)$(BINDIR) $(DESTDIR)$(LIBDIR) $(DESTDIR)$(INCLUDEDIR)
+	install -m 755 $(BUILD)/$(PROGRAM) $(DESTDIR)$(BINDIR)/$(PROGRAM)
+	install -m 644 $(BUILD)/$(LIBRARY) $(DESTDIR)$(LIBDIR)/$(LIBRARY)
+	install -m 644 $(addprefix $(SRCDIR)/,$(HEADERS)) $(DESTDIR)$(INCLUDEDIR)/
+
+uninstall:
+	rm -f $(DESTDIR)$(BINDIR)/$(PROGRAM)
+	rm -f $(DESTDIR)$(LIBDIR)/$(LIBRARY)
+	rm -f $(addprefix $(DESTDIR)$(INCLUDEDIR)/,$(HEADERS))
+	-rmdir $(DESTDIR)$(INCLUDEDIR) 2>/dev/null
+
+clean:
+	rm -rf $(BUILDROOT)
+	@if [ -L $(PROGRAM) ]; then rm -f $(PROGRAM); fi
+	@rmdir build 2>/dev/null || true
+
+# Header dependencies generated by -MMD.
+-include $(DEPENDS)

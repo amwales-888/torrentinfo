@@ -41,12 +41,12 @@ SRCDIR=         src
 LIB_SOURCES=    platform.c net.c extension.c parser.c encoder.c http.c udp.c \
                 tracker.c message.c peer.c piece.c storage.c download.c \
                 announce.c portmap.c magnet.c metadata.c dht.c blocklist.c \
-                config.c crypto.c webseed.c
+                config.c crypto.c webseed.c resume.c
 APP_SOURCES=    main.c
 HEADERS=        queue.h platform.h net.h extension.h parser.h encoder.h http.h \
                 udp.h tracker.h message.h peer.h piece.h storage.h download.h \
                 announce.h portmap.h magnet.h metadata.h dht.h blocklist.h \
-                config.h crypto.h webseed.h
+                config.h crypto.h webseed.h resume.h
 
 # Release builds in build/freebsd/release, debug builds in build/freebsd/debug.
 BUILDROOT=      build/freebsd

@@ -1,13 +1,14 @@
 /*
- * platform.c - What differs between Linux, FreeBSD (POSIX) and Windows (Win32).
+ * platform.c - What differs between Linux, FreeBSD, macOS (POSIX) and Windows
+ * (Win32).
  *
  * See platform.h. Errors are converted to libuv error codes with
  * uv_translate_sys_error(), which takes errno on Linux and FreeBSD and
  * GetLastError() values on Windows.
  */
-#if !defined(_WIN32) && !defined(__FreeBSD__)
-/* On FreeBSD this would hide the routing sysctl and other BSD interfaces;
- * its default environment already has everything POSIX. */
+#if !defined(_WIN32) && !defined(__FreeBSD__) && !defined(__APPLE__)
+/* On FreeBSD and macOS this would hide the routing sysctl and other BSD
+ * interfaces; their default environment already has everything POSIX. */
 #define _POSIX_C_SOURCE 200809L
 #define _DEFAULT_SOURCE             /* glibc: SO_BINDTODEVICE */
 #define _FILE_OFFSET_BITS 64        /* 64-bit off_t on 32-bit Linux too */
@@ -105,6 +106,59 @@ int32_t platformFileStat(const char *path, uint64_t *size, uint8_t *isRegular)
     }
     result = platformFileInfo(&file, size, isRegular);
     CloseHandle((HANDLE)file.handle);
+    return result;
+}
+
+int32_t platformFileStamp(const char *path, uint64_t *size, uint8_t *isRegular,
+                          int64_t *modified)
+{
+    platformFile file;
+    FILETIME     written;
+    int32_t      result;
+
+    result = openWith(path, FILE_READ_ATTRIBUTES,
+                      FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                      OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, &file);
+    if (result != 0) {
+        return result;
+    }
+    result = platformFileInfo(&file, size, isRegular);
+    if (result == 0) {
+        if (GetFileTime((HANDLE)file.handle, NULL, NULL, &written)) {
+            *modified = (int64_t)((((uint64_t)written.dwHighDateTime << 32) |
+                                   written.dwLowDateTime) * 100u);
+        } else {
+            result = lastError();
+        }
+    }
+    CloseHandle((HANDLE)file.handle);
+    return result;
+}
+
+int32_t platformFileReplace(const char *from, const char *to)
+{
+    wchar_t wideFrom[PLATFORM_MAX_PATH];
+    wchar_t wideTo[PLATFORM_MAX_PATH];
+    int32_t result = widen(from, wideFrom);
+
+    if (result == 0) {
+        result = widen(to, wideTo);
+    }
+    if (result == 0 &&
+        !MoveFileExW(wideFrom, wideTo, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        result = lastError();
+    }
+    return result;
+}
+
+int32_t platformFileRemove(const char *path)
+{
+    wchar_t wide[PLATFORM_MAX_PATH];
+    int32_t result = widen(path, wide);
+
+    if (result == 0 && !DeleteFileW(wide)) {
+        result = lastError();
+    }
     return result;
 }
 
@@ -312,7 +366,7 @@ const char *const *platformCertificateBundles(void)
 
 #else
 /* ======================================================================== */
-/* Linux and FreeBSD (POSIX)                                                */
+/* Linux, FreeBSD and macOS (POSIX)                                         */
 /* ======================================================================== */
 
 #include <errno.h>
@@ -322,7 +376,7 @@ const char *const *platformCertificateBundles(void)
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <unistd.h>
-#if defined(__FreeBSD__)
+#if defined(__FreeBSD__) || defined(__APPLE__)
 #include <stddef.h>
 #include <sys/sysctl.h>
 #include <net/route.h>
@@ -351,6 +405,46 @@ int32_t platformFileStat(const char *path, uint64_t *size, uint8_t *isRegular)
     }
     describe(&information, size, isRegular);
     return 0;
+}
+
+int32_t platformFileStamp(const char *path, uint64_t *size, uint8_t *isRegular,
+                          int64_t *modified)
+{
+    struct stat information;
+
+    if (path == NULL || path[0] == '\0') {
+        return UV_EINVAL;
+    }
+    if (stat(path, &information) != 0) {
+        return lastError();
+    }
+    describe(&information, size, isRegular);
+#if defined(__APPLE__)
+    /* macOS names it st_mtimespec. */
+    *modified = (int64_t)information.st_mtimespec.tv_sec * 1000000000 +
+                (int64_t)information.st_mtimespec.tv_nsec;
+#else
+    /* st_mtim: POSIX 2008, on Linux (glibc, musl) and FreeBSD alike. */
+    *modified = (int64_t)information.st_mtim.tv_sec * 1000000000 +
+                (int64_t)information.st_mtim.tv_nsec;
+#endif
+    return 0;
+}
+
+int32_t platformFileReplace(const char *from, const char *to)
+{
+    if (from == NULL || to == NULL) {
+        return UV_EINVAL;
+    }
+    return (rename(from, to) == 0) ? 0 : lastError();
+}
+
+int32_t platformFileRemove(const char *path)
+{
+    if (path == NULL || path[0] == '\0') {
+        return UV_EINVAL;
+    }
+    return (unlink(path) == 0) ? 0 : lastError();
 }
 
 int32_t platformFileOpenRead(const char *path, platformFile *file)
@@ -530,6 +624,34 @@ int32_t platformDefaultGateway(const char *name, uint32_t index, void *scratch, 
     return found ? 0 : UV_ENOENT;
 }
 
+#elif defined(__APPLE__)
+
+/* macOS: IP_BOUND_IF / IPV6_BOUND_IF tie a socket to an interface by index. */
+int32_t platformInterfaceTieCheck(const char *name, uint32_t index)
+{
+    (void)index;
+    return (if_nametoindex(name) != 0) ? 0 : UV_ENODEV;
+}
+
+int32_t platformInterfaceTie(uv_os_sock_t sock, int family, const char *name, uint32_t index)
+{
+    int interfaceIndex = (int)if_nametoindex(name);
+    int result;
+
+    (void)index;
+    if (interfaceIndex == 0) {
+        return UV_ENODEV;
+    }
+    if (family == AF_INET6) {
+        result = setsockopt(sock, IPPROTO_IPV6, IPV6_BOUND_IF, &interfaceIndex,
+                            (socklen_t)sizeof(interfaceIndex));
+    } else {
+        result = setsockopt(sock, IPPROTO_IP, IP_BOUND_IF, &interfaceIndex,
+                            (socklen_t)sizeof(interfaceIndex));
+    }
+    return (result == 0) ? 0 : lastError();
+}
+
 #else   /* FreeBSD and other POSIX systems: no per-interface socket option */
 
 int32_t platformInterfaceTieCheck(const char *name, uint32_t index)
@@ -548,7 +670,22 @@ int32_t platformInterfaceTie(uv_os_sock_t sock, int family, const char *name, ui
     return UV_ENOTSUP;
 }
 
-#if defined(__FreeBSD__)
+#endif  /* networking */
+
+#if defined(__FreeBSD__) || defined(__APPLE__)
+
+/*
+ * The routing sysctl (NET_RT_FLAGS) on FreeBSD and macOS: messages of an
+ * rt_msghdr followed by its addresses, each padded to a boundary: a long
+ * on FreeBSD (SA_SIZE), 32 bits on macOS.
+ */
+#if defined(__APPLE__)
+#define ROUTE_STEP(address) ((address)->sa_len > 0                                              \
+                             ? (1u + (((size_t)(address)->sa_len - 1u) | (sizeof(uint32_t) - 1u))) \
+                             : sizeof(uint32_t))
+#else
+#define ROUTE_STEP(address) SA_SIZE(address)
+#endif
 
 /* Is the IPv4 netmask in the routing message all zeros (a default route)?
  * It may be cut short (sa_len), the missing bytes being zero. */
@@ -638,7 +775,7 @@ int32_t platformDefaultGateway(const char *name, uint32_t index, void *scratch, 
                 mask = address;
             }
             address = (const struct sockaddr *)(const void *)((const char *)address +
-                                                               SA_SIZE(address));
+                                                               ROUTE_STEP(address));
         }
         if (destination == NULL || via == NULL || destination->sa_family != AF_INET ||
             via->sa_family != AF_INET ||
@@ -652,7 +789,7 @@ int32_t platformDefaultGateway(const char *name, uint32_t index, void *scratch, 
     return UV_ENOENT;
 }
 
-#else
+#elif !defined(__linux__)
 
 int32_t platformDefaultGateway(const char *name, uint32_t index, void *scratch, size_t *size,
                                uint32_t *gateway)
@@ -666,12 +803,20 @@ int32_t platformDefaultGateway(const char *name, uint32_t index, void *scratch, 
 }
 
 #endif
-#endif  /* networking */
 
 const char *const *platformCertificateBundles(void)
 {
     static const char *const bundles[] = {
-#if defined(__FreeBSD__)
+#if defined(__APPLE__)
+        /* macOS keeps its roots in the Keychain, which OpenSSL cannot read;
+         * these are PEM copies. */
+        "/opt/homebrew/etc/openssl@3/cert.pem",                 /* Homebrew, Apple silicon */
+        "/usr/local/etc/openssl@3/cert.pem",                    /* Homebrew, Intel   */
+        "/opt/homebrew/etc/ca-certificates/cert.pem",           /* ca-certificates   */
+        "/usr/local/etc/ca-certificates/cert.pem",
+        "/opt/local/etc/openssl/cert.pem",                      /* MacPorts          */
+        "/etc/ssl/cert.pem",                                    /* the system's copy */
+#elif defined(__FreeBSD__)
         "/etc/ssl/cert.pem",                                    /* base system (certctl) */
         "/usr/local/share/certs/ca-root-nss.crt",               /* ca_root_nss package   */
         "/usr/local/etc/ssl/cert.pem",                          /* ports OpenSSL         */
@@ -734,7 +879,7 @@ int32_t platformFileWriteAt(platformFile *file, uint64_t offset, const void *buf
 #endif
 
 /* ------------------------------------------------------------------------ */
-/* Both platforms                                                           */
+/* All platforms                                                            */
 /* ------------------------------------------------------------------------ */
 
 int32_t platformDataDirectory(const char *subdirectory, char *path, size_t size)
@@ -753,6 +898,21 @@ int32_t platformDataDirectory(const char *subdirectory, char *path, size_t size)
         return result;
     }
     written = snprintf(path, size, "%s\\torrentinfo", base);
+#elif defined(__APPLE__)
+    /* The macOS convention: ~/Library/Application Support/torrentinfo */
+    result = uv_os_homedir(base, &length);
+    if (result != 0) {
+        return result;
+    }
+    written = snprintf(path, size, "%s/Library/Application Support", base);
+    if (written < 0 || (size_t)written >= size) {
+        return UV_ENAMETOOLONG;
+    }
+    result = platformMakeDirectory(path);           /* there already, normally */
+    if (result != 0) {
+        return result;
+    }
+    written = snprintf(path, size, "%s/Library/Application Support/torrentinfo", base);
 #else
     result = uv_os_homedir(base, &length);
     if (result != 0) {

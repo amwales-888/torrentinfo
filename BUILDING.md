@@ -1,18 +1,21 @@
 # Building torrentinfo
 
 The library and the `torrentinfo` program build on Linux, FreeBSD and Windows
-from the same sources, which are all in `src/`; build output goes in `build/`
-(Linux in `build/linux`, FreeBSD in `build/freebsd`, Visual Studio in
-`build/x64` and `build/obj`, so they can sit side by side, for example on a
-shared disk).
+from the same sources, which are all in `src/`, and there is an
+**experimental, untested** macOS port (see below). Build output goes in
+`build/` (Linux in `build/linux`, FreeBSD in `build/freebsd`, macOS in
+`build/macos`, Visual Studio in `build/x64` and `build/obj`, so they can sit
+side by side, for example on a shared disk).
 
-There is one makefile per system: `Makefile-Linux` (GNU make) and
-`Makefile-FreeBSD` (FreeBSD's own make), so give it with `-f`. Visual
-Studio uses `torrentinfo.sln`.
+There is one makefile per system: `Makefile-Linux` (GNU make),
+`Makefile-FreeBSD` (FreeBSD's own make) and `Makefile-macOS` (the GNU make
+3.81 that comes with macOS), so give it with `-f`. Visual Studio uses
+`torrentinfo.sln`.
 
-Platform differences are confined to `src/platform.c` (file access; tying
-sockets to a network interface; finding the default gateway; where the
-trusted CA certificates are), `src/net.c` (choosing the interface), the
+Platform differences are confined to `src/platform.c` (file access and
+file times; tying sockets to a network interface; finding the default
+gateway; where the trusted CA certificates are; the data directory),
+`src/net.c` (choosing the interface), the
 Windows certificate store in `src/http.c`, and a few `#ifdef _WIN32` lines
 in `src/main.c`. Lists use the bundled 4.4BSD `queue.h` on every platform.
 
@@ -89,6 +92,81 @@ tree, for amd64 and arm64 (with `-Wall -Wextra -Wpedantic -Wconversion
 -Wshadow`, no warnings), and Makefile-FreeBSD was run with bmake and
 FreeBSD's `sys.mk`; the program has not yet been run on a FreeBSD
 machine.
+
+## macOS (EXPERIMENTAL: not yet tested on a Mac)
+
+> **Status: experimental and untested.** The macOS port has been written
+> and compiled, but it has never been built with Apple's SDK, linked, or
+> run on a Mac. Expect to find problems the first time; please report the
+> output of the build and of a first download so they can be fixed. Linux,
+> FreeBSD (compile only, also not yet run) and Windows are unaffected by
+> it.
+
+macOS 12 or later, on Apple silicon or Intel. You need the Xcode Command
+Line Tools (for `cc`, which is Apple's clang, and `make`) and
+[Homebrew](https://brew.sh) for libuv, OpenSSL 3 and pkg-config:
+
+```sh
+xcode-select --install                       # once, if not done already
+brew install libuv openssl@3 pkg-config
+make -f Makefile-macOS                       # build/macos/release/torrentinfo (and ./torrentinfo link)
+make -f Makefile-macOS debug                 # AddressSanitizer + UBSan build in build/macos/debug
+make -f Makefile-macOS install PREFIX=$HOME/.local
+make -f Makefile-macOS clean                 # removes build/macos only
+```
+
+Homebrew installs OpenSSL 3 out of the way ("keg-only"), so the makefile
+asks `brew --prefix openssl@3` where it is; set `OPENSSL_PREFIX=...` to use
+another copy (MacPorts: `/opt/local`). Other variables: `CC`, `CFLAGS`,
+`PREFIX`, `DESTDIR`, `V=1` (show the full commands), and `ARCHFLAGS`.
+Like Makefile-FreeBSD, it does not define `_POSIX_C_SOURCE` for every file
+(on macOS that hides the BSD interfaces the system headers rely on); it
+defines `_DARWIN_C_SOURCE` instead.
+
+**A universal binary** (one program for Apple silicon and Intel) needs
+libuv and OpenSSL built for both as well, which Homebrew does not do: build
+them yourself with `-arch arm64 -arch x86_64` (or join two builds with
+`lipo -create`), point pkg-config at them, and then
+`make -f Makefile-macOS ARCHFLAGS="-arch arm64 -arch x86_64"`. A plain build
+runs on the kind of Mac it was built on.
+
+What is different on macOS:
+
+- **Data directory:** `~/Library/Application Support/torrentinfo` (the
+  macOS convention) rather than `~/.torrentinfo`; the settings file,
+  blocklist, DHT table, cached torrents and resume files all go there.
+- **Choosing a network interface (`-I`)** works fully, as on Linux and
+  Windows: each socket is tied to the interface with `IP_BOUND_IF` /
+  `IPV6_BOUND_IF` (by its index, from `if_nametoindex()`), as well as bound
+  to its address. Interface names are like `en0` (Wi-Fi or Ethernet) and
+  `utun3` (VPNs); `ifconfig` lists them.
+- **The default gateway** (for NAT-PMP port forwarding) comes from the
+  routing sysctl, as on FreeBSD, except that macOS pads the addresses in
+  routing messages to 4 bytes rather than 8.
+- **Trusted certificates for HTTPS:** macOS keeps them in the Keychain,
+  which OpenSSL cannot read. After `SSL_CERT_FILE` and OpenSSL's own
+  default, the program looks for Homebrew's copy
+  (`/opt/homebrew/etc/openssl@3/cert.pem`, or under `/usr/local` on Intel
+  Macs), then `ca-certificates`, MacPorts, and finally `/etc/ssl/cert.pem`.
+  If HTTPS trackers or web seeds fail with a certificate error, run
+  `brew install ca-certificates` or set `SSL_CERT_FILE`.
+- **Fast resume** reads the files' modification times from `st_mtimespec`
+  (macOS's name for `st_mtim`).
+- **The firewall:** with the macOS application firewall turned on, the
+  first time the program listens for peers (`-L`, or seeding) macOS may ask
+  whether to allow incoming connections. Without that, downloads still work
+  but other peers cannot connect to you.
+- Everything else (files, sockets through libuv's kqueue backend, threads,
+  Ctrl-C) needs nothing special.
+
+What has been checked so far, without a Mac: every source file compiles
+with no warnings (`-Wall -Wextra -Wpedantic -Wconversion -Wshadow`) for
+arm64 and x86_64 against Apple's open-source headers (xnu, Libc,
+libpthread, Libinfo, libplatform, libmalloc), with stand-ins for the few
+SDK headers that are not published (availability annotations, generated
+Mach interfaces, `TargetConditionals.h`); and Makefile-macOS builds macOS
+(Mach-O) objects and the library with them. Linking against the real
+libraries and running the program are still to be done.
 
 ## Windows (Visual Studio 2026)
 
@@ -216,9 +294,11 @@ project's *Properties > Debugging > Command Arguments*.
   transfer).
 
 - **Data directory.** Lasting data is kept in `~/.torrentinfo` on Linux and
-  FreeBSD and `%APPDATA%\torrentinfo` on Windows (created when first needed): `dht.dat`,
+  FreeBSD, `~/Library/Application Support/torrentinfo` on macOS, and
+  `%APPDATA%\torrentinfo` on Windows (created when first needed): `dht.dat`,
   the DHT routing table, `torrents\`, the torrents fetched for magnet
-  links, `config`, the settings, and `blocklist.txt`.
+  links, `resume\`, the fast-resume files, `config`, the settings, and
+  `blocklist.txt`.
 
 - **Settings (config.c).** `config` in the data directory (or the file named
   by `TORRENTINFO_CONFIG`) is read with `configLoad()`: `key = value` lines,
@@ -242,6 +322,32 @@ project's *Properties > Debugging > Command Arguments*.
   peers from every source, incoming connections, DHT nodes (neither stored,
   asked nor answered) and incoming DHT messages; the refusals are counted
   in `peersBlocked` / `dhtStatus.blocked`.
+
+- **Fast resume (resume.c, storage.c, download.c; `-R`).** A resume file
+  per torrent, `resume/<info hash>.resume` in the data directory, records
+  the pieces on disk (download.c's `onDisk`), each file's size and
+  modification time (`platformFileStamp()`: `stat()` `st_mtim` on Linux and
+  FreeBSD, `st_mtimespec` on macOS, `GetFileTime()` on Windows) and, in the final save, the received
+  blocks of unfinished pieces (up to 64 MiB). Format in resume.h; it ends
+  with a SHA-1 of its contents, and is written as `.tmp` and then swapped in
+  with `platformFileReplace()` (`rename()`, `MoveFileExW()`), so it is never
+  half-written. `storageOpen()` takes it as a `storageResume`: in
+  `openWork()` each file's stamp is compared *before* anything resizes it;
+  pieces lying wholly in matching files are settled from the saved
+  bitfield (`pieceFromResume()`), and only the rest go to the parallel hash
+  check. Saving: `resumeEncode()` allocates and encodes on the loop thread;
+  on the thread pool `storageFileStamps()`, `resumeSeal()` (stamps and
+  checksum) and `resumeWrite()` allocate nothing, as the allocator is not
+  thread-safe. Saves happen at most every 30 s while pieces are written,
+  when the download completes, and finally on `downloadEnd()` or an
+  unsuccessful finish, where closing the storage waits for the save
+  (`closeStore()`). Restored blocks become an `activePiece` with no owner,
+  which peers take over (and which is hash-checked when complete, like any
+  other). The bitfield is taken before the files are stamped, so a write
+  landing in between can only make a piece look missing (fetched again) or
+  a file look changed (checked again), never the reverse. Measured on a
+  300 MB torrent: 0.03 s to start against 1.1 s with `-R` (with the data in
+  the page cache; far more from a cold disk).
 
 - **Web seeds (webseed.c, download.c; BEP 19, `-W`, `web_seeds`).**
   `webSeedFetch()` reads any byte range of the torrent's data from one
@@ -332,7 +438,7 @@ project's *Properties > Debugging > Command Arguments*.
   uploaded, downloaded and left. New peers from re-announces join the
   download. A tracker that fails is retried after 1, 2, 4... minutes (up
   to 30). When the download completes the trackers are told "completed";
-  on Ctrl-C (or SIGTERM on Linux and FreeBSD) they are told "stopped" (waiting at most
+  on Ctrl-C (or SIGTERM on Linux, FreeBSD and macOS) they are told "stopped" (waiting at most
   5 seconds; press Ctrl-C again not to wait).
 
 - **Uploading.** Peers are sent our bitfield and a "have" for each new

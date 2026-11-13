@@ -80,6 +80,9 @@
     <ClCompile Include="src\webseed.c">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="src\resume.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="src\queue.h">
@@ -149,6 +152,9 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="src\webseed.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\resume.h">
       <Filter>Header Files</Filter>
     </ClInclude>
   </ItemGroup>

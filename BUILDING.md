@@ -174,6 +174,25 @@ project's *Properties > Debugging > Command Arguments*.
   asked nor answered) and incoming DHT messages; the refusals are counted
   in `peersBlocked` / `dhtStatus.blocked`.
 
+- **Choosing files (`-f`, `-F`).** main.c turns the choice into one byte
+  per file (`downloadOptions.fileWanted`); download.c marks the pieces that
+  touch no chosen file as not wanted (as `-i` does), so they are never
+  requested and "left" counts only the rest. Storage (`storageOpen()`'s
+  `wanted`) does not create skipped files. A wanted piece that also covers a
+  skipped file keeps the skipped bytes in the part file
+  `<folder>/.<name>.parts`: records of an 8-byte header ("TIP1" and the
+  piece index) plus a piece's worth of space, of which only the skipped
+  files' bytes are written. `partSlot[]` maps pieces to records; it is read
+  at open and extended on the loop thread before a write is queued, and
+  reads, writes, the resume check and uploads go through it transparently.
+  A skipped file that already exists is used as a normal file; the part
+  file is deleted when no file needs it. In `STORAGE_READ_ONLY` (`-V`) any
+  missing file is looked for in the part file, and `-V` labels such files
+  `PART FILE`. Patterns are matched by `globMatch()` (`*`, `?`, ASCII case
+  ignored) against the path inside the torrent, or the name alone when the
+  pattern has no `/`. The torrent listing numbers files from 1, padding
+  files not counted.
+
 - **Speed limits (`-d`, `-u`, `max_download_rate`, `max_upload_rate`).**
   Token buckets in download.c (`downloadOptions.maxDownloadRate` /
   `maxUploadRate`, changeable with `downloadSetRateLimits()`), refilled

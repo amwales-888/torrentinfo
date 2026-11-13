@@ -67,6 +67,9 @@ typedef struct storageFileState {
     uint8_t         existed;        /* had data when storageOpen() looked   */
     uint8_t         notRegular;     /* the path is a directory or the like  */
     uint8_t         isPadding;      /* BEP 47 padding: never on disk        */
+    uint8_t         skipped;        /* not wanted (storageOpen()'s 'wanted') */
+    uint8_t         inPartFile;     /* not on disk; any bytes of it that were
+                                       needed are in the part file          */
 } storageFileState;
 
 /* storageOpen() has finished. errorMessage is NULL on success. */
@@ -94,13 +97,15 @@ typedef void (*storageReadCallback)(void *privateArg, storage *store, uint32_t p
  * Prepare the files for 'torrent' under 'directory' (created if needed;
  * "" means the current directory). With STORAGE_CHECK_EXISTING, data
  * already present is hashed piece by piece and storageHave() reports the
- * pieces that match. On STORAGE_OK the work is under way and 'callback'
+ * pieces that match. 'wanted' (one byte per file, in torrent order; NULL:
+ * all) says which files to create: see storage.c about the part file that
+ * holds the edges of pieces shared with skipped files. On STORAGE_OK the work is under way and 'callback'
  * will run once; *store receives the handle, which stays valid until
  * storageClose(). The torrent is not needed after this call returns.
  */
 int32_t storageOpen(uv_loop_t *loop, parserContext *context, const parserTorrent *torrent,
-                    const char *directory, uint32_t flags, storageOpenCallback callback,
-                    void *privateArg, storage **store);
+                    const char *directory, uint32_t flags, const uint8_t *wanted,
+                    storageOpenCallback callback, void *privateArg, storage **store);
 
 /*
  * Write piece 'pieceIndex'. 'data' must hold the whole piece and must have

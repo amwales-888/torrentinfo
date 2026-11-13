@@ -227,6 +227,196 @@ static void printFilePath(const parserTorrent *torrent, const parserFile *file)
     }
 }
 
+/* ------------------------------------------------------------------------ */
+/* Choosing files (-f, -F)                                                  */
+/* ------------------------------------------------------------------------ */
+
+#define SELECT_MAX_PATTERNS 32u
+
+static const char *selectList;                      /* -f "1,3,5-7"            */
+static const char *selectPatterns[SELECT_MAX_PATTERNS];   /* -F, any number   */
+static uint32_t    selectPatternCount;
+
+static int selecting(void)
+{
+    return selectList != NULL || selectPatternCount > 0;
+}
+
+/* The file's path inside the torrent, '/'-separated (no torrent name). */
+static void filePathText(const parserFile *file, char *text, size_t size)
+{
+    const parserPathComponent *component;
+    size_t                     used = 0;
+
+    text[0] = '\0';
+    TAILQ_FOREACH(component, &file->path, entries) {
+        int written = snprintf(text + used, size - used, "%s%s",
+                               (component != TAILQ_FIRST(&file->path)) ? "/" : "",
+                               component->name);
+
+        if (written < 0 || (size_t)written >= size - used) {
+            return;                                 /* truncated: good enough */
+        }
+        used += (size_t)written;
+    }
+}
+
+static char lowerAscii(char c)
+{
+    return (c >= 'A' && c <= 'Z') ? (char)(c - 'A' + 'a') : c;
+}
+
+/* Shell-style match, ignoring ASCII case: '*' is any text (including '/'),
+ * '?' any one character. */
+static int globMatch(const char *pattern, const char *text)
+{
+    const char *starPattern = NULL;
+    const char *starText = NULL;
+
+    while (*text != '\0') {
+        if (*pattern == '*') {
+            starPattern = ++pattern;
+            starText = text;
+        } else if (*pattern == '?' || (*pattern != '\0' && lowerAscii(*pattern) == lowerAscii(*text))) {
+            pattern++;
+            text++;
+        } else if (starPattern != NULL) {
+            pattern = starPattern;
+            text = ++starText;
+        } else {
+            return 0;
+        }
+    }
+    while (*pattern == '*') {
+        pattern++;
+    }
+    return *pattern == '\0';
+}
+
+/*
+ * Fill wanted[] (one byte per file, padding included) from -f and -F, and
+ * say what was chosen. Files are numbered from 1 as the torrent listing
+ * shows them, padding files not counted. -1 (after a message) if the
+ * choice is wrong or empty.
+ */
+static int chooseFiles(const parserTorrent *torrent, uint8_t *wanted)
+{
+    const parserFile *file;
+    uint32_t          count = 0;                    /* numbered files */
+    uint32_t          chosen = 0;
+    uint64_t          chosenBytes = 0;
+    uint64_t          allBytes = 0;
+    uint32_t          index;
+    uint32_t          number;
+    uint32_t          i;
+    char              path[4096];
+    char              size[32];
+    char              total[32];
+
+    memset(wanted, 0, torrent->fileCount);
+    TAILQ_FOREACH(file, &torrent->files, entries) {
+        count += file->isPadding ? 0u : 1u;
+    }
+    if (selectList != NULL) {
+        const char *at = selectList;
+
+        while (*at != '\0') {
+            unsigned long first;
+            unsigned long last;
+            char         *end;
+
+            if (*at < '0' || *at > '9') {
+                fprintf(stderr, "-f: expected file numbers like 1,3,5-7, not \"%s\"\n", selectList);
+                return -1;
+            }
+            first = strtoul(at, &end, 10);
+            last = first;
+            if (*end == '-') {
+                at = end + 1;
+                if (*at < '0' || *at > '9') {
+                    fprintf(stderr, "-f: expected file numbers like 1,3,5-7, not \"%s\"\n",
+                            selectList);
+                    return -1;
+                }
+                last = strtoul(at, &end, 10);
+            }
+            if (*end != '\0' && *end != ',') {
+                fprintf(stderr, "-f: expected file numbers like 1,3,5-7, not \"%s\"\n", selectList);
+                return -1;
+            }
+            if (last < first) {
+                fprintf(stderr, "-f: %lu-%lu is backwards: write %lu-%lu\n", first, last, last,
+                        first);
+                return -1;
+            }
+            if (first == 0 || last > count) {
+                if (count == 1u) {
+                    fprintf(stderr, "-f: no file %lu: the torrent has only file 1\n",
+                            (first == 0 || first > count) ? first : last);
+                } else {
+                    fprintf(stderr, "-f: no file %lu: the torrent has files 1 to %" PRIu32 "\n",
+                            (first == 0 || first > count) ? first : last, count);
+                }
+                return -1;
+            }
+            /* Mark files first..last, counting only numbered (non-padding) files. */
+            index = 0;
+            number = 0;
+            TAILQ_FOREACH(file, &torrent->files, entries) {
+                if (!file->isPadding && ++number >= first && number <= last) {
+                    wanted[index] = 1;
+                }
+                index++;
+            }
+            at = (*end == ',') ? end + 1 : end;
+        }
+    }
+    for (i = 0; i < selectPatternCount; i++) {
+        uint32_t matched = 0;
+
+        index = 0;
+        TAILQ_FOREACH(file, &torrent->files, entries) {
+            const char *name;
+
+            if (!file->isPadding) {
+                filePathText(file, path, sizeof(path));
+                name = strrchr(path, '/');
+                name = (name != NULL) ? name + 1 : path;
+                /* A pattern without '/' may match just the file name. */
+                if (globMatch(selectPatterns[i], path) ||
+                    (strchr(selectPatterns[i], '/') == NULL && globMatch(selectPatterns[i], name))) {
+                    wanted[index] = 1;
+                    matched++;
+                }
+            }
+            index++;
+        }
+        if (matched == 0) {
+            printf("-F %s: matches no file\n", selectPatterns[i]);
+        }
+    }
+    index = 0;
+    TAILQ_FOREACH(file, &torrent->files, entries) {
+        if (!file->isPadding) {
+            allBytes += file->length;
+            if (wanted[index]) {
+                chosen++;
+                chosenBytes += file->length;
+            }
+        }
+        index++;
+    }
+    if (chosen == 0) {
+        fprintf(stderr, "No files chosen: nothing to do.\n");
+        return -1;
+    }
+    formatSize(chosenBytes, size, sizeof(size));
+    formatSize(allBytes, total, sizeof(total));
+    printf("Chosen:     %" PRIu32 " of %" PRIu32 " file%s, %s of %s\n", chosen, count,
+           (count == 1u) ? "" : "s", size, total);
+    return 0;
+}
+
 /* Thread-safe UTC conversion: gmtime_r() on POSIX, gmtime_s() on Windows. */
 static int toUtc(time_t timestamp, struct tm *calendar)
 {
@@ -247,6 +437,7 @@ static void printTorrent(const char *path, const parserTorrent *torrent)
     struct tm         calendar;
     time_t            timestamp;
     uint32_t          index;
+    uint32_t          fileNumber = 0;
 
     printf("Torrent: %s\n\n", path);
 
@@ -303,8 +494,13 @@ static void printTorrent(const char *path, const parserTorrent *torrent)
     }
 
     printf("\nFiles (%" PRIu32 ")\n", torrent->fileCount);
-    printf("  %16s  %16s  %s\n", "Offset", "Size", "Path");
+    printf("  %5s  %16s  %16s  %s\n", "#", "Offset", "Size", "Path");
     TAILQ_FOREACH(file, &torrent->files, entries) {
+        if (file->isPadding) {
+            printf("  %5s", "");
+        } else {
+            printf("  %5" PRIu32, ++fileNumber);
+        }
         printf("  %16" PRIu64 "  %16" PRIu64 "  ", file->offset, file->length);
         printFilePath(torrent, file);
         if (file->isPadding) {
@@ -1499,8 +1695,9 @@ static void onDownloadReady(void *privateArg, download *transfer, int32_t status
     downloadGetProgress(transfer, &progress);
     printf("Saving to:  %s\n", downloadRoot(transfer));
     if (progress.resumed > 0) {
-        printf("Resuming:   %" PRIu32 " of %" PRIu32 " pieces already on disk and verified\n",
-               progress.resumed, progress.pieceCount);
+        printf("Resuming:   %" PRIu32 " of %" PRIu32 "%s pieces already on disk and verified\n",
+               progress.resumed, progress.wanted,
+               (progress.wanted < progress.pieceCount) ? " wanted" : "");
     }
     if (progress.done < progress.wanted) {
         printf("\nDownloading %" PRIu32 " piece(s); Ctrl-C to stop\n",
@@ -1608,6 +1805,7 @@ static int downloadTorrent(uv_loop_t *loop, parserContext *context, const parser
     downloadOptions options;
     trackerConfig   trackerSettings = *config;
     downloadRun     run;
+    uint8_t        *fileWanted = NULL;
     int32_t         status;
 
     if (wanted >= (int64_t)torrent->pieceCount) {
@@ -1634,6 +1832,16 @@ static int downloadTorrent(uv_loop_t *loop, parserContext *context, const parser
     options.uploadSlots = settingsUploadSlots;
     options.maxDownloadRate = maxDownloadRate;
     options.maxUploadRate = maxUploadRate;
+    if (selecting()) {
+        fileWanted = context->allocator.realloc(NULL, torrent->fileCount);
+        if (fileWanted == NULL || chooseFiles(torrent, fileWanted) != 0) {
+            if (fileWanted != NULL) {
+                context->allocator.free(fileWanted);
+            }
+            return -1;
+        }
+        options.fileWanted = fileWanted;
+    }
 
     uv_timer_init(loop, &run.timer);
     run.timer.data = &run;
@@ -1652,6 +1860,10 @@ static int downloadTorrent(uv_loop_t *loop, parserContext *context, const parser
     printf("\nChecking files...\n");
     fflush(stdout);
     status = downloadBegin(loop, context, torrent, &options, &events, &run, &run.transfer);
+    if (fileWanted != NULL) {
+        context->allocator.free(fileWanted);        /* only read by downloadBegin() */
+        fileWanted = NULL;
+    }
     if (status != DOWNLOAD_OK) {
         printf("Could not start the download: %s\n", downloadStatusString(status));
         run.failed = 1;
@@ -1716,6 +1928,9 @@ static int downloadTorrent(uv_loop_t *loop, parserContext *context, const parser
     }
 
 done:
+    if (fileWanted != NULL) {
+        context->allocator.free(fileWanted);
+    }
     uv_close((uv_handle_t *)&run.timer, NULL);
     uv_close((uv_handle_t *)&run.interrupt, NULL);
 #ifndef _WIN32
@@ -1858,6 +2073,11 @@ static int verifyTorrent(parserContext *context, const parserAllocator *allocato
     uint32_t          shown = 0;
     uint32_t          padding = 0;
     uint32_t          filesComplete = 0;
+    uint32_t          skipped = 0;
+    uint32_t          wantedCount = 0;      /* pieces of the chosen files       */
+    uint32_t          wantedHave = 0;       /* ...that are verified             */
+    uint8_t          *fileWanted = NULL;    /* -f / -F, or NULL for every file */
+    uint8_t          *pieceWanted = NULL;   /* bitfield                         */
     uint32_t          i;
     char              size[64];
     char              total[64];
@@ -1882,10 +2102,43 @@ static int verifyTorrent(parserContext *context, const parserAllocator *allocato
     printf("\nPieces:     %" PRIu32 " of %s\n", torrent.pieceCount, size);
     fflush(stdout);
 
+    if (selecting()) {
+        fileWanted = context->allocator.realloc(NULL, torrent.fileCount);
+        if (fileWanted == NULL || chooseFiles(&torrent, fileWanted) != 0) {
+            if (fileWanted != NULL) {
+                context->allocator.free(fileWanted);
+            }
+            parserFree(context, &torrent);
+            return -1;
+        }
+    }
+    pieceWanted = context->allocator.realloc(NULL, messageBitfieldBytes(torrent.pieceCount) + 1u);
+    if (pieceWanted == NULL) {
+        if (fileWanted != NULL) {
+            context->allocator.free(fileWanted);
+        }
+        parserFree(context, &torrent);
+        return -1;
+    }
+    memset(pieceWanted, 0, messageBitfieldBytes(torrent.pieceCount) + 1u);
+    TAILQ_FOREACH(file, &torrent.files, entries) {
+        if ((fileWanted == NULL || fileWanted[fileIndex]) && file->length > 0 && !file->isPadding) {
+            for (i = (uint32_t)(file->offset / torrent.pieceLength);
+                 i <= (uint32_t)((file->offset + file->length - 1u) / torrent.pieceLength); i++) {
+                messageBitfieldSet(pieceWanted, i);
+            }
+        }
+        fileIndex++;
+    }
+    fileIndex = 0;
+    for (i = 0; i < torrent.pieceCount; i++) {
+        wantedCount += messageBitfieldGet(pieceWanted, i) ? 1u : 0u;
+    }
+
     memset(&run, 0, sizeof(run));
     uv_loop_init(&loop);
-    status = storageOpen(&loop, context, &torrent, directory, STORAGE_READ_ONLY, onVerifyOpen,
-                         &run, &store);
+    status = storageOpen(&loop, context, &torrent, directory, STORAGE_READ_ONLY, fileWanted,
+                         onVerifyOpen, &run, &store);
     if (status != STORAGE_OK) {
         printf("Could not check the files: %s\n", storageStatusString(status));
         goto done;
@@ -1922,6 +2175,10 @@ static int verifyTorrent(parserContext *context, const parserAllocator *allocato
             padding++;
             continue;
         }
+        if (state.skipped) {
+            skipped++;
+            continue;
+        }
         dataLength += file->length;
         for (i = first; file->length > 0 && i <= last; i++) {
             if (messageBitfieldGet(have, i)) {
@@ -1933,6 +2190,8 @@ static int verifyTorrent(parserContext *context, const parserAllocator *allocato
 
         if (state.notRegular) {
             label = "NOT A FILE";
+        } else if (state.inPartFile && verified > 0) {
+            label = "PART FILE";                    /* edges kept for a skipped file */
         } else if (verified == file->length) {
             label = "complete";
             filesComplete++;
@@ -1962,6 +2221,10 @@ static int verifyTorrent(parserContext *context, const parserAllocator *allocato
             printf("             size on disk is %s, %s than the torrent says\n", size,
                    (state.sizeOnDisk < file->length) ? "smaller" : "LARGER");
         }
+        if (state.inPartFile && verified > 0) {
+            printf("             not on disk: the bytes shown are kept in the part file,\n"
+                   "             as the file was not chosen for download\n");
+        }
         if (verified < file->length) {
             printf("             missing pieces: ");
             printMissing(have, first, last);
@@ -1973,27 +2236,49 @@ static int verifyTorrent(parserContext *context, const parserAllocator *allocato
         printf("  (%" PRIu32 " padding file%s not shown: never stored on disk)\n", padding,
                (padding == 1u) ? "" : "s");
     }
+    if (skipped > 0) {
+        printf("  (%" PRIu32 " file%s not chosen, not shown)\n", skipped,
+               (skipped == 1u) ? "" : "s");
+    }
+    for (i = 0; i < torrent.pieceCount; i++) {
+        if (messageBitfieldGet(pieceWanted, i) && messageBitfieldGet(have, i)) {
+            wantedHave++;
+        }
+    }
 
     formatSize(bytesDone, size, sizeof(size));
     formatSize(dataLength, total, sizeof(total));
     printf("\nSummary\n");
-    printf("  Status:          %s\n", (haveCount == torrent.pieceCount) ? "COMPLETE" : "INCOMPLETE");
-    printf("  Files:           %" PRIu32 " of %" PRIu32 " complete\n", filesComplete, shown);
-    printf("  Pieces:          %" PRIu32 " of %" PRIu32 " verified (%.1f%%)\n", haveCount,
-           torrent.pieceCount, percentOf(haveCount, torrent.pieceCount));
+    printf("  Status:          %s\n", (wantedHave == wantedCount) ? "COMPLETE" : "INCOMPLETE");
+    printf("  Files:           %" PRIu32 " of %" PRIu32 "%s complete\n", filesComplete, shown,
+           (fileWanted != NULL) ? " chosen" : "");
+    printf("  Pieces:          %" PRIu32 " of %" PRIu32 " verified (%.1f%%)\n", wantedHave,
+           wantedCount, percentOf(wantedHave, wantedCount));
     printf("  Bytes:           %s of %s verified (%.1f%%)\n", size, total,
            percentOf(bytesDone, dataLength));
-    if (haveCount < torrent.pieceCount) {
-        printf("  Missing pieces:  %" PRIu32 ": ", torrent.pieceCount - haveCount);
-        printMissing(have, 0, torrent.pieceCount - 1u);
+    if (wantedHave < wantedCount) {
+        uint32_t first = 0;
+        uint32_t last = torrent.pieceCount - 1u;
+
+        printf("  Missing pieces:  %" PRIu32 "", wantedCount - wantedHave);
+        if (fileWanted == NULL) {
+            printf(": ");
+            printMissing(have, first, last);
+        } else {
+            printf(" (see the files above)");
+        }
         printf("\n");
     }
-    result = (haveCount == torrent.pieceCount) ? 0 : 2;
+    result = (wantedHave == wantedCount) ? 0 : 2;
 
 done:
     storageClose(store);
     uv_run(&loop, UV_RUN_DEFAULT);
     uv_loop_close(&loop);
+    if (fileWanted != NULL) {
+        context->allocator.free(fileWanted);
+    }
+    context->allocator.free(pieceWanted);
     parserFree(context, &torrent);
     return result;
 }
@@ -2835,9 +3120,10 @@ static void usage(const char *program)
             "       %s -o <output.torrent> [options] <file>...\n"
             "       %s -t [-T seconds] [-C ca.pem] [-I interface] <file.torrent>\n"
             "       %s -P [-T seconds] [-C ca.pem] [-I interface] <file.torrent>\n"
-            "       %s -D [-S] [-L port] [-N] [-X] [-d rate] [-u rate] [-O dir] [-i piece]\n"
+            "       %s -D [-S] [-L port] [-N] [-X] [-d rate] [-u rate] [-f list] [-F glob]...\n"
+            "            [-O dir] [-i piece]\n"
             "            [-T seconds] [-C ca.pem] [-I interface] <file.torrent | magnet-link>\n"
-            "       %s -V [-O dir] <file.torrent>\n"
+            "       %s -V [-O dir] [-f list] [-F glob]... <file.torrent>\n"
             "       %s -m <file.torrent>\n"
             "\n"
             "  -o file   create a torrent from the given files and write it to 'file'\n"
@@ -2862,6 +3148,10 @@ static void usage(const char *program)
             "            NAT-PMP are tried by default)\n"
             "  -X        with -D: do not use the DHT (by default it finds peers too,\n"
             "            except for private torrents)\n"
+            "  -f list   with -D or -V: only these files, by the numbers the torrent's\n"
+            "            listing shows: 1,3,5-7\n"
+            "  -F glob   with -D or -V: only files whose path or name matches, like\n"
+            "            '*.mkv' (any case; may be repeated, and combined with -f)\n"
             "  -d rate   with -D: download no faster than this, in KiB/s or with a\n"
             "            unit: 500k, 1.5M (0: no limit)\n"
             "  -u rate   with -D: upload no faster than this (same units)\n"
@@ -2952,7 +3242,7 @@ int main(int argc, char **argv)
     options.trackers = (const char *const *)trackers;
     options.webSeeds = (const char *const *)webSeeds;
 
-    while ((option = nextOption(argc, argv, "o:a:w:c:n:l:ptPDVSNXmL:O:i:T:C:I:d:u:h")) != -1) {
+    while ((option = nextOption(argc, argv, "o:a:w:c:n:l:ptPDVSNXmL:O:i:T:C:I:d:u:f:F:h")) != -1) {
         switch (option) {
         case 'o':
             outputPath = optionValue;
@@ -3038,6 +3328,16 @@ int main(int argc, char **argv)
             }
             downloadOnly = 1;
             break;
+        case 'f':
+            selectList = optionValue;
+            break;
+        case 'F':
+            if (selectPatternCount == SELECT_MAX_PATTERNS) {
+                fprintf(stderr, "-F: at most %u patterns\n", SELECT_MAX_PATTERNS);
+                goto cleanup;
+            }
+            selectPatterns[selectPatternCount++] = optionValue;
+            break;
         case 'V':
             verify = 1;
             break;
@@ -3085,7 +3385,8 @@ int main(int argc, char **argv)
     }
 
     if ((announceOnly && !announceMode) || (directoryGiven && !verify && mode != MODE_DOWNLOAD) ||
-        (downloadOnly && mode != MODE_DOWNLOAD)) {
+        (downloadOnly && mode != MODE_DOWNLOAD) ||
+        (selecting() && !verify && mode != MODE_DOWNLOAD)) {
         usage(argv[0]);
         goto cleanup;
     }

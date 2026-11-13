@@ -212,6 +212,7 @@ struct download {
 
     /* Uploading and seeding */
     uint8_t                *onDisk;         /* pieces we can serve (bitfield) */
+    uint8_t                *wantedPieces;   /* bitfield from fileWanted, or NULL */
     uint32_t                onDiskCount;
     uint64_t                left;           /* wanted bytes not yet on disk */
     uint64_t                bytesUploaded;
@@ -2257,6 +2258,7 @@ static void releaseDownload(download *dl)
     release(dl, dl->pieceState);
     release(dl, dl->availability);
     release(dl, dl->onDisk);
+    release(dl, dl->wantedPieces);
     release(dl, dl);
 }
 
@@ -2286,7 +2288,8 @@ static void onStorageOpen(void *privateArg, storage *store, int32_t status,
     memcpy(dl->onDisk, have, messageBitfieldBytes(dl->torrent->pieceCount));
     dl->onDiskCount = haveCount;
     for (i = 0; i < dl->torrent->pieceCount; i++) {
-        int wanted = (dl->onlyPiece < 0) || ((int64_t)i == dl->onlyPiece);
+        int wanted = ((dl->onlyPiece < 0) || ((int64_t)i == dl->onlyPiece)) &&
+                     (dl->wantedPieces == NULL || messageBitfieldGet(dl->wantedPieces, i));
 
         if (!wanted) {
             dl->pieceState[i] = DOWNLOAD_PIECE_DONE;
@@ -2390,21 +2393,43 @@ int32_t downloadBegin(uv_loop_t *loop, parserContext *context, const parserTorre
     dl->pieceState = allocate(dl, torrent->pieceCount);
     dl->availability = allocate(dl, sizeof(*dl->availability) * torrent->pieceCount);
     dl->onDisk = allocate(dl, messageBitfieldBytes(torrent->pieceCount) + 1u);
-    if (dl->pieceState == NULL || dl->availability == NULL || dl->onDisk == NULL) {
+    if (options->fileWanted != NULL) {
+        const parserFile *file;
+        uint32_t          f = 0;
+
+        dl->wantedPieces = allocate(dl, messageBitfieldBytes(torrent->pieceCount) + 1u);
+        if (dl->wantedPieces != NULL) {
+            TAILQ_FOREACH(file, &torrent->files, entries) {
+                if (options->fileWanted[f++] && file->length > 0 && !file->isPadding) {
+                    uint64_t piece = file->offset / torrent->pieceLength;
+                    uint64_t last = (file->offset + file->length - 1u) / torrent->pieceLength;
+
+                    for (; piece <= last && piece < torrent->pieceCount; piece++) {
+                        messageBitfieldSet(dl->wantedPieces, (uint32_t)piece);
+                    }
+                }
+            }
+        }
+    }
+    if (dl->pieceState == NULL || dl->availability == NULL || dl->onDisk == NULL ||
+        (options->fileWanted != NULL && dl->wantedPieces == NULL)) {
         release(dl, dl->pieceState);
         release(dl, dl->availability);
         release(dl, dl->onDisk);
+    release(dl, dl->wantedPieces);
         release(dl, dl);
         return DOWNLOAD_ENOMEM;
     }
 
     status = storageOpen(loop, context, torrent,
                          (options->directory != NULL) ? options->directory : "",
-                         STORAGE_CHECK_EXISTING, onStorageOpen, dl, &dl->store);
+                         STORAGE_CHECK_EXISTING, options->fileWanted, onStorageOpen, dl,
+                         &dl->store);
     if (status != STORAGE_OK) {
         release(dl, dl->pieceState);
         release(dl, dl->availability);
         release(dl, dl->onDisk);
+    release(dl, dl->wantedPieces);
         release(dl, dl);
         return (status == STORAGE_ENOMEM) ? DOWNLOAD_ENOMEM
              : (status == STORAGE_EINVAL) ? DOWNLOAD_EINVAL : DOWNLOAD_EIO;

@@ -106,6 +106,10 @@ typedef struct downloadOptions {
     uint32_t        pipeline;           /* requests per peer; 0 = default      */
     uint32_t        handshakeTimeoutSeconds;    /* 0 = no limit                */
     int64_t         onlyPiece;          /* download just this piece, or -1     */
+    const uint8_t  *fileWanted;         /* one byte per file (torrent order,
+                                           padding included): non-zero to
+                                           download it; NULL: every file.
+                                           Only read during downloadBegin().   */
     uint16_t        listenPort;         /* accept peers on this port (or the
                                            next free one of the following 9);
                                            0: do not accept connections        */

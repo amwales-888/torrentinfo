@@ -11,9 +11,10 @@ torrentinfo file.torrent | magnet-link
 torrentinfo -o new.torrent [-a url]... [-w url]... [-c text] [-n name] [-l size] [-p] file...
 torrentinfo -t [-T seconds] [-C certs.pem] [-I interface] file.torrent
 torrentinfo -P [-T seconds] [-C certs.pem] [-I interface] file.torrent
-torrentinfo -D [-S] [-L port] [-N] [-X] [-d speed] [-u speed] [-O folder] [-i piece]
-               [-T seconds] [-C certs.pem] [-I interface] file.torrent | magnet-link
-torrentinfo -V [-O folder] file.torrent
+torrentinfo -D [-S] [-L port] [-N] [-X] [-d speed] [-u speed] [-f list] [-F pattern]...
+               [-O folder] [-i piece] [-T seconds] [-C certs.pem] [-I interface]
+               file.torrent | magnet-link
+torrentinfo -V [-O folder] [-f list] [-F pattern]... file.torrent
 torrentinfo -m file.torrent
 ```
 
@@ -144,6 +145,22 @@ The program works in one of six ways, chosen by the first option.
   router (using UPnP or NAT-PMP) to let other peers reach you, and removes
   the forwarding again when it ends.
 
+`-f list`
+: Download only some of the files, given by their numbers in the `#`
+  column of the torrent's file list (`torrentinfo file.torrent` shows it):
+  `-f 2`, `-f 1,3`, `-f 4-9,12`. With `-V`, check only those files. See
+  "Choosing files" under NOTES.
+
+`-F pattern`
+: Download only the files whose name matches the pattern, where `*` stands
+  for any text and `?` for any one character: `-F '*.mkv'`. Upper and lower
+  case are treated alike. A pattern with a `/` in it is matched against the
+  whole path inside the torrent (`-F 'Season 1/*'`). Give `-F` several
+  times for several patterns; `-f` and `-F` can be combined, and every file
+  either one picks is downloaded. Put the pattern in quotes so that the
+  shell does not expand it. With a magnet link, use `-F`: the file numbers
+  are not known until the torrent has been fetched.
+
 `-d speed`
 : Download no faster than this. Give it in KiB per second (`-d 500`) or
   with a unit: `500k`, `1.5M`, `2G`. `0` means no limit, the default. The
@@ -179,7 +196,9 @@ The program works in one of six ways, chosen by the first option.
 ### Other
 
 `-V`
-: Check a download against the torrent (see DESCRIPTION).
+: Check a download against the torrent (see DESCRIPTION). With `-f` or
+  `-F`, only the chosen files are checked and reported, and the download
+  counts as complete when they are.
 
 `-h`
 : Show a short summary of the options.
@@ -221,6 +240,18 @@ fewer people.
 from people who connect to you, and from the peers themselves, which tell
 each other about the other peers they know ("peer exchange"). Private
 torrents only use their trackers.
+
+**Choosing files.** With `-f` or `-F` only the chosen files are
+downloaded; the others are not created at all. The download is complete
+when the chosen files are, and with `-S` the program then shares what it
+has. Data is checked in pieces, and a piece can straddle the end of one
+file and the start of the next. When only one of the two files is chosen,
+the whole piece is still downloaded (it cannot be checked otherwise), and
+the part that belongs to the file you did not choose is kept in a hidden
+file next to the download, `.name.parts`, a few pieces in size. Choosing
+more files later, or the whole torrent, just downloads what is missing; the
+`.parts` file is deleted once every file is on disk. A file you did not
+choose but that is already on disk is left as it is and used.
 
 **Blocking addresses.** Put addresses you never want to deal with in
 `blocklist.txt` (see FILES), one per line: a single address (`203.0.113.7`),
@@ -363,6 +394,15 @@ Turn a torrent file into a magnet link to share:
 
 ```
 torrentinfo -m holiday.torrent
+```
+
+See a torrent's files with their numbers, then download only the second
+and third, or only the videos:
+
+```
+torrentinfo series.torrent
+torrentinfo -D -f 2,3 series.torrent
+torrentinfo -D -F '*.mkv' -F '*.srt' series.torrent
 ```
 
 Check whether a download is complete, and which pieces are missing:

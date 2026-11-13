@@ -15,8 +15,18 @@
  * concurrent writes touch different bytes. The "have" bitfield is updated
  * only on the loop thread after a write completes.
  *
- * Files are opened per operation, which keeps the code simple and the
- * handle count low; a handle cache can come later if needed.
+ * File handles are cached (see fileHandle()).
+ *
+ * Skipped files: a file the caller does not want (storageOpen()'s 'wanted')
+ * is not created. A piece that is partly in a wanted file and partly in a
+ * skipped one must still be downloaded whole to be checked, so the skipped
+ * part of it is kept in the part file, "<directory>/.<name>.parts": records
+ * of an 8-byte header ("TIP1" and the piece index, big-endian) followed by
+ * one piece's worth of space, of which only the bytes belonging to files
+ * not on disk are used. partSlot[] maps pieces to records; it is read when
+ * the storage opens and extended on the loop thread before a write is
+ * queued. A skipped file that already exists on disk is used as it is. In
+ * STORAGE_READ_ONLY mode every missing file is looked for in the part file.
  */
 #ifndef _WIN32
 #define _POSIX_C_SOURCE 200809L
@@ -41,7 +51,11 @@ typedef struct storageFile {
     uint64_t    sizeOnDisk;     /* when opened (before any resizing)         */
     platformFile handle;        /* kept open once used (see fileHandle())    */
     uint8_t     handleOpen;
+    uint8_t     skipped;        /* not wanted by the caller                  */
+    uint8_t     inPart;         /* not on disk: its bytes are in the part file */
 } storageFile;
+
+#define STORAGE_PART_HEADER     8u      /* "TIP1" + piece index             */
 
 #define STORAGE_CHECK_JOBS      4u      /* parallel resume-check jobs          */
 #define STORAGE_MAX_OPEN_FILES  64u     /* handles kept open; more are opened
@@ -72,6 +86,10 @@ struct storage {
     uint32_t                haveCount;
     uint8_t                 checkExisting;
     uint8_t                 readOnly;       /* STORAGE_READ_ONLY: check only      */
+    storageFile             part;           /* the part file (path, handle only)  */
+    uint32_t               *partSlot;       /* per piece: record + 1, or 0        */
+    uint32_t                partSlots;      /* records in the part file           */
+    uint8_t                 anyInPart;      /* some file is kept in the part file */
 
     /* The open job, then the check jobs */
     uv_work_t               openWork;
@@ -162,6 +180,11 @@ static void freeStorage(storage *store)
         release(context, store->checks[i].scratch);
     }
     release(context, store->verified);
+    if (store->part.handleOpen) {
+        platformFileClose(&store->part.handle);
+    }
+    release(context, store->part.path);
+    release(context, store->partSlot);
     if (store->lockReady) {
         uv_mutex_destroy(&store->lock);
     }
@@ -292,7 +315,37 @@ static int32_t fileHandle(storage *store, storageFile *entry, uint8_t write, pla
                  : platformFileOpenRead(entry->path, file);
 }
 
-static int32_t rangeIo(storage *store, uint64_t position, uint32_t remaining,
+/* Where piece 'index' keeps its skipped bytes in the part file. */
+static uint64_t partRecord(const storage *store, uint32_t index)
+{
+    return (uint64_t)(store->partSlot[index] - 1u) * (STORAGE_PART_HEADER + store->pieceLength);
+}
+
+/* Does piece 'index' have bytes in files kept in the part file? */
+static int pieceInPart(const storage *store, uint32_t index)
+{
+    uint64_t start = (uint64_t)index * store->pieceLength;
+    uint64_t end = start + pieceSize(store, index);
+    uint32_t i;
+
+    if (!store->anyInPart) {
+        return 0;
+    }
+    for (i = findFile(store, start); i < store->fileCount && store->files[i].offset < end; i++) {
+        if (store->files[i].inPart && store->files[i].length > 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/*
+ * Worker thread: read or write the bytes [position, position + remaining)
+ * of piece 'index' through the files they span. For reads, *missing is set
+ * if a file is absent or too short. Returns STORAGE_OK or STORAGE_EIO with
+ * 'message' describing the failure.
+ */
+static int32_t rangeIo(storage *store, uint32_t index, uint64_t position, uint32_t remaining,
                        uint8_t *buffer, uint8_t write, char *message, size_t messageSize,
                        uint8_t *missing)
 {
@@ -314,6 +367,21 @@ static int32_t rangeIo(storage *store, uint64_t position, uint32_t remaining,
         }
         chunk = (entry->length - within < remaining) ? (uint32_t)(entry->length - within)
                                                      : remaining;
+        if (entry->inPart) {
+            if (store->partSlot[index] == 0) {
+                if (!write) {
+                    *missing = 1;
+                    return STORAGE_OK;
+                }
+                snprintf(message, messageSize, "%s: no room kept for piece %u",
+                         store->part.path, (unsigned)index);
+                return STORAGE_EIO;
+            }
+            /* The same bytes, in the piece's record of the part file. */
+            within = partRecord(store, index) + STORAGE_PART_HEADER +
+                     (position - (uint64_t)index * store->pieceLength);
+            entry = &store->part;
+        }
         if (entry->padding) {
             if (!write) {
                 memset(buffer, 0, chunk);
@@ -367,8 +435,78 @@ static int32_t rangeIo(storage *store, uint64_t position, uint32_t remaining,
 static int32_t pieceIo(storage *store, uint32_t index, uint8_t *buffer, uint8_t write,
                        char *message, size_t messageSize, uint8_t *missing)
 {
-    return rangeIo(store, (uint64_t)index * store->pieceLength, pieceSize(store, index), buffer,
-                   write, message, messageSize, missing);
+    if (write && pieceInPart(store, index)) {
+        uint8_t      header[STORAGE_PART_HEADER] = { 'T', 'I', 'P', '1', 0, 0, 0, 0 };
+        uint8_t      temporary;
+        uint32_t     count = 0;
+        platformFile file;
+        int32_t      result;
+
+        header[4] = (uint8_t)(index >> 24);
+        header[5] = (uint8_t)(index >> 16);
+        header[6] = (uint8_t)(index >> 8);
+        header[7] = (uint8_t)index;
+        result = fileHandle(store, &store->part, 1, &file, &temporary);
+        if (result == 0) {
+            result = platformFileWriteAt(&file, partRecord(store, index), header,
+                                         STORAGE_PART_HEADER, &count);
+            if (result == 0 && count != STORAGE_PART_HEADER) {
+                result = UV_EIO;
+            }
+            if (temporary) {
+                platformFileClose(&file);
+            }
+        }
+        if (result != 0) {
+            snprintf(message, messageSize, "%s: %s", store->part.path, uv_strerror(result));
+            return STORAGE_EIO;
+        }
+    }
+    return rangeIo(store, index, (uint64_t)index * store->pieceLength, pieceSize(store, index),
+                   buffer, write, message, messageSize, missing);
+}
+
+/* Worker thread (open): find the records already in the part file. */
+static void readPartIndex(storage *store)
+{
+    platformFile file;
+    uint64_t     size;
+    uint8_t      isRegular;
+    uint8_t      header[STORAGE_PART_HEADER];
+    uint64_t     record = STORAGE_PART_HEADER + store->pieceLength;
+    uint32_t     count;
+    uint32_t     slot;
+    uint32_t     index;
+
+    if (platformFileStat(store->part.path, &size, &isRegular) != 0 || !isRegular ||
+        platformFileOpenRead(store->part.path, &file) != 0) {
+        return;
+    }
+    for (slot = 0; (uint64_t)slot * record + STORAGE_PART_HEADER <= size && slot < UINT32_MAX - 1u;
+         slot++) {
+        if (platformFileReadAt(&file, (uint64_t)slot * record, header, STORAGE_PART_HEADER,
+                               &count) != 0 || count != STORAGE_PART_HEADER) {
+            break;
+        }
+        index = ((uint32_t)header[4] << 24) | ((uint32_t)header[5] << 16) |
+                ((uint32_t)header[6] << 8) | header[7];
+        if (memcmp(header, "TIP1", 4) == 0 && index < store->pieceCount &&
+            store->partSlot[index] == 0) {
+            store->partSlot[index] = slot + 1u;
+        }
+    }
+    /* A record cut short (by a crash) is reused space: count it anyway, so a
+     * new record never overlaps it. */
+    store->partSlots = (uint32_t)((size + record - 1u) / record);
+    platformFileClose(&file);
+}
+
+static void removeFile(const char *path)
+{
+    uv_fs_t request;
+
+    uv_fs_unlink(NULL, &request, path, NULL);
+    uv_fs_req_cleanup(&request);
 }
 
 /* Worker thread: does piece 'index' lie entirely in data that existed before? */
@@ -379,7 +517,10 @@ static uint8_t pieceInExistingData(const storage *store, uint32_t index)
     uint32_t i;
 
     for (i = findFile(store, start); i < store->fileCount && store->files[i].offset < end; i++) {
-        if (store->files[i].length > 0 && !store->files[i].padding && !store->files[i].existed) {
+        const storageFile *entry = &store->files[i];
+
+        if (entry->length > 0 && !entry->padding &&
+            (entry->inPart ? store->partSlot[index] == 0 : !entry->existed)) {
             return 0;
         }
     }
@@ -439,13 +580,26 @@ static void openWork(uv_work_t *work)
             continue;
         }
         if (store->readOnly) {
-            /* Look, do not touch: a missing or odd file just has no pieces. */
+            /* Look, do not touch: a missing or odd file just has no pieces
+             * (but its edges may be in the part file). */
             result = platformFileStat(entry->path, &size, &isRegular);
             entry->notRegular = (uint8_t)(result == 0 && !isRegular);
             entry->sizeOnDisk = (result == 0 && isRegular) ? size : 0;
             entry->existed = (uint8_t)(result == 0 && isRegular && size > 0);
+            entry->inPart = (uint8_t)(result != 0 && entry->length > 0);
+            store->anyInPart = (uint8_t)(store->anyInPart | entry->inPart);
             anyExisted = (uint8_t)(anyExisted | entry->existed);
             continue;
+        }
+        if (entry->skipped) {
+            /* Not wanted: leave it alone if it is not there already. */
+            result = platformFileStat(entry->path, &size, &isRegular);
+            if (result != 0 || !isRegular || size == 0) {
+                entry->notRegular = (uint8_t)(result == 0 && !isRegular);
+                entry->inPart = (uint8_t)(entry->length > 0);
+                store->anyInPart = (uint8_t)(store->anyInPart | entry->inPart);
+                continue;
+            }
         }
         result = makeParents(entry->path, entry->parentLength);
         if (result != 0) {
@@ -482,6 +636,13 @@ static void openWork(uv_work_t *work)
             store->openResult = STORAGE_EIO;
             return;
         }
+    }
+
+    if (store->anyInPart) {
+        readPartIndex(store);
+        anyExisted = (uint8_t)(anyExisted | (store->partSlots > 0));
+    } else if (!store->readOnly) {
+        removeFile(store->part.path);               /* every file is on disk now */
     }
 
     /* The pieces in data that was already there are checked next, in
@@ -655,7 +816,8 @@ static void openDone(uv_work_t *work, int status)
 }
 
 /* Build every file's full path, adjusted for the platform. */
-static int32_t buildFiles(storage *store, const parserTorrent *torrent, const char *directory)
+static int32_t buildFiles(storage *store, const parserTorrent *torrent, const char *directory,
+                          const uint8_t *wanted)
 {
     const parserFile          *file;
     const parserPathComponent *component;
@@ -686,6 +848,19 @@ static int32_t buildFiles(storage *store, const parserTorrent *torrent, const ch
         store->root[used++] = PLATFORM_SEPARATOR;
     }
     appendComponent(store->root + used, torrent->name);
+
+    /* The part file: <directory>/.<name>.parts */
+    store->part.path = allocate(store->context, directoryLength + nameLength + 16u);
+    if (store->part.path == NULL) {
+        return STORAGE_ENOMEM;
+    }
+    memcpy(store->part.path, store->root, used);
+    store->part.path[used] = '.';
+    {
+        size_t length = appendComponent(store->part.path + used + 1u, torrent->name);
+
+        memcpy(store->part.path + used + 1u + length, ".parts", 7u);
+    }
 
     TAILQ_FOREACH(file, &torrent->files, entries) {
         storageFile *entry = &store->files[i++];
@@ -721,6 +896,7 @@ static int32_t buildFiles(storage *store, const parserTorrent *torrent, const ch
         entry->offset = file->offset;
         entry->length = file->length;
         entry->padding = file->isPadding;
+        entry->skipped = (uint8_t)(wanted != NULL && !wanted[i - 1u] && !file->isPadding);
     }
     return STORAGE_OK;
 }
@@ -768,8 +944,8 @@ static void writeDone(uv_work_t *work, int status)
 /* ======================================================================== */
 
 int32_t storageOpen(uv_loop_t *loop, parserContext *context, const parserTorrent *torrent,
-                    const char *directory, uint32_t flags, storageOpenCallback callback,
-                    void *privateArg, storage **handle)
+                    const char *directory, uint32_t flags, const uint8_t *wanted,
+                    storageOpenCallback callback, void *privateArg, storage **handle)
 {
     storage *store;
     uint64_t hashBytes;
@@ -807,8 +983,11 @@ int32_t storageOpen(uv_loop_t *loop, parserContext *context, const parserTorrent
     store->hashes = (hashBytes > 0) ? allocate(context, hashBytes) : NULL;
     store->have = (torrent->pieceCount > 0)
                 ? allocate(context, messageBitfieldBytes(torrent->pieceCount)) : NULL;
+    store->partSlot = (torrent->pieceCount > 0)
+                    ? allocate(context, (uint64_t)torrent->pieceCount * sizeof(uint32_t)) : NULL;
     result = STORAGE_OK;
-    if (store->files == NULL || (hashBytes > 0 && (store->hashes == NULL || store->have == NULL))) {
+    if (store->files == NULL || (hashBytes > 0 && (store->hashes == NULL || store->have == NULL ||
+                                                   store->partSlot == NULL))) {
         result = STORAGE_ENOMEM;
     }
     if (result == STORAGE_OK && uv_mutex_init(&store->lock) == 0) {
@@ -820,7 +999,7 @@ int32_t storageOpen(uv_loop_t *loop, parserContext *context, const parserTorrent
         if (hashBytes > 0) {
             memcpy(store->hashes, torrent->pieces, (size_t)hashBytes);
         }
-        result = buildFiles(store, torrent, directory);
+        result = buildFiles(store, torrent, directory, wanted);
     }
     if (result == STORAGE_OK) {
         store->openWork.data = store;
@@ -853,6 +1032,14 @@ int32_t storageWritePiece(storage *store, uint32_t pieceIndex, uint8_t *data,
     if (job == NULL) {
         release(store->context, data);
         return STORAGE_ENOMEM;
+    }
+    if (store->partSlot[pieceIndex] == 0 && pieceInPart(store, pieceIndex)) {
+        if (store->partSlots == UINT32_MAX - 1u) {
+            release(store->context, data);
+            release(store->context, job);
+            return STORAGE_EIO;
+        }
+        store->partSlot[pieceIndex] = ++store->partSlots;   /* before any worker looks */
     }
     job->store = store;
     job->index = pieceIndex;
@@ -920,6 +1107,8 @@ int32_t storageGetFile(const storage *store, uint32_t index, storageFileState *s
     state->isPadding = entry->padding;
     state->existed = (uint8_t)(entry->existed || entry->padding);
     state->notRegular = entry->notRegular;
+    state->skipped = entry->skipped;
+    state->inPartFile = entry->inPart;
     return STORAGE_OK;
 }
 
@@ -933,7 +1122,8 @@ static void readWork(uv_work_t *work)
     storageRead *job = work->data;
     uint8_t      missing = 0;
 
-    job->result = rangeIo(job->store, (uint64_t)job->index * job->store->pieceLength + job->begin,
+    job->result = rangeIo(job->store, job->index,
+                          (uint64_t)job->index * job->store->pieceLength + job->begin,
                           job->length, job->data, 0, job->message, sizeof(job->message),
                           &missing);
     if (job->result == STORAGE_OK && missing) {

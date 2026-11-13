@@ -1,4 +1,4 @@
-# Build output (Linux: build/release, build/debug; Windows: build\x64\..., build\obj\...)
+# Build output (Linux: build/linux/...; Windows: build\x64\..., build\obj\...)
 /build/
 
 # The ./torrentinfo symlink that 'make' creates (not the torrentinfo.* project files)

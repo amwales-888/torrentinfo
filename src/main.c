@@ -1152,6 +1152,16 @@ static void onProgressTick(uv_timer_t *timer)
         return;
     }
     downloadGetProgress(run->transfer, &progress);
+    if (progress.checking) {
+        if (progress.checkTotal > 0) {
+            printf("  checking files: %" PRIu32 " of %" PRIu32 " pieces (%.0f%%)\n",
+                   progress.checkedPieces, progress.checkTotal,
+                   100.0 * progress.checkedPieces / progress.checkTotal);
+            fflush(stdout);
+        }
+        run->lastReport = now;
+        return;
+    }
     formatBytes((progress.bytesReceived - run->reportReceived) * 1000u / elapsed, down,
                 sizeof(down));
     formatBytes((progress.bytesUploaded - run->reportSent) * 1000u / elapsed, up, sizeof(up));
@@ -1357,8 +1367,9 @@ static void onDownloadReady(void *privateArg, download *transfer, int32_t status
     run->lastReport = uv_now(run->loop);
     uv_timer_start(&run->timer, onProgressTick, 2000u, 2000u);
 
-    /* Announce now that "left" is known. */
-    if (run->trackerUp && run->trackers == NULL) {
+    /* Announce now that "left" is known (unless there is nothing to do). */
+    if (run->trackerUp && run->trackers == NULL &&
+        (progress.done < progress.wanted || run->seed)) {
         static const announceEvents callbacks = { getAnnounceStats, onAnnouncePeers,
                                                   onAnnounceResult };
 
@@ -1422,7 +1433,7 @@ static void onDownloadFinished(void *privateArg, download *transfer, int32_t sta
 
     downloadGetProgress(transfer, &progress);
     if (status == DOWNLOAD_OK && !run->complete) {
-        printf("\nNothing to download: %s\n", message);
+        printf("\nNothing to download: the files are already complete.\n");
         run->complete = 1;
     } else if (status != DOWNLOAD_OK) {
         printf("\nDownload failed: %s (%" PRIu32 " of %" PRIu32 " pieces on disk)\n", message,
@@ -1492,6 +1503,8 @@ static int downloadTorrent(uv_loop_t *loop, parserContext *context, const parser
         peerShutdown();
         goto done;
     }
+    run.lastReport = uv_now(loop);
+    uv_timer_start(&run.timer, onProgressTick, 2000u, 2000u);   /* checking progress */
     if (listenPort != 0) {
         if (downloadListenPort(run.transfer) != 0) {
             printf("Listening:  port %u\n", (unsigned)downloadListenPort(run.transfer));
@@ -1550,10 +1563,26 @@ done:
 static const uint32_t verifyRangeLimit = 40u;   /* missing-piece ranges listed per line */
 
 typedef struct verifyRun {
-    int32_t status;
-    char    message[STORAGE_ERROR_MESSAGE_LENGTH];
-    uint8_t done;
+    int32_t     status;
+    char        message[STORAGE_ERROR_MESSAGE_LENGTH];
+    uint8_t     done;
+    storage    *store;
+    uv_timer_t  timer;              /* progress while hashing */
 } verifyRun;
+
+static void onVerifyTick(uv_timer_t *timer)
+{
+    verifyRun *run = timer->data;
+    uint32_t   checked;
+    uint32_t   total;
+
+    storageCheckProgress(run->store, &checked, &total);
+    if (total > 0) {
+        printf("  %" PRIu32 " of %" PRIu32 " pieces (%.0f%%)\n", checked, total,
+               100.0 * checked / total);
+        fflush(stdout);
+    }
+}
 
 static void onVerifyOpen(void *privateArg, storage *store, int32_t status, const char *errorMessage)
 {
@@ -1562,6 +1591,7 @@ static void onVerifyOpen(void *privateArg, storage *store, int32_t status, const
     (void)store;
     run->status = status;
     run->done = 1;
+    uv_timer_stop(&run->timer);
     if (errorMessage != NULL) {
         snprintf(run->message, sizeof(run->message), "%s", errorMessage);
     }
@@ -1689,7 +1719,12 @@ static int verifyTorrent(parserContext *context, const parserAllocator *allocato
     }
     printf("Location:   %s\n\nHashing the data on disk...\n", storageRoot(store));
     fflush(stdout);
+    run.store = store;
+    uv_timer_init(&loop, &run.timer);
+    run.timer.data = &run;
+    uv_timer_start(&run.timer, onVerifyTick, 2000u, 2000u);
     uv_run(&loop, UV_RUN_DEFAULT);
+    uv_close((uv_handle_t *)&run.timer, NULL);
     if (run.status != STORAGE_OK) {
         printf("Could not check the files: %s\n",
                (run.message[0] != '\0') ? run.message : storageStatusString(run.status));

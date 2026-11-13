@@ -1,7 +1,9 @@
 # Building torrentinfo
 
 The library and the `torrentinfo` program build on Linux and Windows from the
-same sources, which are all in `src/`; build output goes in `build/`.
+same sources, which are all in `src/`; build output goes in `build/` (Linux in
+`build/linux`, Visual Studio in `build/x64` and `build/obj`, so both can sit
+side by side).
 Platform differences are confined to `src/platform.c` (file access),
 `src/net.c` (binding to a network interface), the certificate loading in
 `src/http.c`, and a few `#ifdef _WIN32` lines in `src/main.c`. Lists use the bundled 4.4BSD `queue.h` on every platform.
@@ -12,8 +14,8 @@ Dependencies: **libuv** and **OpenSSL 3**.
 
 ```sh
 sudo apt install build-essential pkg-config libuv1-dev libssl-dev   # Debian/Ubuntu
-make                 # build/release/torrentinfo (and ./torrentinfo link)
-make debug           # AddressSanitizer + UBSan build in build/debug
+make                 # build/linux/release/torrentinfo (and ./torrentinfo link)
+make debug           # AddressSanitizer + UBSan build in build/linux/debug
 make install PREFIX=$HOME/.local
 ```
 
@@ -113,6 +115,12 @@ project's *Properties > Debugging > Command Arguments*.
   peer at all for 1 minute. Progress is printed every 2 seconds. Peers come
   from the trackers, from peer exchange, and from peers that connect to us;
   DHT is not implemented yet.
+
+- **Checking and disk access.** Existing data is checked when a download
+  starts (and by `-V`) on four threads at once, with progress every 2
+  seconds; each downloaded piece is checked on a background thread, so
+  networking never waits for it. Files are kept open while the program runs
+  (up to 64 at a time) instead of being opened for every block.
 
 - **Peer exchange.** Peers that support the extension protocol (BEP 10;
   nearly all current clients do) are sent an extended handshake, and with

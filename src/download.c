@@ -93,6 +93,10 @@ typedef struct activePiece {
     uint64_t               *requestedAt;    /* uv_now() of each block's first */
     struct downloadPeer   **contributor;    /* who delivered each block     */
     uint8_t                 exclusive;      /* failed once: one peer at a time */
+    uint8_t                 verifying;      /* SHA-1 check on the thread pool */
+    struct download        *owningDownload;
+    int32_t                 verifyResult;
+    uv_work_t               verifyWork;
     uint8_t                *failedData;     /* the copy that failed, kept to */
     struct downloadPeer   **failedBy;       /* find the culprit once it passes */
 } activePiece;
@@ -211,6 +215,9 @@ struct download {
     uint64_t                noPeersSince;   /* 0 while there are peers      */
     uint8_t                 pexEnabled;     /* not for private torrents     */
     uint32_t                pexLearned;     /* new peers heard of by PEX    */
+
+    uint32_t                verifyJobs;     /* piece checks on the thread pool */
+    uint8_t                 timerClosed;    /* waiting only for those to end */
 
     uint8_t                 ready;          /* storage open                 */
     uint8_t                 endgame;
@@ -1476,7 +1483,54 @@ static void complete(download *dl)
 }
 
 /* Every block of the piece is here: verify it, then write it or try again. */
+static void releaseDownload(download *dl);
+
+static void verifyWork(uv_work_t *work)
+{
+    activePiece *piece = work->data;
+
+    piece->verifyResult = pieceVerify(&piece->piece);   /* only reads the piece */
+}
+
+static void pieceChecked(download *dl, activePiece *piece, int32_t result);
+
+static void verifyDone(uv_work_t *work, int status)
+{
+    activePiece *piece = work->data;
+    download    *dl = piece->owningDownload;
+
+    dl->verifyJobs--;
+    piece->verifying = 0;
+    if (dl->ended) {
+        if (dl->timerClosed && dl->verifyJobs == 0) {
+            releaseDownload(dl);                    /* the last thing we waited for */
+        }
+        return;
+    }
+    if (stopped(dl)) {
+        return;                                     /* freed with the download */
+    }
+    pieceChecked(dl, piece, (status == 0) ? piece->verifyResult : PIECE_EINVAL);
+}
+
+/*
+ * Every block of the piece is here: check it on the thread pool (a large
+ * piece takes a while to hash), then write it or try again.
+ */
 static void completePiece(download *dl, activePiece *piece)
+{
+    piece->owningDownload = dl;
+    piece->verifying = 1;
+    piece->verifyWork.data = piece;
+    if (uv_queue_work(dl->loop, &piece->verifyWork, verifyWork, verifyDone) == 0) {
+        dl->verifyJobs++;
+        return;
+    }
+    piece->verifying = 0;
+    pieceChecked(dl, piece, pieceVerify(&piece->piece));    /* no pool: do it here */
+}
+
+static void pieceChecked(download *dl, activePiece *piece, int32_t result)
 {
     downloadPeer *sole = NULL;
     downloadPeer *peer;
@@ -1487,7 +1541,7 @@ static void completePiece(download *dl, activePiece *piece)
     uint32_t      earlier;
     int32_t       status;
 
-    if (pieceVerify(&piece->piece) == PIECE_OK) {
+    if (result == PIECE_OK) {
         if (piece->failedData != NULL) {
             blameCulprits(dl, piece);
             if (stopped(dl)) {
@@ -1980,7 +2034,16 @@ static void onTick(uv_timer_t *timer)
 
 static void onTimerClosed(uv_handle_t *handle)
 {
-    download     *dl = handle->data;
+    download *dl = handle->data;
+
+    dl->timerClosed = 1;
+    if (dl->verifyJobs == 0) {
+        releaseDownload(dl);                        /* else the last check does it */
+    }
+}
+
+static void releaseDownload(download *dl)
+{
     downloadPeer *peer;
     activePiece  *piece;
 
@@ -2243,6 +2306,8 @@ void downloadGetProgress(const download *dl, downloadProgress *progress)
     progress->bytesUploaded = dl->bytesUploaded;
     progress->listenPort = dl->listenPort;
     progress->peersFromPex = dl->pexLearned;
+    progress->checking = (uint8_t)(!dl->ready && !dl->finished);
+    storageCheckProgress(dl->store, &progress->checkedPieces, &progress->checkTotal);
     TAILQ_FOREACH(peer, &dl->peers, entries) {
         switch (peer->state) {
         case DOWNLOAD_PEER_QUEUED:

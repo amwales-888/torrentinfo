@@ -124,6 +124,13 @@ int32_t storageReadBlock(storage *store, uint32_t pieceIndex, uint32_t begin, ui
 /* Pieces complete on disk, as a bitfield (messageBitfieldGet), and their count. */
 const uint8_t *storageHave(const storage *store, uint32_t *haveCount);
 
+/*
+ * While storageOpen() checks the data already on disk (on several threads):
+ * how many pieces it has checked so far, of how many. Both are 0 until the
+ * check starts, and stay at their final values afterwards.
+ */
+void storageCheckProgress(storage *store, uint32_t *checked, uint32_t *total);
+
 /* The torrent's files, in torrent order (padding files included). */
 uint32_t storageFileCount(const storage *store);
 

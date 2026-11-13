@@ -135,6 +135,9 @@ typedef struct downloadProgress {
     uint32_t        peersIncoming;      /* connected peers that came to us     */
     uint16_t        listenPort;         /* 0 if not accepting connections      */
     uint32_t        peersFromPex;       /* new peers heard of by peer exchange */
+    uint8_t         checking;           /* still checking the files on disk    */
+    uint32_t        checkedPieces;      /* ...pieces checked so far            */
+    uint32_t        checkTotal;         /* ...of these (0 until known)         */
 } downloadProgress;
 
 typedef struct downloadEvents {

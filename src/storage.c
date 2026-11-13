@@ -39,7 +39,24 @@ typedef struct storageFile {
     uint8_t     existed;        /* had data before storageOpen()             */
     uint8_t     notRegular;     /* the path is a directory or something else */
     uint64_t    sizeOnDisk;     /* when opened (before any resizing)         */
+    platformFile handle;        /* kept open once used (see fileHandle())    */
+    uint8_t     handleOpen;
 } storageFile;
+
+#define STORAGE_CHECK_JOBS      4u      /* parallel resume-check jobs          */
+#define STORAGE_MAX_OPEN_FILES  64u     /* handles kept open; more are opened
+                                           and closed per access              */
+
+struct storage;
+
+/* One of the parallel jobs hashing existing data. */
+typedef struct storageCheck {
+    uv_work_t               work;
+    struct storage         *store;
+    uint32_t                first;          /* pieces [first, last)           */
+    uint32_t                last;
+    uint8_t                *scratch;        /* one piece                      */
+} storageCheck;
 
 struct storage {
     uv_loop_t              *loop;
@@ -56,13 +73,24 @@ struct storage {
     uint8_t                 checkExisting;
     uint8_t                 readOnly;       /* STORAGE_READ_ONLY: check only      */
 
-    /* The open job */
+    /* The open job, then the check jobs */
     uv_work_t               openWork;
     storageOpenCallback     openCallback;
     void                   *openArg;
-    uint8_t                *scratch;        /* one piece, for the resume check    */
     int32_t                 openResult;
     char                    openMessage[STORAGE_ERROR_MESSAGE_LENGTH];
+    uint8_t                 anyExisted;     /* some file had data             */
+    storageCheck            checks[STORAGE_CHECK_JOBS];
+    uint32_t                checksRunning;
+    uint8_t                *verified;       /* one byte per piece (no sharing) */
+
+    /* Shared with the thread pool, under 'lock' */
+    uv_mutex_t              lock;
+    uint8_t                 lockReady;
+    uint32_t                openFiles;      /* cached handles                  */
+    uint32_t                checkTotal;     /* pieces to check                 */
+    uint32_t                checked;        /* of those, done                  */
+    uint8_t                 stopChecking;
 
     uint32_t                jobs;           /* thread-pool jobs not yet completed */
     uint8_t                 opened;
@@ -125,13 +153,22 @@ static void freeStorage(storage *store)
     uint32_t       i;
 
     for (i = 0; store->files != NULL && i < store->fileCount; i++) {
+        if (store->files[i].handleOpen) {
+            platformFileClose(&store->files[i].handle);
+        }
         release(context, store->files[i].path);
+    }
+    for (i = 0; i < STORAGE_CHECK_JOBS; i++) {
+        release(context, store->checks[i].scratch);
+    }
+    release(context, store->verified);
+    if (store->lockReady) {
+        uv_mutex_destroy(&store->lock);
     }
     release(context, store->files);
     release(context, store->root);
     release(context, store->hashes);
     release(context, store->have);
-    release(context, store->scratch);
     release(context, store);
 }
 
@@ -221,10 +258,45 @@ static uint32_t findFile(const storage *store, uint64_t position)
  * For reads, *missing is set if a file is absent or too short. Returns
  * STORAGE_OK or STORAGE_EIO with 'message' describing the failure.
  */
-static int32_t rangeIo(const storage *store, uint64_t position, uint32_t remaining,
+/*
+ * A handle for the file: the cached one, or a new one that is cached (up to
+ * STORAGE_MAX_OPEN_FILES), or else a temporary one the caller must close.
+ * Positional reads and writes make one handle safe for every thread.
+ */
+static int32_t fileHandle(storage *store, storageFile *entry, uint8_t write, platformFile *file,
+                          uint8_t *temporary)
+{
+    int32_t result;
+
+    *temporary = 0;
+    uv_mutex_lock(&store->lock);
+    if (entry->handleOpen) {
+        *file = entry->handle;
+        uv_mutex_unlock(&store->lock);
+        return 0;
+    }
+    if (store->openFiles < STORAGE_MAX_OPEN_FILES) {
+        result = store->readOnly ? platformFileOpenRead(entry->path, file)
+                                 : platformFileOpenReadWrite(entry->path, file);
+        if (result == 0) {
+            entry->handle = *file;
+            entry->handleOpen = 1;
+            store->openFiles++;
+        }
+        uv_mutex_unlock(&store->lock);
+        return result;
+    }
+    uv_mutex_unlock(&store->lock);
+    *temporary = 1;
+    return write ? platformFileOpenReadWrite(entry->path, file)
+                 : platformFileOpenRead(entry->path, file);
+}
+
+static int32_t rangeIo(storage *store, uint64_t position, uint32_t remaining,
                        uint8_t *buffer, uint8_t write, char *message, size_t messageSize,
                        uint8_t *missing)
 {
+    uint8_t      temporary;
     uint32_t     fileIndex = findFile(store, position);
     uint32_t     done;
     uint32_t     count;
@@ -234,7 +306,7 @@ static int32_t rangeIo(const storage *store, uint64_t position, uint32_t remaini
     int32_t      result;
 
     while (remaining > 0 && fileIndex < store->fileCount) {
-        const storageFile *entry = &store->files[fileIndex++];
+        storageFile *entry = &store->files[fileIndex++];
 
         within = position - entry->offset;
         if (within >= entry->length) {
@@ -247,8 +319,7 @@ static int32_t rangeIo(const storage *store, uint64_t position, uint32_t remaini
                 memset(buffer, 0, chunk);
             }
         } else {
-            result = write ? platformFileOpenReadWrite(entry->path, &file)
-                           : platformFileOpenRead(entry->path, &file);
+            result = fileHandle(store, entry, write, &file, &temporary);
             if (result != 0) {
                 if (!write && result == UV_ENOENT) {
                     *missing = 1;
@@ -265,18 +336,22 @@ static int32_t rangeIo(const storage *store, uint64_t position, uint32_t remaini
                 if (result == 0 && count == 0) {
                     if (!write) {
                         *missing = 1;               /* file shorter than it should be */
-                        platformFileClose(&file);
+                        if (temporary) {
+                            platformFileClose(&file);
+                        }
                         return STORAGE_OK;
                     }
                     result = UV_EIO;
                 }
                 if (result != 0) {
                     snprintf(message, messageSize, "%s: %s", entry->path, uv_strerror(result));
-                    platformFileClose(&file);
+                    if (temporary) {
+                        platformFileClose(&file);
+                    }
                     return STORAGE_EIO;
                 }
             }
-            result = platformFileClose(&file);
+            result = temporary ? platformFileClose(&file) : 0;
             if (result != 0) {
                 snprintf(message, messageSize, "%s: %s", entry->path, uv_strerror(result));
                 return STORAGE_EIO;
@@ -289,7 +364,7 @@ static int32_t rangeIo(const storage *store, uint64_t position, uint32_t remaini
     return STORAGE_OK;
 }
 
-static int32_t pieceIo(const storage *store, uint32_t index, uint8_t *buffer, uint8_t write,
+static int32_t pieceIo(storage *store, uint32_t index, uint8_t *buffer, uint8_t write,
                        char *message, size_t messageSize, uint8_t *missing)
 {
     return rangeIo(store, (uint64_t)index * store->pieceLength, pieceSize(store, index), buffer,
@@ -353,8 +428,6 @@ static void openWork(uv_work_t *work)
     uint64_t     size;
     uint8_t      isRegular;
     uint8_t      anyExisted = 0;
-    uint8_t      missing;
-    uint8_t      digest[PARSER_SHA1_LENGTH];
     uint32_t     i;
     int32_t      result;
 
@@ -411,30 +484,141 @@ static void openWork(uv_work_t *work)
         }
     }
 
-    /* Resume: hash every piece that lies entirely in data that was there. */
-    if (!store->checkExisting || !anyExisted) {
-        return;
-    }
-    for (i = 0; i < store->pieceCount; i++) {
+    /* The pieces in data that was already there are checked next, in
+     * parallel (startChecks()). */
+    store->anyExisted = anyExisted;
+}
+
+/* ------------------------------------------------------------------------ */
+/* Checking existing data, in parallel                                      */
+/* ------------------------------------------------------------------------ */
+
+static void checkWork(uv_work_t *work)
+{
+    storageCheck *job = work->data;
+    storage      *store = job->store;
+    uint8_t       digest[PARSER_SHA1_LENGTH];
+    char          message[STORAGE_ERROR_MESSAGE_LENGTH];
+    uint8_t       missing;
+    uint8_t       stop;
+    uint32_t      i;
+
+    for (i = job->first; i < job->last; i++) {
         if (!pieceInExistingData(store, i)) {
             continue;
         }
-        missing = 0;
-        if (pieceIo(store, i, store->scratch, 0, store->openMessage,
-                    sizeof(store->openMessage), &missing) != STORAGE_OK) {
-            store->openResult = STORAGE_EIO;
+        uv_mutex_lock(&store->lock);
+        stop = store->stopChecking;
+        uv_mutex_unlock(&store->lock);
+        if (stop) {
             return;
         }
-        if (missing) {
-            continue;
+        missing = 0;
+        message[0] = '\0';
+        if (pieceIo(store, i, job->scratch, 0, message, sizeof(message), &missing) !=
+            STORAGE_OK) {
+            uv_mutex_lock(&store->lock);
+            if (store->openResult == STORAGE_OK) {
+                store->openResult = STORAGE_EIO;
+                snprintf(store->openMessage, sizeof(store->openMessage), "%s", message);
+            }
+            store->stopChecking = 1;
+            uv_mutex_unlock(&store->lock);
+            return;
         }
-        parserSha1(store->scratch, pieceSize(store, i), digest);
-        if (memcmp(digest, store->hashes + (uint64_t)i * PARSER_SHA1_LENGTH,
-                   PARSER_SHA1_LENGTH) == 0) {
-            messageBitfieldSet(store->have, i);
-            store->haveCount++;
+        if (!missing) {
+            parserSha1(job->scratch, pieceSize(store, i), digest);
+            store->verified[i] = (uint8_t)(memcmp(digest,
+                                                  store->hashes + (uint64_t)i * PARSER_SHA1_LENGTH,
+                                                  PARSER_SHA1_LENGTH) == 0);
         }
+        uv_mutex_lock(&store->lock);
+        store->checked++;
+        uv_mutex_unlock(&store->lock);
     }
+}
+
+static void finishOpen(storage *store);
+
+static void checkDone(uv_work_t *work, int status)
+{
+    storageCheck *job = work->data;
+    storage      *store = job->store;
+    uint32_t      i;
+
+    (void)status;
+    release(store->context, job->scratch);
+    job->scratch = NULL;
+    if (--store->checksRunning == 0) {
+        if (store->openResult == STORAGE_OK) {
+            for (i = 0; i < store->pieceCount; i++) {
+                if (store->verified[i]) {
+                    messageBitfieldSet(store->have, i);
+                    store->haveCount++;
+                }
+            }
+        }
+        release(store->context, store->verified);
+        store->verified = NULL;
+        finishOpen(store);
+    }
+    store->jobs--;
+    maybeFree(store);
+}
+
+/* Hash existing pieces on several threads. 0 if they are under way. */
+static int startChecks(storage *store)
+{
+    uint32_t total = 0;
+    uint32_t jobs;
+    uint32_t i;
+    uint32_t start = 0;
+
+    for (i = 0; i < store->pieceCount; i++) {
+        total += pieceInExistingData(store, i) ? 1u : 0u;
+    }
+    if (total == 0) {
+        return -1;
+    }
+    store->verified = allocate(store->context, store->pieceCount);
+    if (store->verified == NULL) {
+        store->openResult = STORAGE_ENOMEM;
+        return -1;
+    }
+    store->checkTotal = total;
+    jobs = (total < STORAGE_CHECK_JOBS) ? total : STORAGE_CHECK_JOBS;
+    for (i = 0; i < jobs; i++) {
+        storageCheck *job = &store->checks[i];
+        uint32_t      end = (i + 1u == jobs) ? store->pieceCount
+                          : (uint32_t)((uint64_t)store->pieceCount * (i + 1u) / jobs);
+
+        job->store = store;
+        job->first = start;
+        job->last = end;
+        start = end;
+        job->scratch = allocate(store->context, store->pieceLength);
+        job->work.data = job;
+        if (job->scratch == NULL ||
+            uv_queue_work(store->loop, &job->work, checkWork, checkDone) != 0) {
+            /* Run what fits in the jobs already queued: none left to take
+             * this range, so give up on the whole check. */
+            release(store->context, job->scratch);
+            job->scratch = NULL;
+            store->openResult = STORAGE_ENOMEM;
+            uv_mutex_lock(&store->lock);
+            store->stopChecking = 1;
+            uv_mutex_unlock(&store->lock);
+            break;
+        }
+        store->checksRunning++;
+        store->jobs++;
+    }
+    if (store->checksRunning == 0) {
+        release(store->context, store->verified);
+        store->verified = NULL;
+        return -1;
+    }
+    return 0;
 }
 
 /*
@@ -442,15 +626,9 @@ static void openWork(uv_work_t *work)
  * callback runs, so a storageClose() from inside the callback cannot free
  * the storage under our feet; the count drops afterwards.
  */
-static void openDone(uv_work_t *work, int status)
+/* Report the outcome of storageOpen(). */
+static void finishOpen(storage *store)
 {
-    storage *store = work->data;
-
-    release(store->context, store->scratch);
-    store->scratch = NULL;
-    if (status == UV_ECANCELED) {
-        store->openResult = STORAGE_ECANCELLED;
-    }
     if (!store->closed) {
         store->opened = (uint8_t)(store->openResult == STORAGE_OK);
         store->openCallback(store->openArg, store,
@@ -458,6 +636,19 @@ static void openDone(uv_work_t *work, int status)
                             (store->openResult == STORAGE_OK) ? NULL
                             : (store->openMessage[0] != '\0') ? store->openMessage
                                                               : storageStatusString(store->openResult));
+    }
+}
+
+static void openDone(uv_work_t *work, int status)
+{
+    storage *store = work->data;
+
+    if (status == UV_ECANCELED) {
+        store->openResult = STORAGE_ECANCELLED;
+    }
+    if (store->openResult != STORAGE_OK || store->closed || !store->checkExisting ||
+        !store->anyExisted || startChecks(store) != 0) {
+        finishOpen(store);
     }
     store->jobs--;
     maybeFree(store);
@@ -616,13 +807,14 @@ int32_t storageOpen(uv_loop_t *loop, parserContext *context, const parserTorrent
     store->hashes = (hashBytes > 0) ? allocate(context, hashBytes) : NULL;
     store->have = (torrent->pieceCount > 0)
                 ? allocate(context, messageBitfieldBytes(torrent->pieceCount)) : NULL;
-    if (store->checkExisting && torrent->pieceCount > 0) {
-        store->scratch = allocate(context, torrent->pieceLength);
-    }
     result = STORAGE_OK;
-    if (store->files == NULL || (hashBytes > 0 && (store->hashes == NULL || store->have == NULL)) ||
-        (store->checkExisting && torrent->pieceCount > 0 && store->scratch == NULL)) {
+    if (store->files == NULL || (hashBytes > 0 && (store->hashes == NULL || store->have == NULL))) {
         result = STORAGE_ENOMEM;
+    }
+    if (result == STORAGE_OK && uv_mutex_init(&store->lock) == 0) {
+        store->lockReady = 1;
+    } else if (result == STORAGE_OK) {
+        result = STORAGE_EIO;
     }
     if (result == STORAGE_OK) {
         if (hashBytes > 0) {
@@ -684,6 +876,25 @@ const uint8_t *storageHave(const storage *store, uint32_t *haveCount)
         *haveCount = (store != NULL) ? store->haveCount : 0;
     }
     return (store != NULL) ? store->have : NULL;
+}
+
+void storageCheckProgress(storage *store, uint32_t *checked, uint32_t *total)
+{
+    uint32_t done = 0;
+    uint32_t all = 0;
+
+    if (store != NULL && store->lockReady) {
+        uv_mutex_lock(&store->lock);
+        done = store->checked;
+        all = store->checkTotal;
+        uv_mutex_unlock(&store->lock);
+    }
+    if (checked != NULL) {
+        *checked = done;
+    }
+    if (total != NULL) {
+        *total = all;
+    }
 }
 
 uint32_t storageFileCount(const storage *store)
@@ -804,6 +1015,9 @@ void storageClose(storage *store)
     store->closed = 1;
     if (!store->opened) {
         uv_cancel((uv_req_t *)&store->openWork);    /* only if it has not started */
+        uv_mutex_lock(&store->lock);
+        store->stopChecking = 1;                    /* check jobs stop at the next piece */
+        uv_mutex_unlock(&store->lock);
     }
     maybeFree(store);
 }

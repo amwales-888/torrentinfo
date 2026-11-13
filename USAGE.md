@@ -61,7 +61,8 @@ The program works in one of six ways, chosen by the first option.
 
 **Check a download** (`-V`)
 : Checks the files on disk against the torrent, without using the network
-  and without changing anything. For each file it says whether it is
+  and without changing anything. On a large torrent this can take a while;
+  progress is shown every two seconds. For each file it says whether it is
   complete, partly there or missing, how much of it is good, and which
   pieces are missing.
 

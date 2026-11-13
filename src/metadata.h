@@ -19,6 +19,7 @@
 #include <stdint.h>
 #include <uv.h>
 
+#include "blocklist.h"
 #include "parser.h"
 #include "peer.h"
 
@@ -43,6 +44,8 @@ typedef struct metadataOptions {
     uint32_t    maxPeers;               /* connections at once; 0 = default  */
     uint32_t    handshakeTimeoutSeconds;    /* 0: no limit                   */
     uint16_t    listenPort;             /* told to peers; 0 if not listening */
+    const blocklist *blocklist;         /* addresses never to talk to; NULL:
+                                           none. Must outlive the fetch.     */
 } metadataOptions;
 
 typedef struct metadataProgress {
@@ -53,6 +56,7 @@ typedef struct metadataProgress {
     uint32_t    size;                   /* bytes, once a peer has said       */
     uint32_t    pieces;                 /* 16 KiB pieces of it               */
     uint32_t    piecesDone;
+    uint32_t    peersBlocked;           /* refused by the blocklist          */
 } metadataProgress;
 
 typedef struct metadataEvents {

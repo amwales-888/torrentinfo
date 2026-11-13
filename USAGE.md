@@ -67,11 +67,14 @@ The program works in one of six ways, chosen by the first option.
   program first asks peers for the torrent's details (this usually takes a
   few seconds), checks them, keeps them (see FILES), and then downloads as
   usual. Running the same link again starts straight away. Links that name
-  no tracker work too: the peers are found through the DHT.
+  no tracker work too: the peers are found through the DHT. Magnet links
+  cannot be used for *private* torrents (those of many private trackers):
+  their peers will not send the details, so you need the .torrent file.
 
 **Make a magnet link** (`-m`)
 : Prints the magnet link for a torrent file, with its name, trackers and
   web seeds, ready to paste into a web page, a message or another client.
+  For a private torrent it also warns that the link will not work.
 
 **Check a download** (`-V`)
 : Checks the files on disk against the torrent, without using the network
@@ -209,6 +212,17 @@ from people who connect to you, and from the peers themselves, which tell
 each other about the other peers they know ("peer exchange"). Private
 torrents only use their trackers.
 
+**Blocking addresses.** Put addresses you never want to deal with in
+`blocklist.txt` (see FILES), one per line: a single address (`203.0.113.7`),
+a block (`10.0.0.0/8`, `2001:db8::/32`) or a range
+(`198.51.100.0 - 198.51.100.255`). Lines starting with `#` are comments.
+Published lists in the PeerGuardian (`.p2p`) and eMule `ipfilter.dat`
+formats can be used as they are, even with hundreds of thousands of lines.
+The program never connects to these addresses, refuses their connections,
+and ignores them in the DHT. When it starts it says how many ranges it
+loaded and how many lines it did not understand, and while it runs it says
+how many peers were refused.
+
 **Bad data.** Every piece is checked when it arrives. A peer that sends
 damaged data is disconnected and not used again, and the piece is fetched
 again from someone else.
@@ -225,6 +239,45 @@ minute, so that newcomers get a chance.
 The program keeps a little data between runs, in `~/.torrentinfo` on Linux
 and in `%APPDATA%\torrentinfo` on Windows (made when first needed):
 
+`config`
+: Your settings, one `name = value` per line. The first time the program
+  needs it, it writes this file with every setting listed but switched off
+  (each line starts with `#`); remove the `#` to use one. Options given on
+  the command line win over this file. Lines it does not understand are
+  reported and skipped. The settings are:
+
+  `blocklist = blocklist.txt`
+  : The blocklist to use (a name on its own is looked for in this
+    directory); `none` for no blocklist.
+
+  `listen_port = 6881`
+  : Like `-L`.
+
+  `port_forwarding = yes`
+  : `no` is like `-N`.
+
+  `dht = yes`
+  : `no` is like `-X`.
+
+  `dht_bootstrap = host:port, host:port`
+  : DHT nodes to start from instead of the usual public ones.
+
+  `download_directory = ~/Downloads`
+  : Where downloads go (and where `-V` looks) when `-O` is not given. `~`
+    is your home directory.
+
+  `max_peers = 50`
+  : How many peers to be connected to at once (1 to 1000).
+
+  `upload_slots = 4`
+  : How many peers to upload to at once (1 to 100).
+
+`blocklist.txt`
+: Addresses never to talk to (see "Blocking addresses" under NOTES). Used
+  if it exists, unless `config` names another file or says `none`. If
+  `config` names a file that cannot be read, the program stops rather than
+  run without it.
+
 `dht.dat`
 : The DHT nodes it knew last time, so the next start finds peers sooner.
 
@@ -234,9 +287,13 @@ and in `%APPDATA%\torrentinfo` on Windows (made when first needed):
 
 ## ENVIRONMENT
 
+`TORRENTINFO_CONFIG`
+: A settings file to use instead of `config` in the directory above. It is
+  not created if missing.
+
 `TORRENTINFO_DHT_BOOTSTRAP`
 : DHT nodes to start from, as `host:port` separated by commas, instead of
-  the usual public ones. Rarely needed.
+  the usual public ones, and `dht_bootstrap` in the settings. Rarely needed.
 
 ## EXAMPLES
 
@@ -331,6 +388,15 @@ torrentinfo -o photos.torrent -n "Summer photos" -c "From the trip" \
     -a https://tracker.example.org/announce \
     -a udp://backup.example.net:6969/announce \
     beach.jpg harbour.jpg sunset.jpg
+```
+
+Block a range of addresses and download to your Downloads folder by
+default (Linux; on Windows edit the same files in `%APPDATA%\torrentinfo`):
+
+```
+echo "198.51.100.0/24" >> ~/.torrentinfo/blocklist.txt
+sed -i 's|^#download_directory.*|download_directory = ~/Downloads|' ~/.torrentinfo/config
+torrentinfo -D ubuntu.torrent
 ```
 
 Then share it by seeding from the folder that holds the files:

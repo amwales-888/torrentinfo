@@ -26,6 +26,8 @@
 #include <time.h>
 
 #include "announce.h"
+#include "blocklist.h"
+#include "config.h"
 #include "dht.h"
 #include "download.h"
 #include "magnet.h"
@@ -1103,6 +1105,12 @@ static uint32_t handshakePeers(uv_loop_t *loop, peerAttempt *attempts, uint32_t 
 
 static uint8_t useDht = 1;                  /* -X turns it off */
 
+/* From the settings file (see loadSettings()); 0 or NULL: not set. */
+static configSettings  settingsFile;
+static blocklist      *peerBlocklist;
+static uint32_t        settingsMaxPeers;
+static uint32_t        settingsUploadSlots;
+
 static int dataFilePath(const char *subdirectory, const char *name, char *path, size_t size)
 {
     size_t length;
@@ -1133,9 +1141,15 @@ static dht *startDht(uv_loop_t *loop, parserContext *context, const parserAlloca
     static const char *bootstrap[9];
     const char        *environment = getenv("TORRENTINFO_DHT_BOOTSTRAP");
 
+    if ((environment == NULL || environment[0] == '\0') &&
+        (settingsFile.set & CONFIG_SET_DHT_BOOTSTRAP) != 0) {
+        environment = settingsFile.dhtBootstrap;    /* dht_bootstrap in the settings */
+    }
+
     memset(&options, 0, sizeof(options));
     options.port = port;
     options.binding = binding;
+    options.blocklist = peerBlocklist;
     /* TORRENTINFO_DHT_BOOTSTRAP="host:port,host:port": routers to use instead
      * of the well-known ones (a private DHT, or a network that blocks them). */
     if (environment != NULL && environment[0] != '\0' && strlen(environment) < sizeof(list)) {
@@ -1219,6 +1233,7 @@ typedef struct downloadRun {
     uint64_t        lastReport;         /* uv_now() of the last progress line */
     uint64_t        reportReceived;     /* bytes received at that line       */
     uint64_t        reportSent;         /* bytes uploaded at that line       */
+    uint32_t        reportBlocked;      /* peers refused, as last reported   */
 } downloadRun;
 
 static void formatBytes(uint64_t bytes, char *out, size_t size)
@@ -1273,6 +1288,11 @@ static void onProgressTick(uv_timer_t *timer)
                progress.done, progress.wanted, down, up, progress.peersConnected,
                progress.peersIncoming, progress.peersUnchoking, progress.peersDownloading,
                progress.peersUploading, progress.endgame ? "  [endgame]" : "");
+    }
+    if (progress.peersBlocked != run->reportBlocked) {
+        printf("  blocklist: %" PRIu32 " peer address%s refused so far\n", progress.peersBlocked,
+               (progress.peersBlocked == 1u) ? "" : "es");
+        run->reportBlocked = progress.peersBlocked;
     }
     fflush(stdout);
     run->lastReport = now;
@@ -1607,6 +1627,9 @@ static int downloadTorrent(uv_loop_t *loop, parserContext *context, const parser
     options.seed = seed;
     options.infoDictionary = info;
     options.infoDictionaryLength = infoLength;
+    options.blocklist = peerBlocklist;
+    options.maxPeers = settingsMaxPeers;
+    options.uploadSlots = settingsUploadSlots;
 
     uv_timer_init(loop, &run.timer);
     run.timer.data = &run;
@@ -2121,6 +2144,9 @@ static void onFetchTick(uv_timer_t *timer)
     if (progress.pieces > 0) {
         printf(", %" PRIu32 " of %" PRIu32 " pieces", progress.piecesDone, progress.pieces);
     }
+    if (progress.peersBlocked > 0) {
+        printf(", %" PRIu32 " blocked", progress.peersBlocked);
+    }
     printf("\n");
     fflush(stdout);
 }
@@ -2266,6 +2292,8 @@ static int magnetTorrent(parserContext *context, const parserAllocator *allocato
     memcpy(options.peerId, config->peerId, PEER_ID_LENGTH);
     options.handshakeTimeoutSeconds = timeoutSeconds;
     options.listenPort = listenPort;
+    options.blocklist = peerBlocklist;
+    options.maxPeers = settingsMaxPeers;
     if (peerInit(&loop, context, config->binding) == PEER_OK &&
         metadataBegin(&loop, context, &options, &events, run, &run->fetch) == METADATA_OK) {
         for (i = 0; i < link->peerCount; i++) {
@@ -2344,6 +2372,11 @@ static int printMagnet(parserContext *context, const parserAllocator *allocator,
         return -1;
     }
     status = magnetFromTorrent(context, &torrent, &uri);
+    if (status == MAGNET_OK && torrent.isPrivate) {
+        fprintf(stderr, "Note: this torrent is private. Its peers will not send the torrent's "
+                        "details to a\nmagnet link (BEP 27), so the link cannot be used to "
+                        "download it: share the\n.torrent file instead.\n");
+    }
     parserFree(context, &torrent);
     if (status != MAGNET_OK) {
         fprintf(stderr, "%s: out of memory\n", path);
@@ -2672,6 +2705,125 @@ static char **utf8Arguments(const parserAllocator *allocator, int *count)
 }
 #endif
 
+/* ------------------------------------------------------------------------ */
+/* Settings file and blocklist                                              */
+/* ------------------------------------------------------------------------ */
+
+static void onSettingsWarning(void *privateArg, uint32_t line, const char *message)
+{
+    fprintf(stderr, "%s:%" PRIu32 ": %s (ignored)\n", (const char *)privateArg, line, message);
+}
+
+/*
+ * Read the settings file into settingsFile: $TORRENTINFO_CONFIG, or "config"
+ * in the data directory, which is created, as a commented template listing
+ * every setting, if it does not exist. Problems are reported, never fatal.
+ */
+static void loadSettings(parserContext *context)
+{
+    static char path[1024];
+    const char *environment = getenv("TORRENTINFO_CONFIG");
+    int32_t     error;
+
+    memset(&settingsFile, 0, sizeof(settingsFile));
+    if (environment != NULL && environment[0] != '\0') {
+        snprintf(path, sizeof(path), "%s", environment);
+    } else if (dataFilePath(NULL, CONFIG_FILE_NAME, path, sizeof(path)) != 0) {
+        return;                                     /* no data directory: defaults */
+    }
+    if (configLoad(context, path, &settingsFile, onSettingsWarning, path, &error) == CONFIG_OK) {
+        return;
+    }
+    memset(&settingsFile, 0, sizeof(settingsFile));
+    if (error == UV_ENOENT && (environment == NULL || environment[0] == '\0')) {
+        if (configWriteTemplate(path, &error) == CONFIG_OK) {
+            printf("Settings:   created %s (all settings there are off until you edit it)\n",
+                   path);
+        }
+    } else {
+        fprintf(stderr, "%s: cannot read the settings: %s\n", path,
+                (error != 0) ? uv_strerror(error) : "out of memory");
+    }
+}
+
+static int isAbsolutePath(const char *path)
+{
+#ifdef _WIN32
+    return path[0] == '\\' || path[0] == '/' ||
+           (path[0] != '\0' && path[1] == ':');
+#else
+    return path[0] == '/';
+#endif
+}
+
+/* Group digits in threes: 1234567 -> "1,234,567". */
+static const char *formatCount(uint64_t value, char *text, size_t size)
+{
+    char   digits[32];
+    size_t length = (size_t)snprintf(digits, sizeof(digits), "%" PRIu64, value);
+    size_t out = 0;
+    size_t i;
+
+    for (i = 0; i < length && out + 2u < size; i++) {
+        if (i > 0 && (length - i) % 3u == 0) {
+            text[out++] = ',';
+        }
+        text[out++] = digits[i];
+    }
+    text[out] = '\0';
+    return text;
+}
+
+/*
+ * Load the IP blocklist into peerBlocklist: the "blocklist" setting, or
+ * blocklist.txt in the data directory if there is one. 0, or -1 if a list
+ * the settings name cannot be read (better not to run unprotected).
+ */
+static int loadBlocklist(parserContext *context)
+{
+    char           path[CONFIG_MAX_VALUE + 64];
+    blocklistStats stats;
+    int32_t        error;
+    int32_t        result;
+    char           addresses[32];
+    int            named = (settingsFile.set & CONFIG_SET_BLOCKLIST) != 0;
+
+    if (named && settingsFile.blocklist[0] == '\0') {
+        return 0;                                   /* blocklist = none */
+    }
+    if (named && isAbsolutePath(settingsFile.blocklist)) {
+        snprintf(path, sizeof(path), "%s", settingsFile.blocklist);
+    } else if (dataFilePath(NULL, named ? settingsFile.blocklist : "blocklist.txt", path,
+                            sizeof(path)) != 0) {
+        return named ? -1 : 0;
+    }
+    result = blocklistLoad(context, path, &peerBlocklist, &stats, &error);
+    if (result == BLOCKLIST_EIO && error == UV_ENOENT && !named) {
+        return 0;                                   /* no list: nothing blocked */
+    }
+    if (result != BLOCKLIST_OK) {
+        fprintf(stderr, "Blocklist %s: %s\n", path,
+                (result == BLOCKLIST_EIO) ? uv_strerror(error) : "out of memory");
+        return -1;
+    }
+    printf("Blocklist:  %" PRIu32 " IPv4 range%s (%s addresses)", stats.ranges4,
+           (stats.ranges4 == 1u) ? "" : "s", formatCount(stats.addresses4, addresses,
+                                                         sizeof(addresses)));
+    if (stats.ranges6 > 0) {
+        printf(" and %" PRIu32 " IPv6 range%s", stats.ranges6, (stats.ranges6 == 1u) ? "" : "s");
+    }
+    printf(" from %s\n", path);
+    if (stats.rejected > 0) {
+        printf("            %" PRIu32 " line%s not understood (the first is line %" PRIu32 ")\n",
+               stats.rejected, (stats.rejected == 1u) ? "" : "s", stats.firstRejected);
+    }
+    if (stats.ranges4 == 0 && stats.ranges6 == 0) {
+        blocklistFree(context, peerBlocklist);      /* nothing in it */
+        peerBlocklist = NULL;
+    }
+    return 0;
+}
+
 static void usage(const char *program)
 {
     fprintf(stderr,
@@ -2738,6 +2890,9 @@ int main(int argc, char **argv)
     uint32_t        listenPort = 6881;  /* -L */
     uint8_t         downloadOnly = 0;   /* -S, -L or -N given */
     uint8_t         mapPort = 1;        /* -N turns it off */
+    uint8_t         listenGiven = 0;    /* -L: wins over the settings file */
+    uint8_t         mapGiven = 0;       /* -N */
+    uint8_t         dhtGiven = 0;       /* -X */
     const char     *interfaceSpec = NULL;   /* -I */
     netBinding      binding;
     uint8_t         directoryGiven = 0; /* -O */
@@ -2838,10 +2993,12 @@ int main(int argc, char **argv)
             break;
         case 'N':
             mapPort = 0;
+            mapGiven = 1;
             downloadOnly = 1;
             break;
         case 'X':
             useDht = 0;
+            dhtGiven = 1;
             downloadOnly = 1;
             break;
         case 'L': {
@@ -2853,6 +3010,7 @@ int main(int argc, char **argv)
                 goto cleanup;
             }
             listenPort = (uint32_t)value;
+            listenGiven = 1;
             downloadOnly = 1;
             break;
         }
@@ -2920,6 +3078,10 @@ int main(int argc, char **argv)
             usage(argv[0]);
             goto cleanup;
         }
+        loadSettings(&context);
+        if (!directoryGiven && (settingsFile.set & CONFIG_SET_DOWNLOAD_DIRECTORY) != 0) {
+            outputDirectory = settingsFile.downloadDirectory;
+        }
         status = verifyTorrent(&context, &allocator, argv[optionIndex], outputDirectory);
     } else if (announceMode) {
         if (outputPath != NULL || createOnly || argc - optionIndex != 1) {
@@ -2929,6 +3091,27 @@ int main(int argc, char **argv)
         if ((wanted >= 0 || outputDirectory[0] != '\0' || downloadOnly) && mode != MODE_DOWNLOAD) {
             usage(argv[0]);
             goto cleanup;
+        }
+        /* The settings file fills in what the command line did not say. */
+        loadSettings(&context);
+        if (!listenGiven && (settingsFile.set & CONFIG_SET_LISTEN_PORT) != 0) {
+            listenPort = settingsFile.listenPort;
+        }
+        if (!mapGiven && (settingsFile.set & CONFIG_SET_PORT_FORWARDING) != 0) {
+            mapPort = settingsFile.portForwarding;
+        }
+        if (!dhtGiven && (settingsFile.set & CONFIG_SET_DHT) != 0) {
+            useDht = settingsFile.dht;
+        }
+        settingsMaxPeers = settingsFile.maxPeers;
+        settingsUploadSlots = settingsFile.uploadSlots;
+        if (mode == MODE_DOWNLOAD) {
+            if (!directoryGiven && (settingsFile.set & CONFIG_SET_DOWNLOAD_DIRECTORY) != 0) {
+                outputDirectory = settingsFile.downloadDirectory;
+            }
+            if (loadBlocklist(&context) != 0) {
+                goto cleanup;
+            }
         }
         memset(&binding, 0, sizeof(binding));
         if (interfaceSpec != NULL) {
@@ -2968,6 +3151,10 @@ int main(int argc, char **argv)
     }
 
 cleanup:
+    if (peerBlocklist != NULL) {
+        blocklistFree(&context, peerBlocklist);
+        peerBlocklist = NULL;
+    }
     allocator.free((void *)trackers);
     allocator.free((void *)webSeeds);
 #ifdef _WIN32

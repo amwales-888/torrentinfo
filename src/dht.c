@@ -141,6 +141,8 @@ struct dht {
     uint32_t            openHandles;
     uint32_t            resolving;          /* DNS requests outstanding       */
     uint8_t             ended;
+    const blocklist    *blocklist;
+    uint64_t            blocked;            /* by the blocklist               */
     uint16_t            port;
 
     uint8_t             id[DHT_ID_LENGTH];
@@ -420,6 +422,10 @@ static void addNode(dht *d, const uint8_t *id, const struct sockaddr_in *address
     uint32_t i;
 
     if (memcmp(id, d->id, DHT_ID_LENGTH) == 0 || !usableAddress(address)) {
+        return;
+    }
+    if (blocklistContains(d->blocklist, (const struct sockaddr *)address)) {
+        d->blocked++;
         return;
     }
     bucket = bucketOf(d, id);
@@ -1111,7 +1117,9 @@ static void handleResponse(dht *d, const krpc *message, const struct sockaddr_in
         struct sockaddr_in address;
 
         fromCompact(message->nodes + i + DHT_ID_LENGTH, &address);
-        if (memcmp(message->nodes + i, d->id, DHT_ID_LENGTH) != 0) {
+        if (blocklistContains(d->blocklist, (const struct sockaddr *)&address)) {
+            d->blocked++;
+        } else if (memcmp(message->nodes + i, d->id, DHT_ID_LENGTH) != 0) {
             addCandidate(lk, message->nodes + i, &address);
         }
     }
@@ -1147,6 +1155,10 @@ static void onReceive(uv_udp_t *udp, ssize_t count, const uv_buf_t *buffer,
 
     (void)flags;
     if (d->ended || count <= 0 || from == NULL || from->sa_family != AF_INET) {
+        return;
+    }
+    if (blocklistContains(d->blocklist, from)) {
+        d->blocked++;                               /* neither heard nor answered */
         return;
     }
     d->received++;
@@ -1497,6 +1509,7 @@ int32_t dhtBegin(uv_loop_t *loop, parserContext *context, const dhtOptions *opti
     memset(d, 0, sizeof(*d));
     d->loop = loop;
     d->context = context;
+    d->blocklist = options->blocklist;
     if (options->binding != NULL) {
         d->binding = *options->binding;
     }
@@ -1623,6 +1636,7 @@ void dhtGetStatus(const dht *d, dhtStatus *status)
         }
     }
     status->received = d->received;
+    status->blocked = d->blocked;
     status->sent = d->sent;
 }
 

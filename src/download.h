@@ -59,6 +59,7 @@
 #include <stdint.h>
 #include <uv.h>
 
+#include "blocklist.h"
 #include "parser.h"
 #include "peer.h"
 
@@ -115,6 +116,8 @@ typedef struct downloadOptions {
                                            metadata (BEP 9); NULL: do not.
                                            Must outlive the download.          */
     uint32_t        infoDictionaryLength;
+    const blocklist *blocklist;         /* addresses never to talk to; NULL:
+                                           none. Must outlive the download.    */
 } downloadOptions;
 
 typedef struct downloadProgress {
@@ -143,6 +146,7 @@ typedef struct downloadProgress {
     uint8_t         checking;           /* still checking the files on disk    */
     uint32_t        checkedPieces;      /* ...pieces checked so far            */
     uint32_t        checkTotal;         /* ...of these (0 until known)         */
+    uint32_t        peersBlocked;       /* addresses refused by the blocklist  */
 } downloadProgress;
 
 typedef struct downloadEvents {

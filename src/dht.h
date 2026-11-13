@@ -29,6 +29,7 @@
 #include <stdint.h>
 #include <uv.h>
 
+#include "blocklist.h"
 #include "net.h"
 #include "parser.h"
 
@@ -68,6 +69,8 @@ typedef struct dhtOptions {
     size_t              stateLength;
     const char *const  *bootstrap;      /* "host:port" list ending in NULL, or
                                            NULL for the well-known routers     */
+    const blocklist    *blocklist;      /* nodes never to talk to, or NULL;
+                                           must outlive the dht                */
 } dhtOptions;
 
 typedef struct dhtStatus {
@@ -78,6 +81,7 @@ typedef struct dhtStatus {
     uint32_t    storedPeers;            /* peers others announced to us        */
     uint64_t    received;               /* messages                            */
     uint64_t    sent;
+    uint64_t    blocked;                /* messages and nodes refused          */
 } dhtStatus;
 
 /* Peers found for a torrent (IPv4); may repeat ones given before. */

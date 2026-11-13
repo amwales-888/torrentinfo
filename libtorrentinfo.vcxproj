@@ -101,6 +101,8 @@
     <ClCompile Include="src\magnet.c" />
     <ClCompile Include="src\metadata.c" />
     <ClCompile Include="src\dht.c" />
+    <ClCompile Include="src\blocklist.c" />
+    <ClCompile Include="src\config.c" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="src\queue.h" />
@@ -122,6 +124,8 @@
     <ClInclude Include="src\magnet.h" />
     <ClInclude Include="src\metadata.h" />
     <ClInclude Include="src\dht.h" />
+    <ClInclude Include="src\blocklist.h" />
+    <ClInclude Include="src\config.h" />
   </ItemGroup>
   <ItemGroup>
     <None Include="vcpkg.json" />

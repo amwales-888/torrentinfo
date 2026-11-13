@@ -48,6 +48,7 @@ typedef struct metaPeer {
     uint8_t                 excluded;
     uint8_t                 metadataId;     /* its id for ut_metadata          */
     uint8_t                 attempts;       /* connections made                */
+    uint8_t                 refused;        /* said it has no metadata to give */
     uint64_t                retryAt;        /* uv_now() before which to wait   */
     uint32_t                requests[METADATA_REQUESTS_PER_PEER];
     uint32_t                requestCount;
@@ -64,6 +65,8 @@ struct metadataFetch {
     peerConnectOptions  connectOptions;
     uint32_t            maxPeers;
     uint16_t            listenPort;
+    const blocklist    *blocklist;
+    uint32_t            blocked;
     uv_timer_t          timer;
     struct metaPeerList peers;
     uint32_t            peerCount;
@@ -76,6 +79,9 @@ struct metadataFetch {
     uint8_t            *pieceState;
     metaPeer          **pieceFrom;      /* who sent each piece                */
     uint32_t            piecesDone;
+    uint32_t            refusals;       /* peers without metadata to give    */
+    uint8_t             offered;        /* some peer did offer it            */
+    uint8_t             hinted;
 
     uint8_t             done;
     uint8_t             ended;
@@ -371,9 +377,24 @@ static void receiveHandshake(metadataFetch *f, metaPeer *peer, const uint8_t *da
         return;
     }
     if (handshake.metadataId == 0 || handshake.metadataSize == 0) {
-        dropPeer(peer, "does not offer the metadata (yet)", 0);
+        int first = !peer->refused;
+
+        if (first) {
+            peer->refused = 1;
+            f->refusals++;
+        }
+        dropPeer(peer, first ? "has the torrent but will not send its details" : NULL, 0);
+        /* Peers will not share a private torrent's metadata (BEP 27): if
+         * none offers it, say what that probably means, once. */
+        if (!f->offered && !f->hinted && f->refusals >= 3u) {
+            f->hinted = 1;
+            emit(f, "%u peers have the torrent but none will send its details: it is most "
+                 "likely a private torrent, which cannot be fetched from a magnet link. Use "
+                 "the .torrent file instead.", (unsigned)f->refusals);
+        }
         return;
     }
+    f->offered = 1;
     peer->metadataId = handshake.metadataId;
     if (f->info == NULL) {
         /* The first size we hear; the hash will tell if it was a lie. */
@@ -549,6 +570,7 @@ int32_t metadataBegin(uv_loop_t *loop, parserContext *context, const metadataOpt
     f->privateArg = privateArg;
     f->maxPeers = (options->maxPeers != 0) ? options->maxPeers : METADATA_DEFAULT_MAX_PEERS;
     f->listenPort = options->listenPort;
+    f->blocklist = options->blocklist;
     memcpy(f->connectOptions.infoHash, options->infoHash, PARSER_SHA1_LENGTH);
     memcpy(f->connectOptions.peerId, options->peerId, PEER_ID_LENGTH);
     f->connectOptions.pieceCount = 0;               /* unknown until we have it */
@@ -570,6 +592,10 @@ int32_t metadataAddPeer(metadataFetch *f, const struct sockaddr *address)
     if (f == NULL || address == NULL ||
         (address->sa_family != AF_INET && address->sa_family != AF_INET6) || stopped(f)) {
         return METADATA_EINVAL;
+    }
+    if (blocklistContains(f->blocklist, address)) {
+        f->blocked++;
+        return METADATA_OK;                         /* quietly ignored */
     }
     size = (address->sa_family == AF_INET) ? sizeof(struct sockaddr_in)
                                            : sizeof(struct sockaddr_in6);
@@ -614,6 +640,7 @@ void metadataGetProgress(const metadataFetch *f, metadataProgress *progress)
     progress->size = f->size;
     progress->pieces = f->pieces;
     progress->piecesDone = f->piecesDone;
+    progress->peersBlocked = f->blocked;
     TAILQ_FOREACH(peer, &f->peers, entries) {
         progress->peersQueued += (peer->state == PEER_QUEUED) ? 1u : 0u;
         progress->peersConnecting += (peer->state == PEER_CONNECTING) ? 1u : 0u;

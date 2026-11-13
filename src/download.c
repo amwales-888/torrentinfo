@@ -218,6 +218,8 @@ struct download {
     const uint8_t          *info;           /* raw info dictionary, or NULL */
     uint32_t                infoLength;
     uint32_t                pexLearned;     /* new peers heard of by PEX    */
+    const blocklist        *blocklist;
+    uint32_t                blocked;        /* addresses refused            */
 
     uint32_t                verifyJobs;     /* piece checks on the thread pool */
     uint8_t                 timerClosed;    /* waiting only for those to end */
@@ -1891,6 +1893,10 @@ static int onIncoming(void *listenerArg, peerConnection *connection, const struc
         (address->sa_family != AF_INET && address->sa_family != AF_INET6)) {
         return 0;
     }
+    if (blocklistContains(dl->blocklist, address)) {
+        dl->blocked++;
+        return 0;
+    }
     TAILQ_FOREACH(peer, &dl->peers, entries) {
         if (peer->excluded && sameHost(&peer->address, address)) {
             return 0;                               /* misbehaved before */
@@ -2233,6 +2239,7 @@ int32_t downloadBegin(uv_loop_t *loop, parserContext *context, const parserTorre
     dl->pexEnabled = (uint8_t)!torrent->isPrivate;      /* BEP 27: trackers only */
     dl->info = options->infoDictionary;
     dl->infoLength = options->infoDictionaryLength;
+    dl->blocklist = options->blocklist;
 
     if (uv_random(NULL, NULL, &seed, sizeof(seed), 0, NULL) != 0) {
         seed = 0;
@@ -2301,6 +2308,10 @@ int32_t downloadAddPeer(download *dl, const struct sockaddr *address)
     if (stopped(dl)) {
         return DOWNLOAD_EINVAL;
     }
+    if (blocklistContains(dl->blocklist, address)) {
+        dl->blocked++;
+        return DOWNLOAD_OK;                         /* quietly ignored */
+    }
     TAILQ_FOREACH(peer, &dl->peers, entries) {
         if (sameAddress(&peer->address, address)) {
             if (peer->state == DOWNLOAD_PEER_CLOSED && !peer->excluded && !peer->incoming) {
@@ -2364,6 +2375,7 @@ void downloadGetProgress(const download *dl, downloadProgress *progress)
     progress->bytesUploaded = dl->bytesUploaded;
     progress->listenPort = dl->listenPort;
     progress->peersFromPex = dl->pexLearned;
+    progress->peersBlocked = dl->blocked;
     progress->checking = (uint8_t)(!dl->ready && !dl->finished);
     storageCheckProgress(dl->store, &progress->checkedPieces, &progress->checkTotal);
     TAILQ_FOREACH(peer, &dl->peers, entries) {

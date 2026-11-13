@@ -113,8 +113,7 @@ project's *Properties > Debugging > Command Arguments*.
   the end, slow blocks are also requested from a second peer ("endgame").
   The download stops if no data arrives for 2 minutes, or if there is no
   peer at all for 1 minute. Progress is printed every 2 seconds. Peers come
-  from the trackers, from peer exchange, and from peers that connect to us;
-  DHT is not implemented yet.
+  from the trackers, the DHT, peer exchange, and peers that connect to us.
 
 - **Checking and disk access.** Existing data is checked when a download
   starts (and by `-V`) on four threads at once, with progress every 2
@@ -126,11 +125,27 @@ project's *Properties > Debugging > Command Arguments*.
   quoted in the shell) instead of a .torrent file. The torrent's info
   dictionary is first fetched from peers (BEP 9: peers from the link's
   trackers and `x.pe` addresses), checked against the info hash, and saved
-  as `<info hash>.torrent` in the download folder; running the same link
-  again uses that file. Our client also sends the metadata to peers that
-  ask for it. Without trackers or peer addresses in the link, a magnet link
-  needs DHT, which is not implemented yet. On its own (no option) a magnet
-  link is just shown.
+  as `torrents/<info hash>.torrent` in the data directory (below); running
+  the same link again uses that file. Our client also sends the metadata to
+  peers that ask for it. Peers come from the link's trackers and `x.pe`
+  addresses and from the DHT, so a link with only the info hash works. On
+  its own (no option) a magnet link is just shown.
+
+- **DHT (BEP 5).** `-D` runs a DHT node on the UDP port with the same number
+  as the listening port (IPv4 only). It looks up peers for the torrent at
+  once and then every 15 minutes (5 while it finds fewer than 8), announces
+  us to the closest nodes, and answers other nodes' queries. It starts from
+  the routing table saved last time and from the well-known routers
+  (router.bittorrent.com, dht.transmissionbt.com, router.utorrent.com,
+  dht.libtorrent.org); `TORRENTINFO_DHT_BOOTSTRAP="host:port,..."` names
+  others instead. Private torrents never use it; `-X` turns it off. Tested
+  against libtorrent 2.1 in both directions (finding, announcing, metadata,
+  transfer).
+
+- **Data directory.** Lasting data is kept in `~/.torrentinfo` on Linux and
+  `%APPDATA%\torrentinfo` on Windows (created when first needed): `dht.dat`,
+  the DHT routing table, and `torrents\`, the torrents fetched for magnet
+  links.
 
 - **Peer exchange.** Peers that support the extension protocol (BEP 10;
   nearly all current clients do) are sent an extended handshake, and with

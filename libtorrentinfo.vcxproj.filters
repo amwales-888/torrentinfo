@@ -65,6 +65,9 @@
     <ClCompile Include="src\metadata.c">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="src\dht.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="src\queue.h">
@@ -119,6 +122,9 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="src\metadata.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\dht.h">
       <Filter>Header Files</Filter>
     </ClInclude>
   </ItemGroup>

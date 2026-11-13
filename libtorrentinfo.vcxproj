@@ -100,6 +100,7 @@
     <ClCompile Include="src\portmap.c" />
     <ClCompile Include="src\magnet.c" />
     <ClCompile Include="src\metadata.c" />
+    <ClCompile Include="src\dht.c" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="src\queue.h" />
@@ -120,6 +121,7 @@
     <ClInclude Include="src\portmap.h" />
     <ClInclude Include="src\magnet.h" />
     <ClInclude Include="src\metadata.h" />
+    <ClInclude Include="src\dht.h" />
   </ItemGroup>
   <ItemGroup>
     <None Include="vcpkg.json" />

@@ -11,7 +11,7 @@ torrentinfo file.torrent | magnet-link
 torrentinfo -o new.torrent [-a url]... [-w url]... [-c text] [-n name] [-l size] [-p] file...
 torrentinfo -t [-T seconds] [-C certs.pem] [-I interface] file.torrent
 torrentinfo -P [-T seconds] [-C certs.pem] [-I interface] file.torrent
-torrentinfo -D [-S] [-L port] [-N] [-O folder] [-i piece] [-T seconds] [-C certs.pem]
+torrentinfo -D [-S] [-L port] [-N] [-X] [-O folder] [-i piece] [-T seconds] [-C certs.pem]
                [-I interface] file.torrent | magnet-link
 torrentinfo -V [-O folder] file.torrent
 ```
@@ -64,10 +64,9 @@ The program works in one of six ways, chosen by the first option.
 : Instead of a torrent file, `-D` accepts a *magnet link*, the
   `magnet:?xt=urn:btih:...` links websites offer. Put it in quotes. The
   program first asks peers for the torrent's details (this usually takes a
-  few seconds), checks them, saves them in the download folder as a
-  *.torrent* file named after the link's long hexadecimal code, and then
-  downloads as usual. Running the same link again uses that saved file.
-  For now, the link must name a tracker (most do).
+  few seconds), checks them, keeps them (see FILES), and then downloads as
+  usual. Running the same link again starts straight away. Links that name
+  no tracker work too: the peers are found through the DHT.
 
 **Check a download** (`-V`)
 : Checks the files on disk against the torrent, without using the network
@@ -126,6 +125,11 @@ The program works in one of six ways, chosen by the first option.
   it is busy, the next free one up to 6890 is used. `-L 0` turns this off:
   the program then only makes connections itself, which still works for
   downloading. See NOTES about firewalls.
+
+`-X`
+: Don't use the DHT. Normally the program also finds peers through the DHT,
+  a worldwide network of BitTorrent users that works without trackers (but
+  never for private torrents).
 
 `-N`
 : Don't ask the router to forward the port. Normally the program asks the
@@ -195,11 +199,10 @@ port by hand. Windows asks about the firewall the first time. Without any of
 this, downloading still works; you just meet fewer peers and can share with
 fewer people.
 
-**Finding peers.** Peers come from the torrent's trackers, from people who
-connect to you, and from the peers themselves, which tell each other about
-the other peers they know ("peer exchange"). Private torrents only use their
-trackers. The program does not yet use DHT, the tracker-less way of finding
-peers, so a magnet link without a tracker cannot be used yet.
+**Finding peers.** Peers come from the torrent's trackers, from the DHT,
+from people who connect to you, and from the peers themselves, which tell
+each other about the other peers they know ("peer exchange"). Private
+torrents only use their trackers.
 
 **Bad data.** Every piece is checked when it arrives. A peer that sends
 damaged data is disconnected and not used again, and the piece is fetched
@@ -211,6 +214,24 @@ size, so make sure there is room for the whole torrent.
 **Sharing fairly.** While downloading, the program shares with the peers
 that send to it the most, plus one other chosen at random every half
 minute, so that newcomers get a chance.
+
+## FILES
+
+The program keeps a little data between runs, in `~/.torrentinfo` on Linux
+and in `%APPDATA%\torrentinfo` on Windows (made when first needed):
+
+`dht.dat`
+: The DHT nodes it knew last time, so the next start finds peers sooner.
+
+`torrents/`
+: The torrent files fetched for magnet links, named after each link's info
+  hash. Deleting them is harmless: they are fetched again when needed.
+
+## ENVIRONMENT
+
+`TORRENTINFO_DHT_BOOTSTRAP`
+: DHT nodes to start from, as `host:port` separated by commas, instead of
+  the usual public ones. Rarely needed.
 
 ## EXAMPLES
 

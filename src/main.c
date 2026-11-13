@@ -26,6 +26,7 @@
 #include <time.h>
 
 #include "announce.h"
+#include "dht.h"
 #include "download.h"
 #include "magnet.h"
 #include "metadata.h"
@@ -1097,6 +1098,96 @@ static uint32_t handshakePeers(uv_loop_t *loop, peerAttempt *attempts, uint32_t 
 }
 
 /* ------------------------------------------------------------------------ */
+/* DHT: the routing table is kept in the data directory between runs       */
+/* ------------------------------------------------------------------------ */
+
+static uint8_t useDht = 1;                  /* -X turns it off */
+
+static int dataFilePath(const char *subdirectory, const char *name, char *path, size_t size)
+{
+    size_t length;
+
+    if (platformDataDirectory(subdirectory, path, size) != 0) {
+        return -1;
+    }
+    length = strlen(path);
+    return (snprintf(path + length, size - length, "%c%s", PLATFORM_SEPARATOR, name) <
+            (int)(size - length)) ? 0 : -1;
+}
+
+static int saveFile(const char *path, const uint8_t *data, uint64_t length);
+
+/* Start a DHT node, loading the table saved last time. NULL if it cannot. */
+static dht *startDht(uv_loop_t *loop, parserContext *context, const parserAllocator *allocator,
+                     uint16_t port, const netBinding *binding)
+{
+    dhtOptions options;
+    dht       *node = NULL;
+    char       path[1024];
+    uint8_t   *state = NULL;
+    uint64_t   length = 0;
+    uint64_t   size;
+    uint8_t    isRegular;
+
+    static char        list[512];
+    static const char *bootstrap[9];
+    const char        *environment = getenv("TORRENTINFO_DHT_BOOTSTRAP");
+
+    memset(&options, 0, sizeof(options));
+    options.port = port;
+    options.binding = binding;
+    /* TORRENTINFO_DHT_BOOTSTRAP="host:port,host:port": routers to use instead
+     * of the well-known ones (a private DHT, or a network that blocks them). */
+    if (environment != NULL && environment[0] != '\0' && strlen(environment) < sizeof(list)) {
+        char    *item;
+        uint32_t count = 0;
+
+        snprintf(list, sizeof(list), "%s", environment);
+        for (item = strtok(list, ","); item != NULL && count < 8u; item = strtok(NULL, ",")) {
+            bootstrap[count++] = item;
+        }
+        bootstrap[count] = NULL;
+        options.bootstrap = bootstrap;
+    }
+    if (dataFilePath(NULL, "dht.dat", path, sizeof(path)) == 0 &&
+        platformFileStat(path, &size, &isRegular) == 0 && isRegular && size <= DHT_MAX_STATE &&
+        readFile(allocator, path, &state, &length) == 0) {
+        options.state = state;
+        options.stateLength = (size_t)length;
+    }
+    if (dhtBegin(loop, context, &options, &node) != DHT_OK) {
+        node = NULL;
+    }
+    if (state != NULL) {
+        allocator->free(state);
+    }
+    return node;
+}
+
+/* Save the table for next time, then close the node. */
+static void stopDht(dht *node)
+{
+    uint8_t state[DHT_MAX_STATE];
+    size_t  length;
+    char    path[1024];
+
+    if (node == NULL) {
+        return;
+    }
+    if (dhtSaveState(node, state, sizeof(state), &length) == DHT_OK &&
+        dataFilePath(NULL, "dht.dat", path, sizeof(path)) == 0) {
+        (void)saveFile(path, state, length);
+    }
+    dhtEnd(node);
+}
+
+static void sockaddrFromDht(const struct sockaddr_in *peer, struct sockaddr_storage *address)
+{
+    memset(address, 0, sizeof(*address));
+    memcpy(address, peer, sizeof(*peer));
+}
+
+/* ------------------------------------------------------------------------ */
 /* Download mode: ./torrentinfo -D [-S] [-L port] [-O dir] [-i piece] ...   */
 /*                                                                          */
 /* The download module does the work: it opens the files (hashing existing  */
@@ -1110,6 +1201,8 @@ typedef struct downloadRun {
     download       *transfer;
     announce       *trackers;           /* NULL if the torrent lists none   */
     portmap        *mapper;             /* router port forwarding, or NULL  */
+    dht            *dhtNode;            /* or NULL                          */
+    dhtTorrent     *dhtEntry;
     uv_timer_t      timer;              /* progress line                    */
     uv_signal_t     interrupt;          /* Ctrl-C                           */
 #ifndef _WIN32
@@ -1236,6 +1329,31 @@ static void onAnnounceResult(void *privateArg, const char *url, uint32_t event, 
     fflush(stdout);
 }
 
+/* --- DHT ---------------------------------------------------------------- */
+
+static void onDhtPeers(void *privateArg, const struct sockaddr_in *peers, uint32_t count)
+{
+    downloadRun            *run = privateArg;
+    struct sockaddr_storage address;
+    uint32_t                i;
+
+    for (i = 0; i < count && run->transfer != NULL; i++) {
+        sockaddrFromDht(&peers[i], &address);
+        downloadAddPeer(run->transfer, (const struct sockaddr *)&address);
+    }
+}
+
+static void onDhtDone(void *privateArg, uint32_t peers, uint32_t nodes)
+{
+    downloadRun *run = privateArg;
+    dhtStatus    status;
+
+    dhtGetStatus(run->dhtNode, &status);
+    printf("  DHT: %" PRIu32 " peer%s found (asked %" PRIu32 " nodes; %" PRIu32
+           " in the routing table)\n", peers, (peers == 1u) ? "" : "s", nodes, status.nodes);
+    fflush(stdout);
+}
+
 /* --- Router port forwarding -------------------------------------------- */
 
 static void onPortmap(void *privateArg, portmap *mapper, const portmapResult *result)
@@ -1260,6 +1378,11 @@ static void onPortmap(void *privateArg, portmap *mapper, const portmapResult *re
 
 static void closeRun(downloadRun *run)
 {
+    if (run->dhtNode != NULL) {
+        stopDht(run->dhtNode);                      /* saves the routing table */
+        run->dhtNode = NULL;
+        run->dhtEntry = NULL;
+    }
     if (run->mapper != NULL) {
         portmapEnd(run->mapper);                    /* removes the forwarding */
         run->mapper = NULL;
@@ -1535,6 +1658,17 @@ static int downloadTorrent(uv_loop_t *loop, parserContext *context, const parser
         } else {
             printf("Listening:  could not open ports %u-%u; outgoing connections only\n",
                    (unsigned)listenPort, (unsigned)(listenPort + DOWNLOAD_LISTEN_ATTEMPTS - 1u));
+        }
+    }
+    if (useDht && !torrent->isPrivate) {
+        run.dhtNode = startDht(loop, context, &context->allocator,
+                               (downloadListenPort(run.transfer) != 0)
+                                   ? downloadListenPort(run.transfer) : trackerSettings.port,
+                               config->binding);
+        if (run.dhtNode == NULL ||
+            dhtAddTorrent(run.dhtNode, torrent->infoHash, downloadListenPort(run.transfer),
+                          onDhtPeers, onDhtDone, &run, &run.dhtEntry) != DHT_OK) {
+            printf("DHT:        could not start; trackers only\n");
         }
     }
     status = trackerInit(loop, context, &trackerSettings);
@@ -1853,6 +1987,8 @@ typedef struct fetchRun {
     uv_loop_t              *loop;
     metadataFetch          *fetch;
     announce               *trackers;
+    dht                    *dhtNode;
+    dhtTorrent             *dhtEntry;
     uv_timer_t              timer;
     uv_signal_t             interrupt;
 #ifndef _WIN32
@@ -1890,6 +2026,10 @@ static void stopFetch(fetchRun *run)
         metadataEnd(run->fetch);
         run->fetch = NULL;
     }
+    if (run->dhtNode != NULL) {
+        stopDht(run->dhtNode);
+        run->dhtNode = NULL;
+    }
     uv_timer_stop(&run->timer);
     uv_signal_stop(&run->interrupt);
 #ifndef _WIN32
@@ -1916,6 +2056,30 @@ static void onFetchPeers(void *privateArg, const trackerPeer *peers, uint32_t co
         metadataAddPeer(run->fetch, (const struct sockaddr *)&address);
         rememberPeer(run, (const struct sockaddr *)&address);
     }
+}
+
+static void onFetchDhtPeers(void *privateArg, const struct sockaddr_in *peers, uint32_t count)
+{
+    fetchRun               *run = privateArg;
+    struct sockaddr_storage address;
+    uint32_t                i;
+
+    for (i = 0; i < count && run->fetch != NULL; i++) {
+        sockaddrFromDht(&peers[i], &address);
+        metadataAddPeer(run->fetch, (const struct sockaddr *)&address);
+        rememberPeer(run, (const struct sockaddr *)&address);
+    }
+}
+
+static void onFetchDhtDone(void *privateArg, uint32_t peers, uint32_t nodes)
+{
+    fetchRun *run = privateArg;
+    dhtStatus status;
+
+    dhtGetStatus(run->dhtNode, &status);
+    printf("  DHT: %" PRIu32 " peer%s found (asked %" PRIu32 " nodes; %" PRIu32
+           " in the routing table)\n", peers, (peers == 1u) ? "" : "s", nodes, status.nodes);
+    fflush(stdout);
 }
 
 static void onFetchEvent(void *privateArg, metadataFetch *fetch, const char *message)
@@ -1948,6 +2112,12 @@ static void onFetchTick(uv_timer_t *timer)
     metadataGetProgress(run->fetch, &progress);
     printf("  fetching the metadata: %" PRIu32 " peer(s) connected, %" PRIu32 " offering it",
            progress.peersConnected, progress.peersWithMetadata);
+    if (run->dhtNode != NULL) {
+        dhtStatus status;
+
+        dhtGetStatus(run->dhtNode, &status);
+        printf(", %" PRIu32 " DHT nodes", status.nodes);
+    }
     if (progress.pieces > 0) {
         printf(", %" PRIu32 " of %" PRIu32 " pieces", progress.piecesDone, progress.pieces);
     }
@@ -1995,25 +2165,18 @@ static int parsePeerAddress(const char *text, struct sockaddr_storage *address)
            uv_ip6_addr(host, (int)port, (struct sockaddr_in6 *)address) == 0;
 }
 
-/* Where a magnet link's torrent is kept: <directory>/<info hash>.torrent */
-static void magnetCachePath(const char *directory, const uint8_t infoHash[PARSER_SHA1_LENGTH],
-                            char *out, size_t size)
+/* Where a magnet link's torrent is kept: in the data directory,
+ * torrents/<info hash>.torrent (created if needed). */
+static int magnetCachePath(const uint8_t infoHash[PARSER_SHA1_LENGTH], char *out, size_t size)
 {
-    char     hex[PARSER_SHA1_LENGTH * 2u + 1u];
+    char     name[PARSER_SHA1_LENGTH * 2u + 16u];
     uint32_t i;
 
     for (i = 0; i < PARSER_SHA1_LENGTH; i++) {
-        snprintf(hex + 2u * i, 3, "%02x", infoHash[i]);
+        snprintf(name + 2u * i, 3, "%02x", infoHash[i]);
     }
-    if (directory == NULL || directory[0] == '\0') {
-        snprintf(out, size, "%s.torrent", hex);
-    } else {
-        size_t length = strlen(directory);
-        int    slash = directory[length - 1u] == '/' || directory[length - 1u] == '\\';
-
-        snprintf(out, size, "%s%s%s.torrent", directory, slash ? "" : (PLATFORM_SEPARATOR == '/' ? "/" : "\\"),
-                 hex);
-    }
+    snprintf(name + 2u * PARSER_SHA1_LENGTH, 16, ".torrent");
+    return dataFilePath("torrents", name, out, size);
 }
 
 static int saveFile(const char *path, const uint8_t *data, uint64_t length)
@@ -2055,8 +2218,11 @@ static int magnetTorrent(parserContext *context, const parserAllocator *allocato
     int                     result = -1;
 
     *runOut = NULL;
-    magnetCachePath(directory, link->infoHash, path, sizeof(path));
-    if (platformFileStat(path, &size, &isRegular) == 0 && isRegular &&
+    (void)directory;                                /* the cache lives in the data directory */
+    if (magnetCachePath(link->infoHash, path, sizeof(path)) != 0) {
+        path[0] = '\0';                             /* no data directory: no cache */
+    }
+    if (path[0] != '\0' && platformFileStat(path, &size, &isRegular) == 0 && isRegular &&
         readFile(allocator, path, buffer, length) == 0) {
         if (parserParse(context, *buffer, *length, &cached) == PARSER_OK) {
             int same = memcmp(cached.infoHash, link->infoHash, PARSER_SHA1_LENGTH) == 0;
@@ -2070,9 +2236,9 @@ static int magnetTorrent(parserContext *context, const parserAllocator *allocato
         allocator->free(*buffer);
         *buffer = NULL;
     }
-    if (link->trackerCount == 0 && link->peerCount == 0) {
-        printf("The magnet link names no trackers or peers, and without DHT there is no other\n"
-               "way to find peers yet.\n");
+    if (link->trackerCount == 0 && link->peerCount == 0 && !useDht) {
+        printf("The magnet link names no trackers or peers, and DHT is off (-X): there is\n"
+               "no way to find peers.\n");
         return -1;
     }
 
@@ -2108,6 +2274,14 @@ static int magnetTorrent(parserContext *context, const parserAllocator *allocato
                 rememberPeer(run, (const struct sockaddr *)&address);
             }
         }
+        if (useDht) {
+            run->dhtNode = startDht(&loop, context, allocator, settings.port, config->binding);
+            if (run->dhtNode == NULL ||
+                dhtAddTorrent(run->dhtNode, link->infoHash, 0, onFetchDhtPeers, onFetchDhtDone,
+                              run, &run->dhtEntry) != DHT_OK) {
+                printf("DHT: could not start\n");
+            }
+        }
         if (link->trackerCount > 0 && trackerInit(&loop, context, &settings) == TRACKER_OK) {
             announceBeginUrls(&loop, context, link->infoHash, link->trackers, link->trackerCount,
                               &announceCallbacks, run, &run->trackers);
@@ -2136,10 +2310,7 @@ static int magnetTorrent(parserContext *context, const parserAllocator *allocato
         magnetBuildTorrent(context, link, run->info, run->infoLength, buffer, length) ==
             MAGNET_OK) {
         printf("Got the metadata (%" PRIu32 " bytes).\n", run->infoLength);
-        if (directory != NULL && directory[0] != '\0') {
-            (void)platformMakeDirectory(directory);
-        }
-        if (saveFile(path, *buffer, *length) == 0) {
+        if (path[0] != '\0' && saveFile(path, *buffer, *length) == 0) {
             printf("Saved the torrent as %s\n", path);
         }
         result = 0;
@@ -2479,7 +2650,7 @@ static void usage(const char *program)
             "       %s -o <output.torrent> [options] <file>...\n"
             "       %s -t [-T seconds] [-C ca.pem] [-I interface] <file.torrent>\n"
             "       %s -P [-T seconds] [-C ca.pem] [-I interface] <file.torrent>\n"
-            "       %s -D [-S] [-L port] [-N] [-O dir] [-i piece] [-T seconds] [-C ca.pem]\n"
+            "       %s -D [-S] [-L port] [-N] [-X] [-O dir] [-i piece] [-T seconds] [-C ca.pem]\n"
             "            [-I interface] <file.torrent | magnet-link>\n"
             "       %s -V [-O dir] <file.torrent>\n"
             "\n"
@@ -2503,6 +2674,8 @@ static void usage(const char *program)
             "            free one of the 9 after it (default 6881; 0: do not listen)\n"
             "  -N        with -D: do not ask the router to forward the port (UPnP and\n"
             "            NAT-PMP are tried by default)\n"
+            "  -X        with -D: do not use the DHT (by default it finds peers too,\n"
+            "            except for private torrents)\n"
             "  -V        verify downloaded data against the torrent (no network, changes\n"
             "            nothing): each file's state, bytes verified, missing pieces;\n"
             "            exit status 0 if complete, 2 if not, 1 on error\n"
@@ -2582,7 +2755,7 @@ int main(int argc, char **argv)
     options.trackers = (const char *const *)trackers;
     options.webSeeds = (const char *const *)webSeeds;
 
-    while ((option = nextOption(argc, argv, "o:a:w:c:n:l:ptPDVSNL:O:i:T:C:I:h")) != -1) {
+    while ((option = nextOption(argc, argv, "o:a:w:c:n:l:ptPDVSNXL:O:i:T:C:I:h")) != -1) {
         switch (option) {
         case 'o':
             outputPath = optionValue;
@@ -2632,6 +2805,10 @@ int main(int argc, char **argv)
             break;
         case 'N':
             mapPort = 0;
+            downloadOnly = 1;
+            break;
+        case 'X':
+            useDht = 0;
             downloadOnly = 1;
             break;
         case 'L': {

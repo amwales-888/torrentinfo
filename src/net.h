@@ -98,6 +98,9 @@ int netUdpBind(uv_udp_t *udp, const netBinding *binding, int family);
  */
 int netTcpListenBind(uv_tcp_t *tcp, const netBinding *binding, int family, uint16_t port);
 
+/* As netTcpListenBind(), for a UDP socket that receives on 'port' (DHT). */
+int netUdpBindPort(uv_udp_t *udp, const netBinding *binding, int family, uint16_t port);
+
 const char *netStatusString(int32_t status);
 
 #ifdef __cplusplus

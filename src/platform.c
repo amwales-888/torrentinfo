@@ -10,6 +10,7 @@
 #define _FILE_OFFSET_BITS 64        /* 64-bit off_t on 32-bit Linux too */
 #endif
 
+#include <stdio.h>
 #include <string.h>
 
 #include <uv.h>     /* uv_translate_sys_error(); on Windows also <windows.h> */
@@ -406,3 +407,45 @@ int32_t platformFileWriteAt(platformFile *file, uint64_t offset, const void *buf
 }
 
 #endif
+
+/* ------------------------------------------------------------------------ */
+/* Both platforms                                                           */
+/* ------------------------------------------------------------------------ */
+
+int32_t platformDataDirectory(const char *subdirectory, char *path, size_t size)
+{
+    char    base[PLATFORM_MAX_PATH];
+    size_t  length = sizeof(base);
+    int     written;
+    int32_t result;
+
+    if (path == NULL || size == 0) {
+        return UV_EINVAL;
+    }
+#ifdef _WIN32
+    result = uv_os_getenv("APPDATA", base, &length);    /* UTF-8 */
+    if (result != 0) {
+        return result;
+    }
+    written = snprintf(path, size, "%s\\torrentinfo", base);
+#else
+    result = uv_os_homedir(base, &length);
+    if (result != 0) {
+        return result;
+    }
+    written = snprintf(path, size, "%s/.torrentinfo", base);
+#endif
+    if (written < 0 || (size_t)written >= size) {
+        return UV_ENAMETOOLONG;
+    }
+    result = platformMakeDirectory(path);
+    if (result != 0 || subdirectory == NULL || subdirectory[0] == '\0') {
+        return result;
+    }
+    length = strlen(path);
+    written = snprintf(path + length, size - length, "%c%s", PLATFORM_SEPARATOR, subdirectory);
+    if (written < 0 || (size_t)written >= size - length) {
+        return UV_ENAMETOOLONG;
+    }
+    return platformMakeDirectory(path);
+}

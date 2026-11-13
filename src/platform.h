@@ -69,6 +69,14 @@ int32_t platformFileClose(platformFile *file);
 /* Create a directory. Succeeds (0) if it already exists as a directory. */
 int32_t platformMakeDirectory(const char *path);
 
+/*
+ * The directory for the program's own lasting data, created if missing:
+ * ~/.torrentinfo on Linux, %APPDATA%\\torrentinfo on Windows; with a
+ * 'subdirectory' (or NULL), that directory inside it, created too. The
+ * UTF-8 path goes to 'path'. Returns 0 or a libuv error code.
+ */
+int32_t platformDataDirectory(const char *subdirectory, char *path, size_t size);
+
 /* Open a file for reading and writing, creating it if needed; never truncates. */
 int32_t platformFileOpenReadWrite(const char *path, platformFile *file);
 

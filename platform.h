@@ -28,6 +28,13 @@ extern "C" {
 /* Longest path accepted on Windows, in UTF-16 units (the NTFS limit). */
 #define PLATFORM_MAX_PATH       32768u
 
+/* The preferred path separator. */
+#ifdef _WIN32
+#define PLATFORM_SEPARATOR      '\\'
+#else
+#define PLATFORM_SEPARATOR      '/'
+#endif
+
 /* An open file. Treat as opaque. */
 typedef struct platformFile {
 #ifdef _WIN32
@@ -58,6 +65,21 @@ int32_t platformFileWrite(platformFile *file, const void *buffer, uint32_t lengt
 
 /* Close a file. Returns an error if pending writes failed. */
 int32_t platformFileClose(platformFile *file);
+
+/* Create a directory. Succeeds (0) if it already exists as a directory. */
+int32_t platformMakeDirectory(const char *path);
+
+/* Open a file for reading and writing, creating it if needed; never truncates. */
+int32_t platformFileOpenReadWrite(const char *path, platformFile *file);
+
+/* Extend or truncate an open file to 'size' bytes. */
+int32_t platformFileSetSize(platformFile *file, uint64_t size);
+
+/* Read or write at a byte offset, independent of any file position. */
+int32_t platformFileReadAt(platformFile *file, uint64_t offset, void *buffer, uint32_t length,
+                           uint32_t *count);
+int32_t platformFileWriteAt(platformFile *file, uint64_t offset, const void *buffer,
+                            uint32_t length, uint32_t *count);
 
 #ifdef __cplusplus
 }

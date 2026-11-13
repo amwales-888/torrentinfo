@@ -7,7 +7,10 @@
  */
 #ifndef _WIN32
 #define _POSIX_C_SOURCE 200809L
+#define _FILE_OFFSET_BITS 64        /* 64-bit off_t on 32-bit Linux too */
 #endif
+
+#include <string.h>
 
 #include <uv.h>     /* uv_translate_sys_error(); on Windows also <windows.h> */
 
@@ -140,6 +143,89 @@ int32_t platformFileClose(platformFile *file)
     return result;
 }
 
+int32_t platformMakeDirectory(const char *path)
+{
+    wchar_t wide[PLATFORM_MAX_PATH];
+    DWORD   attributes;
+    int32_t result = widen(path, wide);
+
+    if (result != 0) {
+        return result;
+    }
+    if (CreateDirectoryW(wide, NULL)) {
+        return 0;
+    }
+    if (GetLastError() == ERROR_ALREADY_EXISTS) {
+        attributes = GetFileAttributesW(wide);
+        if (attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_DIRECTORY)) {
+            return 0;
+        }
+        return UV_ENOTDIR;                          /* a file is in the way */
+    }
+    return lastError();
+}
+
+int32_t platformFileOpenReadWrite(const char *path, platformFile *file)
+{
+    return openWith(path, GENERIC_READ | GENERIC_WRITE,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                    OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, file);
+}
+
+int32_t platformFileSetSize(platformFile *file, uint64_t size)
+{
+    LARGE_INTEGER position;
+
+    position.QuadPart = (LONGLONG)size;
+    if (!SetFilePointerEx((HANDLE)file->handle, position, NULL, FILE_BEGIN) ||
+        !SetEndOfFile((HANDLE)file->handle)) {
+        return lastError();
+    }
+    return 0;
+}
+
+/* An OVERLAPPED with an offset makes ReadFile/WriteFile positional, even on
+ * a handle opened for synchronous I/O. */
+static void atOffset(OVERLAPPED *overlapped, uint64_t offset)
+{
+    memset(overlapped, 0, sizeof(*overlapped));
+    overlapped->Offset = (DWORD)(offset & 0xFFFFFFFFu);
+    overlapped->OffsetHigh = (DWORD)(offset >> 32);
+}
+
+int32_t platformFileReadAt(platformFile *file, uint64_t offset, void *buffer, uint32_t length,
+                           uint32_t *count)
+{
+    OVERLAPPED overlapped;
+    DWORD      got = 0;
+
+    *count = 0;
+    atOffset(&overlapped, offset);
+    if (!ReadFile((HANDLE)file->handle, buffer, (DWORD)length, &got, &overlapped)) {
+        if (GetLastError() == ERROR_HANDLE_EOF) {
+            return 0;                               /* reading past the end: 0 bytes */
+        }
+        return lastError();
+    }
+    *count = (uint32_t)got;
+    return 0;
+}
+
+int32_t platformFileWriteAt(platformFile *file, uint64_t offset, const void *buffer,
+                            uint32_t length, uint32_t *count)
+{
+    OVERLAPPED overlapped;
+    DWORD      written = 0;
+
+    *count = 0;
+    atOffset(&overlapped, offset);
+    if (!WriteFile((HANDLE)file->handle, buffer, (DWORD)length, &written, &overlapped)) {
+        return lastError();
+    }
+    *count = (uint32_t)written;
+    return 0;
+}
+
 #else
 /* ======================================================================== */
 /* Linux (POSIX)                                                            */
@@ -246,6 +332,77 @@ int32_t platformFileClose(platformFile *file)
     }
     file->descriptor = -1;
     return result;
+}
+
+int32_t platformMakeDirectory(const char *path)
+{
+    struct stat information;
+
+    if (path == NULL || path[0] == '\0') {
+        return UV_EINVAL;
+    }
+    if (mkdir(path, 0755) == 0) {
+        return 0;
+    }
+    if (errno == EEXIST) {
+        if (stat(path, &information) == 0 && S_ISDIR(information.st_mode)) {
+            return 0;
+        }
+        return UV_ENOTDIR;                          /* a file is in the way */
+    }
+    return lastError();
+}
+
+int32_t platformFileOpenReadWrite(const char *path, platformFile *file)
+{
+    file->descriptor = -1;
+    if (path == NULL || path[0] == '\0') {
+        return UV_EINVAL;
+    }
+    file->descriptor = open(path, O_RDWR | O_CREAT | O_CLOEXEC, 0644);
+    return (file->descriptor < 0) ? lastError() : 0;
+}
+
+int32_t platformFileSetSize(platformFile *file, uint64_t size)
+{
+    int result;
+
+    do {
+        result = ftruncate(file->descriptor, (off_t)size);
+    } while (result != 0 && errno == EINTR);
+    return (result != 0) ? lastError() : 0;
+}
+
+int32_t platformFileReadAt(platformFile *file, uint64_t offset, void *buffer, uint32_t length,
+                           uint32_t *count)
+{
+    ssize_t got;
+
+    *count = 0;
+    do {
+        got = pread(file->descriptor, buffer, (size_t)length, (off_t)offset);
+    } while (got < 0 && errno == EINTR);
+    if (got < 0) {
+        return lastError();
+    }
+    *count = (uint32_t)got;
+    return 0;
+}
+
+int32_t platformFileWriteAt(platformFile *file, uint64_t offset, const void *buffer,
+                            uint32_t length, uint32_t *count)
+{
+    ssize_t written;
+
+    *count = 0;
+    do {
+        written = pwrite(file->descriptor, buffer, (size_t)length, (off_t)offset);
+    } while (written < 0 && errno == EINTR);
+    if (written < 0) {
+        return lastError();
+    }
+    *count = (uint32_t)written;
+    return 0;
 }
 
 #endif

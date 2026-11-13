@@ -12,6 +12,7 @@
  *   pieceCancelRequests() "requested" blocks back to "missing" (e.g. when
  *                         the peer chokes us, which discards our requests)
  *   pieceVerify()         SHA-1 of the data against the torrent's hash
+ *   pieceTakeData()       hand the data to the caller (e.g. for storage)
  *   pieceEnd()            release the memory
  *
  * No I/O: the caller sends the requests and passes in the replies.
@@ -98,6 +99,13 @@ void pieceReset(pieceAssembly *piece);
 
 /* PIECE_OK if the complete data matches the torrent's hash, else PIECE_EHASH. */
 int32_t pieceVerify(const pieceAssembly *piece);
+
+/*
+ * Take the piece's data buffer: the caller becomes its owner (free it with
+ * the context's allocator, or pass it to storageWritePiece()). Afterwards
+ * the piece has no data; call pieceEnd() to release the rest.
+ */
+uint8_t *pieceTakeData(pieceAssembly *piece);
 
 /* Release the piece's memory. Safe to call more than once. */
 void pieceEnd(pieceAssembly *piece);

@@ -160,6 +160,18 @@ int32_t pieceVerify(const pieceAssembly *piece)
                                                                           : PIECE_EHASH;
 }
 
+uint8_t *pieceTakeData(pieceAssembly *piece)
+{
+    uint8_t *data;
+
+    if (piece == NULL) {
+        return NULL;
+    }
+    data = piece->data;
+    piece->data = NULL;
+    return data;
+}
+
 void pieceEnd(pieceAssembly *piece)
 {
     if (piece == NULL || piece->context == NULL) {

@@ -62,8 +62,8 @@ cd build\x64\Release
 .\torrentinfo.exe -t file.torrent
 .\torrentinfo.exe -P file.torrent      # announce, then contact the peers: handshake,
                                         # pieces each one has, and whether it unchokes us
-.\torrentinfo.exe -D file.torrent      # download one piece into memory and verify it
-.\torrentinfo.exe -D -i 42 file.torrent   # ... a specific piece
+.\torrentinfo.exe -D -O C:\Downloads file.torrent   # download the torrent (re-run to resume)
+.\torrentinfo.exe -D -i 42 file.torrent              # ... only piece 42
 ```
 
 To pass arguments when debugging in Visual Studio, use the `torrentinfo`
@@ -78,6 +78,9 @@ project's *Properties > Debugging > Command Arguments*.
 - **Unicode file names** work: the library converts UTF-8 paths to UTF-16 for
   the Win32 file functions, and `torrentinfo.manifest` makes the program's
   command-line arguments UTF-8 (Windows 10 version 1903 or later).
+- **File names Windows cannot use** are adjusted when a torrent is saved:
+  `< > : " | ? *` and control characters become `_`, a trailing `.` or space
+  becomes `_`, and reserved names such as `CON` or `LPT1` get a `_` prefix.
 - **Using the library in your own project:** add `libtorrentinfo.vcxproj` as
   a project reference, enable vcpkg manifest mode, define
   `WIN32_LEAN_AND_MEAN`, and link the Windows libraries listed in

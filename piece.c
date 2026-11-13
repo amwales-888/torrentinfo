@@ -138,6 +138,21 @@ void pieceCancelRequests(pieceAssembly *piece)
     piece->requestedCount = 0;
 }
 
+void pieceCancelBlock(pieceAssembly *piece, uint32_t begin)
+{
+    uint32_t block;
+
+    if (piece == NULL || piece->blocks == NULL || begin % PIECE_BLOCK_LENGTH != 0 ||
+        begin >= piece->length) {
+        return;
+    }
+    block = begin / PIECE_BLOCK_LENGTH;
+    if (piece->blocks[block] == PIECE_BLOCK_REQUESTED) {
+        piece->blocks[block] = PIECE_BLOCK_MISSING;
+        piece->requestedCount--;
+    }
+}
+
 void pieceReset(pieceAssembly *piece)
 {
     if (piece == NULL || piece->blocks == NULL) {

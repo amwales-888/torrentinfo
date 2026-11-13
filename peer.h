@@ -25,6 +25,10 @@
  * Memory comes from the allocator in the parserContext given to peerInit().
  * All functions must be called from the thread that runs the libuv loop.
  *
+ * On Linux and other POSIX systems the program should ignore SIGPIPE
+ * (signal(SIGPIPE, SIG_IGN)): writing to a connection the peer has just
+ * closed raises it, and by default it ends the process.
+ *
  * Usage:
  *     peerConnectOptions options = { 0 };
  *     memcpy(options.infoHash, torrent.infoHash, 20);

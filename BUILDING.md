@@ -16,6 +16,9 @@ make debug           # AddressSanitizer + UBSan build in build/debug
 make install PREFIX=$HOME/.local
 ```
 
+Usage is the same as on Windows (below), for example
+`./torrentinfo -D -O ~/Downloads file.torrent`.
+
 ## Windows (Visual Studio 2026)
 
 The solution uses platform toolset **v145** (Visual Studio 2026) and gets
@@ -62,7 +65,7 @@ cd build\x64\Release
 .\torrentinfo.exe -t file.torrent
 .\torrentinfo.exe -P file.torrent      # announce, then contact the peers: handshake,
                                         # pieces each one has, and whether it unchokes us
-.\torrentinfo.exe -D -O C:\Downloads file.torrent   # download the torrent (re-run to resume)
+.\torrentinfo.exe -D -O C:\Downloads file.torrent   # download from all peers (re-run to resume)
 .\torrentinfo.exe -D -i 42 file.torrent              # ... only piece 42
 ```
 
@@ -70,6 +73,16 @@ To pass arguments when debugging in Visual Studio, use the `torrentinfo`
 project's *Properties > Debugging > Command Arguments*.
 
 ### Notes
+
+- **Downloading (`-D`)** uses every peer the trackers return, up to 50
+  connections at once. Pieces are chosen rarest-first; each peer keeps 16
+  block requests in flight; a peer that sends a corrupt piece, stalls for
+  30 seconds or sends blocks it was not asked for is dropped, and one that
+  disconnects is retried after 30 seconds (three connections at most). Near
+  the end, slow blocks are also requested from a second peer ("endgame").
+  The download stops if no data arrives for 2 minutes. Progress is printed
+  every 2 seconds. DHT and peer exchange are not implemented yet, so the
+  trackers are the only source of peers.
 
 - **Trusted certificates for HTTPS trackers** come from the Windows
   certificate store (the "Trusted Root Certification Authorities"), loaded

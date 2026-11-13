@@ -94,6 +94,9 @@ int32_t pieceReceive(pieceAssembly *piece, const messageFrame *message);
 /* Mark every requested-but-not-received block as missing again. */
 void pieceCancelRequests(pieceAssembly *piece);
 
+/* Mark one requested block (by byte offset) as missing again. */
+void pieceCancelBlock(pieceAssembly *piece, uint32_t begin);
+
 /* Mark every block missing (e.g. after a failed verification). */
 void pieceReset(pieceAssembly *piece);
 

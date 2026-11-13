@@ -44,6 +44,9 @@
     <ClCompile Include="storage.c">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="download.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="queue.h">
@@ -77,6 +80,9 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="storage.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="download.h">
       <Filter>Header Files</Filter>
     </ClInclude>
   </ItemGroup>

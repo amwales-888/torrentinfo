@@ -24,6 +24,7 @@
 #include <string.h>
 #include <time.h>
 
+#include "download.h"
 #include "encoder.h"
 #include "parser.h"
 #include "peer.h"
@@ -34,6 +35,8 @@
 
 #ifdef _WIN32
 #include <shellapi.h>   /* CommandLineToArgvW(); not in WIN32_LEAN_AND_MEAN */
+#else
+#include <signal.h>     /* SIGPIPE */
 #endif
 
 static const uint64_t maxTorrentSize = 64u * 1024u * 1024u;
@@ -42,9 +45,6 @@ static const uint32_t peerPreviewCount = 10u;
 static const uint32_t defaultAnnounceTimeout = 15u;
 static int            announceTag;  /* privateArg for tracker requests */
 static const uint32_t maxPeerAttempts = 200u;
-static const uint32_t downloadPipeline = 16u;       /* requests in flight: 256 KiB  */
-static const uint32_t downloadStallSeconds = 15u;   /* no block for this long: drop */
-static const uint32_t downloadLimitSeconds = 120u;  /* no data for this long: stop  */
 
 /* What to do after announcing. */
 #define MODE_ANNOUNCE   0u
@@ -1093,66 +1093,22 @@ static uint32_t handshakePeers(uv_loop_t *loop, peerAttempt *attempts, uint32_t 
 /* ------------------------------------------------------------------------ */
 /* Download mode: ./torrentinfo -D [-O dir] [-i piece] file.torrent         */
 /*                                                                          */
-/* Open the files (hashing any existing data, so an interrupted download    */
-/* resumes), connect to the peers, then download the missing pieces one at  */
-/* a time from one peer at a time: 16 requests in flight, each piece        */
-/* verified and then written on the thread pool while the next downloads.   */
-/* A peer that stalls, keeps us choked, disconnects, sends a block we did   */
-/* not ask for or sends corrupt data is dropped and another is used; a peer */
-/* with nothing more that we need is set aside until it announces more.    */
+/* The download module does the work: it opens the files (hashing existing  */
+/* data, so an interrupted download resumes), connects to the peers the     */
+/* trackers returned and fetches pieces from all of them at once. This      */
+/* prints its events and a progress line every two seconds.                 */
 /* ------------------------------------------------------------------------ */
 
-#define PIECE_STATE_NEEDED      0u
-#define PIECE_STATE_ACTIVE      1u      /* being downloaded */
-#define PIECE_STATE_WRITING     2u      /* verified, on its way to disk */
-#define PIECE_STATE_DONE        3u      /* on disk, or not wanted (-i) */
-
-struct downloadRun;
-
-typedef struct downloadPeer {
-    struct downloadRun *run;
-    trackerPeer         peer;
-    peerConnection     *connection;
-    uint8_t             open;           /* handshake done, still connected */
-    uint8_t             excluded;       /* failed us: never use again      */
-    char                client[64];
-    char                where[80];
-} downloadPeer;
-
 typedef struct downloadRun {
-    uv_loop_t          *loop;
-    uv_timer_t          timer;          /* ticks every 500 ms              */
-    uint8_t             timerStarted;
-    parserContext      *context;
-    const parserAllocator *allocator;
-    const parserTorrent *torrent;
-    storage            *store;
-    const peerAttempt  *found;          /* peers from the trackers         */
-    uint32_t            foundCount;
-    uint8_t             peerId[PEER_ID_LENGTH];
-    uint32_t            timeoutSeconds;
-    downloadPeer       *peers;
-    uint32_t            count;
-    uint32_t            unresolved;     /* handshakes still in progress    */
-    int64_t             wanted;         /* -i piece, or -1 for all         */
-    uint8_t            *pieceState;     /* PIECE_STATE_* per piece         */
-    uint32_t            remaining;      /* pieces not yet on disk          */
-    uint32_t            wantedTotal;    /* pieces this run must fetch      */
-    downloadPeer       *active;         /* the peer we are downloading from */
-    pieceAssembly       piece;
-    uint8_t             pieceStarted;
-    uint32_t            outstanding;    /* requests sent, blocks not back   */
-    uint8_t             done;
-    int                 result;         /* 0 once everything is on disk     */
-    uint64_t            startedAt;      /* uv_hrtime()                      */
-    uint64_t            bytesReceived;  /* block data this run              */
-    uint64_t            lastProgress;   /* uv_now(): block, unchoke, start  */
-    uint64_t            lastReport;     /* uv_now() of the last progress line */
-    uint64_t            reportBytes;    /* bytesReceived at that line        */
+    download   *transfer;
+    uv_timer_t  timer;
+    uint8_t     timerStarted;
+    int         result;             /* 0 once everything is on disk     */
+    uint64_t    startedAt;          /* uv_hrtime() when the files were ready */
+    uint64_t    lastReport;         /* uv_now() of the last progress line */
+    uint64_t    reportBytes;        /* bytes received at that line       */
+    uint32_t    peerCount;
 } downloadRun;
-
-static void downloadFill(downloadRun *run);
-static void downloadStart(downloadRun *run);
 
 static void formatBytes(uint64_t bytes, char *out, size_t size)
 {
@@ -1167,452 +1123,114 @@ static void formatBytes(uint64_t bytes, char *out, size_t size)
     snprintf(out, size, (unit == 0) ? "%.0f %s" : "%.1f %s", value, units[unit]);
 }
 
-/* End the run: close every connection, the storage and the timer. */
-static void downloadFinish(downloadRun *run, int result)
+static void onProgressTick(uv_timer_t *timer)
 {
-    uint32_t i;
+    downloadRun     *run = timer->data;
+    downloadProgress progress;
+    uint64_t         now = uv_now(timer->loop);
+    uint64_t         elapsed = now - run->lastReport;
+    char             speed[32];
 
-    if (run->done) {
+    if (run->transfer == NULL || elapsed == 0) {
         return;
     }
-    run->done = 1;
-    run->result = result;
-    for (i = 0; i < run->count; i++) {
-        peerClose(run->peers[i].connection);
-        run->peers[i].connection = NULL;
-        run->peers[i].open = 0;
-    }
-    storageClose(run->store);                       /* writes in flight finish quietly */
-    run->store = NULL;
-    if (run->timerStarted) {
-        uv_timer_stop(&run->timer);
-    }
+    downloadGetProgress(run->transfer, &progress);
+    formatBytes((progress.bytesReceived - run->reportBytes) * 1000u / elapsed, speed, sizeof(speed));
+    printf("  %5.1f%%  %" PRIu32 "/%" PRIu32 " pieces  %9s/s  peers %" PRIu32 " connected,"
+           " %" PRIu32 " unchoking, %" PRIu32 " sending%s\n",
+           (progress.wanted > 0) ? 100.0 * progress.done / progress.wanted : 100.0,
+           progress.done, progress.wanted, speed, progress.peersConnected,
+           progress.peersUnchoking, progress.peersDownloading,
+           progress.endgame ? "  [endgame]" : "");
+    fflush(stdout);
+    run->lastReport = now;
+    run->reportBytes = progress.bytesReceived;
 }
 
-/* Give up the piece being assembled: its blocks are kept only if the next
- * peer can finish it (downloadStart decides). */
-static void downloadAbandonPiece(downloadRun *run)
+static void onDownloadReady(void *privateArg, download *transfer, int32_t status,
+                            const char *message)
 {
-    if (run->pieceStarted) {
-        run->pieceState[run->piece.index] = PIECE_STATE_NEEDED;
-        pieceEnd(&run->piece);
-        run->pieceStarted = 0;
-    }
-}
+    downloadRun     *run = privateArg;
+    downloadProgress progress;
 
-/* Stop using a peer; continue with another if one is available. */
-static void downloadDrop(downloadPeer *peer, const char *reason)
-{
-    downloadRun *run = peer->run;
-
-    printf("  dropped %s: %s\n", peer->where, reason);
-    if (run->active == peer) {
-        pieceCancelRequests(&run->piece);
-        run->outstanding = 0;
-        run->active = NULL;
+    if (status != DOWNLOAD_OK) {
+        return;                                     /* onDownloadFinished reports it */
     }
-    peer->excluded = 1;
-    peer->open = 0;
-    peerClose(peer->connection);
-    peer->connection = NULL;
-    downloadStart(run);
-}
-
-/* The lowest piece this peer has that we still need, or -1. Prefers the
- * piece already being assembled. */
-static int64_t downloadPickPiece(const downloadRun *run, const downloadPeer *peer)
-{
-    peerRemoteState state;
-    uint32_t        index;
-
-    if (!peer->open || peer->excluded || peer->connection == NULL ||
-        peerGetState(peer->connection, &state) != PEER_OK || state.peerChoking ||
-        state.haveCount == 0) {
-        return -1;
-    }
-    if (run->pieceStarted && messageBitfieldGet(state.have, run->piece.index)) {
-        return (int64_t)run->piece.index;
-    }
-    for (index = 0; index < state.pieceCount; index++) {
-        if (run->pieceState[index] == PIECE_STATE_NEEDED && messageBitfieldGet(state.have, index)) {
-            return (int64_t)index;
-        }
-    }
-    return -1;
-}
-
-/*
- * Make sure something is downloading: keep the active peer if it has a
- * piece we need, otherwise find another peer that does.
- */
-static void downloadStart(downloadRun *run)
-{
-    downloadPeer *peer = run->active;
-    int64_t       index = -1;
-    uint32_t      i;
-    int32_t       status;
-
-    if (run->done || run->store == NULL) {
-        return;
-    }
-    if (peer != NULL) {
-        if (run->pieceStarted) {
-            return;                                 /* still busy with a piece */
-        }
-        index = downloadPickPiece(run, peer);
-        if (index < 0) {
-            run->active = NULL;                     /* nothing more from it, for now */
-            peer = NULL;
-        }
-    }
-    for (i = 0; peer == NULL && i < run->count; i++) {
-        index = downloadPickPiece(run, &run->peers[i]);
-        if (index >= 0) {
-            peer = &run->peers[i];
-        }
-    }
-    if (peer == NULL) {
-        return;                                     /* wait for an unchoke or a have */
-    }
-
-    /* A half-finished piece the new peer cannot supply is dropped. */
-    if (run->pieceStarted && (uint32_t)index != run->piece.index) {
-        downloadAbandonPiece(run);
-    }
-    if (!run->pieceStarted) {
-        status = pieceBegin(&run->piece, run->context, run->torrent, (uint32_t)index);
-        if (status != PIECE_OK) {
-            printf("Could not start piece %" PRId64 ": %s\n", index,
-                   (status == PIECE_ENOMEM) ? "out of memory" : "invalid piece");
-            downloadFinish(run, -1);
-            return;
-        }
-        run->pieceStarted = 1;
-        run->pieceState[index] = PIECE_STATE_ACTIVE;
-    }
-    if (run->active != peer) {
-        printf("  downloading from %s (%s)\n", peer->where, peer->client);
-        fflush(stdout);
-        run->active = peer;
-    }
-    run->lastProgress = uv_now(run->loop);
-    downloadFill(run);
-}
-
-/* Keep 'downloadPipeline' requests in flight while the peer has us unchoked. */
-static void downloadFill(downloadRun *run)
-{
-    peerRemoteState state;
-    messageFrame    request;
-
-    if (run->active == NULL || !run->pieceStarted ||
-        peerGetState(run->active->connection, &state) != PEER_OK || state.peerChoking) {
-        return;
-    }
-    while (run->outstanding < downloadPipeline &&
-           pieceNextRequest(&run->piece, &request) == PIECE_OK) {
-        if (peerSend(run->active->connection, &request) != PEER_OK) {
-            downloadDrop(run->active, "could not send a request");
-            return;
-        }
-        run->outstanding++;
-    }
-}
-
-/* A piece is on disk: tell the peers, and finish when nothing is left. */
-static void onPieceWritten(void *privateArg, storage *store, uint32_t pieceIndex, int32_t status,
-                           const char *errorMessage)
-{
-    downloadRun *run = privateArg;
-    messageFrame have;
-    double       seconds;
-    char         size[32];
-    uint32_t     i;
-
-    (void)store;
-    if (status != STORAGE_OK) {
-        printf("\nCould not write piece %" PRIu32 ": %s\n", pieceIndex, errorMessage);
-        downloadFinish(run, -1);
-        return;
-    }
-    run->pieceState[pieceIndex] = PIECE_STATE_DONE;
-    run->remaining--;
-
-    memset(&have, 0, sizeof(have));
-    have.id = MESSAGE_HAVE;
-    have.index = pieceIndex;
-    for (i = 0; i < run->count; i++) {
-        if (run->peers[i].open) {
-            peerSend(run->peers[i].connection, &have);
-        }
-    }
-
-    if (run->remaining == 0) {
-        seconds = (double)(uv_hrtime() - run->startedAt) / 1e9;
-        formatBytes(run->bytesReceived, size, sizeof(size));
-        printf("\nDownload complete: %s\n  %" PRIu32 " piece(s), %s received in %.1f s (%.1f KiB/s)\n",
-               storageRoot(run->store), run->wantedTotal, size, seconds,
-               (seconds > 0.0) ? (double)run->bytesReceived / 1024.0 / seconds : 0.0);
-        downloadFinish(run, 0);
-    }
-}
-
-/* A block arrived from the active peer. */
-static void downloadBlock(downloadRun *run, downloadPeer *peer, const messageFrame *message)
-{
-    uint8_t *data;
-    int32_t  status = pieceReceive(&run->piece, message);
-
-    if (status == PIECE_EUNEXPECTED) {
-        downloadDrop(peer, "sent a block we did not ask for");
-        return;
-    }
-    if (status == PIECE_DUPLICATE || status < 0) {
-        return;
-    }
-    run->outstanding--;
-    run->bytesReceived += message->payloadLength;
-    run->lastProgress = uv_now(run->loop);
-    if (status != PIECE_COMPLETE) {
-        downloadFill(run);
-        return;
-    }
-
-    if (pieceVerify(&run->piece) != PIECE_OK) {
-        printf("  piece %" PRIu32 " failed verification (SHA-1 mismatch); discarding it\n",
-               run->piece.index);
-        downloadAbandonPiece(run);
-        downloadDrop(peer, "sent corrupt data");
-        return;
-    }
-
-    /* Hand the data to the storage and move straight on to the next piece. */
-    run->pieceState[run->piece.index] = PIECE_STATE_WRITING;
-    data = pieceTakeData(&run->piece);
-    status = storageWritePiece(run->store, run->piece.index, data, onPieceWritten, run);
-    pieceEnd(&run->piece);
-    run->pieceStarted = 0;
-    if (status != STORAGE_OK) {
-        printf("\nCould not queue piece %" PRIu32 " for writing: %s\n", run->piece.index,
-               storageStatusString(status));
-        downloadFinish(run, -1);
-        return;
-    }
-    downloadStart(run);
-}
-
-static void onDownloadHandshake(void *privateArg, peerConnection *connection,
-                                const peerHandshakeResult *result)
-{
-    downloadPeer *peer = privateArg;
-    downloadRun  *run = peer->run;
-    messageFrame  interested;
-
-    run->unresolved--;
-    if (result->status != PEER_OK) {
-        peerClose(connection);
-        peer->connection = NULL;
-        return;
-    }
-    peer->open = 1;
-    describeClient(result->peerId, peer->client, sizeof(peer->client));
-    memset(&interested, 0, sizeof(interested));
-    interested.id = MESSAGE_INTERESTED;
-    if (peerSend(connection, &interested) != PEER_OK) {
-        downloadDrop(peer, "could not send interested");
-    }
-}
-
-static void onDownloadMessage(void *privateArg, peerConnection *connection,
-                              const messageFrame *message)
-{
-    downloadPeer *peer = privateArg;
-    downloadRun  *run = peer->run;
-
-    (void)connection;
-    if (run->done) {
-        return;
-    }
-    if (peer != run->active) {
-        if (message->id == MESSAGE_UNCHOKE || message->id == MESSAGE_HAVE ||
-            message->id == MESSAGE_BITFIELD) {
-            downloadStart(run);                     /* this peer may now be usable */
-        }
-        return;
-    }
-    switch (message->id) {
-    case MESSAGE_PIECE:
-        downloadBlock(run, peer, message);
-        break;
-    case MESSAGE_CHOKE:                             /* the peer discards our requests */
-        printf("  choked by %s; waiting to be unchoked\n", peer->where);
-        pieceCancelRequests(&run->piece);
-        run->outstanding = 0;
-        run->lastProgress = uv_now(run->loop);
-        break;
-    case MESSAGE_UNCHOKE:
-        printf("  unchoked again\n");
-        run->lastProgress = uv_now(run->loop);
-        downloadFill(run);
-        break;
-    case MESSAGE_HAVE:
-        downloadStart(run);                         /* if idle, it may have a piece now */
-        break;
-    default:
-        break;
-    }
-}
-
-static void onDownloadClosed(void *privateArg, peerConnection *connection, int32_t status,
-                             const char *errorMessage)
-{
-    downloadPeer *peer = privateArg;
-
-    (void)connection;
-    (void)status;
-    if (peer == peer->run->active) {
-        downloadDrop(peer, errorMessage);
-    } else {
-        peer->open = 0;
-        peerClose(peer->connection);
-        peer->connection = NULL;
-    }
-}
-
-/* Every 500 ms: progress, inactivity, stalled or choking peers, running out of peers. */
-static void onDownloadTick(uv_timer_t *timer)
-{
-    downloadRun    *run = timer->data;
-    uint64_t        now = uv_now(run->loop);
-    peerRemoteState state;
-    char            speed[32];
-    uint32_t        usable = 0;
-    uint32_t        needed = 0;
-    uint32_t        i;
-
-    if (run->done) {
-        return;
-    }
-    if (now - run->lastReport >= 2000u && run->wantedTotal > 0) {
-        formatBytes((run->bytesReceived - run->reportBytes) * 1000u / (now - run->lastReport),
-                    speed, sizeof(speed));
-        printf("  %5.1f%%  %" PRIu32 "/%" PRIu32 " pieces  %s/s%s%s\n",
-               100.0 * (run->wantedTotal - run->remaining) / run->wantedTotal,
-               run->wantedTotal - run->remaining, run->wantedTotal, speed,
-               (run->active != NULL) ? "  from " : "",
-               (run->active != NULL) ? run->active->where : "");
-        fflush(stdout);
-        run->lastReport = now;
-        run->reportBytes = run->bytesReceived;
-    }
-    if (now - run->lastProgress >= (uint64_t)downloadLimitSeconds * 1000u) {
-        printf("\nNo progress for %" PRIu32 " seconds; giving up.\n", downloadLimitSeconds);
-        downloadFinish(run, -1);
-        return;
-    }
-    if (run->active != NULL) {
-        if (now - run->lastProgress >= (uint64_t)downloadStallSeconds * 1000u) {
-            peerGetState(run->active->connection, &state);
-            downloadDrop(run->active, state.peerChoking ? "kept us choked"
-                                                        : "stopped sending blocks");
-        }
-        return;
-    }
-    downloadStart(run);
-    if (run->active == NULL && run->unresolved == 0) {
-        for (i = 0; i < run->count; i++) {
-            usable += (run->peers[i].open && !run->peers[i].excluded) ? 1u : 0u;
-        }
-        for (i = 0; i < run->torrent->pieceCount; i++) {
-            needed += (run->pieceState[i] == PIECE_STATE_NEEDED) ? 1u : 0u;
-        }
-        if (usable == 0 && needed > 0) {
-            printf("\nNo peer left that can supply the remaining %" PRIu32 " piece(s).\n", needed);
-            downloadFinish(run, -1);
-        }
-    }
-}
-
-/* The storage is ready: work out what is missing, then connect to the peers. */
-static void onStorageOpen(void *privateArg, storage *store, int32_t status,
-                          const char *errorMessage)
-{
-    downloadRun            *run = privateArg;
-    peerCallbacks           callbacks = { onDownloadHandshake, onDownloadMessage, onDownloadClosed };
-    peerConnectOptions      options;
-    struct sockaddr_storage address;
-    const uint8_t          *have;
-    uint32_t                haveCount;
-    uint32_t                pieceCount = run->torrent->pieceCount;
-    uint32_t                i;
-
-    if (status != STORAGE_OK) {
-        printf("Could not prepare the files: %s\n", errorMessage);
-        downloadFinish(run, -1);
-        return;
-    }
-    have = storageHave(store, &haveCount);
-    for (i = 0; i < pieceCount; i++) {
-        uint8_t wanted = (run->wanted < 0) || ((int64_t)i == run->wanted);
-
-        run->pieceState[i] = (!wanted || messageBitfieldGet(have, i)) ? PIECE_STATE_DONE
-                                                                      : PIECE_STATE_NEEDED;
-        run->remaining += (run->pieceState[i] == PIECE_STATE_NEEDED) ? 1u : 0u;
-    }
-    run->wantedTotal = run->remaining;
-    printf("Saving to:  %s\n", storageRoot(store));
-    if (haveCount > 0) {
+    downloadGetProgress(transfer, &progress);
+    printf("Saving to:  %s\n", downloadRoot(transfer));
+    if (progress.resumed > 0) {
         printf("Resuming:   %" PRIu32 " of %" PRIu32 " pieces already on disk and verified\n",
-               haveCount, pieceCount);
+               progress.resumed, progress.pieceCount);
     }
-    if (run->remaining == 0) {
-        printf("\nNothing to download: %s already complete.\n",
-               (run->wanted < 0) ? "the torrent is" : "that piece is");
-        downloadFinish(run, 0);
-        return;
+    if (progress.done < progress.wanted) {
+        printf("\nDownloading %" PRIu32 " piece(s) from up to %" PRIu32 " peer(s)\n",
+               progress.wanted - progress.done, run->peerCount);
     }
-
-    memset(&options, 0, sizeof(options));
-    memcpy(options.infoHash, run->torrent->infoHash, PARSER_SHA1_LENGTH);
-    memcpy(options.peerId, run->peerId, PEER_ID_LENGTH);
-    options.pieceCount = pieceCount;
-    options.timeoutSeconds = run->timeoutSeconds;
-
-    printf("\nDownloading %" PRIu32 " piece(s) using up to %" PRIu32 " peer(s)\n",
-           run->remaining, run->foundCount);
-    for (i = 0; i < run->foundCount; i++) {
-        downloadPeer *peer = &run->peers[run->count];
-
-        peer->run = run;
-        peer->peer = run->found[i].peer;
-        formatPeer(&peer->peer, peer->where, sizeof(peer->where));
-        toSocketAddress(&peer->peer, &address);
-        if (peerConnect((const struct sockaddr *)&address, &options, &callbacks, peer,
-                        &peer->connection) == PEER_OK) {
-            run->count++;
-            run->unresolved++;
-        }
-    }
-    if (run->count == 0) {
-        printf("No connection could be started.\n");
-        downloadFinish(run, -1);
-        return;
-    }
+    fflush(stdout);
+    (void)message;
     run->startedAt = uv_hrtime();
-    run->lastProgress = uv_now(run->loop);
-    run->lastReport = run->lastProgress;
-    uv_timer_start(&run->timer, onDownloadTick, 500u, 500u);
+    run->lastReport = uv_now(run->timer.loop);
+    uv_timer_start(&run->timer, onProgressTick, 2000u, 2000u);
     run->timerStarted = 1;
 }
 
+static void onDownloadEvent(void *privateArg, download *transfer, const char *message)
+{
+    (void)privateArg;
+    (void)transfer;
+    printf("  %s\n", message);
+    fflush(stdout);
+}
+
+static void onDownloadFinished(void *privateArg, download *transfer, int32_t status,
+                               const char *message)
+{
+    downloadRun     *run = privateArg;
+    downloadProgress progress;
+    double           seconds;
+    char             size[32];
+    char             wasted[32];
+
+    downloadGetProgress(transfer, &progress);
+    if (status == DOWNLOAD_OK && progress.done > progress.resumed) {
+        seconds = (double)(uv_hrtime() - run->startedAt) / 1e9;
+        formatBytes(progress.bytesReceived, size, sizeof(size));
+        formatBytes(progress.bytesWasted, wasted, sizeof(wasted));
+        printf("\nDownload complete: %s\n  %" PRIu32 " piece(s), %s received in %.1f s"
+               " (%.1f KiB/s)", downloadRoot(transfer), progress.done - progress.resumed,
+               size, seconds, (seconds > 0.0) ? (double)progress.bytesReceived / 1024.0 / seconds : 0.0);
+        if (progress.bytesWasted > 0 || progress.hashFailures > 0) {
+            printf("; %s wasted, %" PRIu32 " piece(s) failed verification", wasted,
+                   progress.hashFailures);
+        }
+        printf("\n");
+    } else if (status == DOWNLOAD_OK) {
+        printf("\nNothing to download: %s\n", message);
+    } else {
+        printf("\nDownload failed: %s (%" PRIu32 " of %" PRIu32 " pieces on disk)\n", message,
+               progress.done, progress.wanted);
+    }
+    fflush(stdout);
+    run->result = (status == DOWNLOAD_OK) ? 0 : -1;
+    if (run->timerStarted) {
+        uv_timer_stop(&run->timer);
+    }
+    downloadEnd(transfer);
+    run->transfer = NULL;
+}
+
 /* Download the torrent (or piece 'wanted') into 'directory'. */
-static int downloadTorrent(uv_loop_t *loop, parserContext *context, const parserAllocator *allocator,
-                           const parserTorrent *torrent, const peerAttempt *found, uint32_t count,
+static int downloadTorrent(uv_loop_t *loop, parserContext *context, const parserTorrent *torrent,
+                           const peerAttempt *found, uint32_t count,
                            const uint8_t peerId[PEER_ID_LENGTH], uint32_t timeoutSeconds,
                            int64_t wanted, const char *directory)
 {
-    downloadRun run;
-    int32_t     status;
+    downloadEvents          events = { onDownloadReady, onDownloadEvent, onDownloadFinished };
+    downloadOptions         options;
+    downloadRun             run;
+    struct sockaddr_storage address;
+    uint32_t                i;
+    int32_t                 status;
 
     if (wanted >= (int64_t)torrent->pieceCount) {
         printf("\nPiece %" PRId64 " does not exist: the torrent has %" PRIu32 " pieces.\n",
@@ -1620,43 +1238,32 @@ static int downloadTorrent(uv_loop_t *loop, parserContext *context, const parser
         return -1;
     }
     memset(&run, 0, sizeof(run));
-    run.loop = loop;
-    run.context = context;
-    run.allocator = allocator;
-    run.torrent = torrent;
-    run.found = found;
-    run.foundCount = (count > maxPeerAttempts) ? maxPeerAttempts : count;
-    memcpy(run.peerId, peerId, PEER_ID_LENGTH);
-    run.timeoutSeconds = timeoutSeconds;
-    run.wanted = wanted;
     run.result = -1;
-    run.peers = allocator->realloc(NULL, sizeof(*run.peers) * (run.foundCount + 1u));
-    run.pieceState = allocator->realloc(NULL, (size_t)torrent->pieceCount + 1u);
-    if (run.peers == NULL || run.pieceState == NULL) {
-        fprintf(stderr, "out of memory\n");
-        allocator->free(run.peers);
-        allocator->free(run.pieceState);
-        return -1;
-    }
-    memset(run.peers, 0, sizeof(*run.peers) * (run.foundCount + 1u));
+    memset(&options, 0, sizeof(options));
+    memcpy(options.peerId, peerId, PEER_ID_LENGTH);
+    options.directory = directory;
+    options.handshakeTimeoutSeconds = timeoutSeconds;
+    options.onlyPiece = wanted;
+
     uv_timer_init(loop, &run.timer);
     run.timer.data = &run;
 
     printf("\nChecking files...\n");
     fflush(stdout);
-    status = storageOpen(loop, context, torrent, directory, STORAGE_CHECK_EXISTING,
-                         onStorageOpen, &run, &run.store);
-    if (status != STORAGE_OK) {
-        printf("Could not prepare the files: %s\n", storageStatusString(status));
+    status = downloadBegin(loop, context, torrent, &options, &events, &run, &run.transfer);
+    if (status != DOWNLOAD_OK) {
+        printf("Could not start the download: %s\n", downloadStatusString(status));
     } else {
-        uv_run(loop, UV_RUN_DEFAULT);               /* until downloadFinish() */
+        for (i = 0; i < count; i++) {
+            toSocketAddress(&found[i].peer, &address);
+            if (downloadAddPeer(run.transfer, (const struct sockaddr *)&address) == DOWNLOAD_OK) {
+                run.peerCount++;
+            }
+        }
+        uv_run(loop, UV_RUN_DEFAULT);               /* until onDownloadFinished */
     }
     uv_close((uv_handle_t *)&run.timer, NULL);
-    uv_run(loop, UV_RUN_DEFAULT);                   /* closing handles, writes in flight */
-
-    pieceEnd(&run.piece);
-    allocator->free(run.peers);
-    allocator->free(run.pieceState);
+    uv_run(loop, UV_RUN_DEFAULT);                   /* closing handles */
     return run.result;
 }
 
@@ -1779,7 +1386,7 @@ static int announceTorrent(parserContext *context, const parserAllocator *alloca
                 handshakes = handshakePeers(&loop, attempts, attemptCount, infoHash,
                                             config.peerId, pieceCount, timeoutSeconds);
             } else {
-                downloaded = (downloadTorrent(&loop, context, allocator, &torrent, attempts,
+                downloaded = (downloadTorrent(&loop, context, &torrent, attempts,
                                               attemptCount, config.peerId, timeoutSeconds,
                                               wanted, outputDirectory) == 0);
             }
@@ -1924,7 +1531,8 @@ static void usage(const char *program)
             "  -t        announce to every tracker in the torrent and list the peers\n"
             "  -P        announce, then contact each peer found (up to 200): handshake,\n"
             "            send interested, report its pieces and whether it unchokes us\n"
-            "  -D        announce, then download the torrent (resuming if files exist)\n"
+            "  -D        announce, then download the torrent from all the peers found\n"
+            "            at once (up to 50 connected); re-run to resume\n"
             "  -O dir    with -D: where to save (default: the current directory)\n"
             "  -i piece  with -D: download only this piece\n"
             "  -T secs   announce and handshake timeout (default 15)\n"
@@ -1954,6 +1562,12 @@ int main(int argc, char **argv)
     int32_t         result;
     int             option;
     int             status = -1;
+
+#ifndef _WIN32
+    /* A peer may close its connection while we are writing to it; that must
+     * be an error from the write, not a signal that ends the program. */
+    signal(SIGPIPE, SIG_IGN);
+#endif
 
     memset(&options, 0, sizeof(options));
 

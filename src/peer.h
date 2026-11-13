@@ -97,6 +97,25 @@ extern "C" {
 #define PEER_ESELF                  (-12)   /* Connected to ourselves          */
 #define PEER_ECLOSED                (-13)   /* The connection has closed       */
 #define PEER_EADDRINUSE             (-14)   /* peerListen(): port already in use */
+#define PEER_ECRYPTO                (-15)   /* The peer dropped our encrypted
+                                               handshake (try again with
+                                               peerConnectOptions.plaintext), or
+                                               refused/sent an unencrypted one
+                                               when encryption is required     */
+
+/* Protocol encryption policy (peerSetEncryption()) */
+#define PEER_ENCRYPTION_OFF         0u      /* plain connections only          */
+#define PEER_ENCRYPTION_PREFER      1u      /* try encrypted first, accept both
+                                               (the default)                   */
+#define PEER_ENCRYPTION_REQUIRE     2u      /* encrypted (RC4) only            */
+
+/* How a connection turned out (peerHandshakeResult/peerRemoteState.encryption) */
+#define PEER_ENCRYPTED_NONE         0u      /* plain                           */
+#define PEER_ENCRYPTED_RC4          1u      /* everything encrypted            */
+#define PEER_ENCRYPTED_HEADER       2u      /* only the handshake hidden: the
+                                               peer chose plaintext after it   */
+
+#define PEER_LISTENER_MAX_HASHES    16u     /* peerListenerAddInfoHash()       */
 
 /* ------------------------------------------------------------------------ */
 /* Types                                                                    */
@@ -119,6 +138,10 @@ typedef struct peerConnectOptions {
     uint32_t    extensions;                 /* PEER_EXTENSION_* we advertise in
                                                the handshake (only _PROTOCOL so
                                                far); 0 for none                  */
+    uint8_t     plaintext;                  /* 1: do not try encryption on this
+                                               connection (a retry after
+                                               PEER_ECRYPTO); ignored when it is
+                                               required                          */
 } peerConnectOptions;
 
 /* The outcome of a handshake. Valid only during the callback. */
@@ -129,6 +152,7 @@ typedef struct peerHandshakeResult {
     uint8_t         reserved[PEER_RESERVED_LENGTH]; /* the peer's reserved bytes  */
     uint32_t        extensions;                     /* PEER_EXTENSION_* decoded
                                                        from 'reserved'           */
+    uint8_t         encryption;                     /* PEER_ENCRYPTED_*          */
     const char     *errorMessage;                   /* NULL on success            */
 } peerHandshakeResult;
 
@@ -151,6 +175,7 @@ typedef struct peerRemoteState {
     uint32_t        extensions;     /* PEER_EXTENSION_*                      */
     uint8_t         incoming;       /* the peer connected to us              */
     uint64_t        sendQueued;     /* bytes given to peerSend() not yet sent */
+    uint8_t         encryption;     /* PEER_ENCRYPTED_*                      */
 } peerRemoteState;
 
 /* Called once with the handshake's outcome. */
@@ -254,6 +279,18 @@ void peerShutdown(void);
 int32_t peerListen(int family, uint16_t port, peerIncomingCallback callback, void *privateArg,
                    peerListener **listener);
 uint16_t peerListenerPort(const peerListener *listener);
+
+/*
+ * Tell a listener which torrents it serves, so that it can recognise
+ * encrypted connections for them (they do not send the info hash in the
+ * clear). PEER_ENOMEM beyond PEER_LISTENER_MAX_HASHES.
+ */
+int32_t peerListenerAddInfoHash(peerListener *listener,
+                                const uint8_t infoHash[PARSER_SHA1_LENGTH]);
+
+/* Protocol encryption for all connections from now on: PEER_ENCRYPTION_*. */
+void peerSetEncryption(uint8_t mode);
+uint8_t peerGetEncryption(void);
 
 /* Stop accepting. Connections already taken are not affected. */
 void peerListenerClose(peerListener *listener);

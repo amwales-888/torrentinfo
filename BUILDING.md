@@ -174,6 +174,27 @@ project's *Properties > Debugging > Command Arguments*.
   asked nor answered) and incoming DHT messages; the refusals are counted
   in `peersBlocked` / `dhtStatus.blocked`.
 
+- **Protocol encryption (crypto.c, peer.c; `-E`, `encryption`).** Message
+  Stream Encryption: Diffie-Hellman over the 768-bit MSE prime (generator 2,
+  160-bit private keys) with OpenSSL's BIGNUM functions, then RC4 with the
+  first 1024 bytes of key stream discarded (our own RC4: OpenSSL 3 keeps it
+  only in the legacy provider). It is a layer in peer.c below the
+  BitTorrent handshake: `mseProcess()` runs the exchange as bytes arrive
+  (A: send Ya and padding; on Yb send SHA1(req1,S), SHA1(req2,hash) xor
+  SHA1(req3,S) and the encrypted VC, crypto_provide and our handshake as
+  IA; find B's encrypted VC within 512 bytes of padding. B: answer Ya with
+  Yb; find SHA1(req1,S); identify the torrent among the listener's info
+  hashes, `peerListenerAddInfoHash()`; read IA; choose RC4 if offered).
+  Afterwards `sendBytes()` encrypts each chunk as it is queued and
+  `onRead()` decrypts as bytes arrive, so nothing above peer.c changes.
+  Incoming connections are told apart by their first 20 bytes. Policy:
+  `peerSetEncryption()` OFF / PREFER / REQUIRE. An outgoing attempt that
+  the peer closes, resets or does not answer within 5 s
+  (`MSE_REPLY_SECONDS`) fails with `PEER_ECRYPTO`; with PREFER, download.c
+  and metadata.c retry the peer at once with
+  `peerConnectOptions.plaintext`. Tested against libtorrent 2.1 with
+  encryption forced, disabled and header-only, in both directions.
+
 - **Choosing files (`-f`, `-F`).** main.c turns the choice into one byte
   per file (`downloadOptions.fileWanted`); download.c marks the pieces that
   touch no chosen file as not wanted (as `-i` does), so they are never

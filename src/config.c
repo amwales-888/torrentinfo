@@ -49,7 +49,12 @@ static const char configTemplate[] =
     "# Speed limits, in KiB/s, or with a unit: 500k, 1.5M. 0: no limit.\n"
     "# Like -d and -u.\n"
     "#max_download_rate = 0\n"
-    "#max_upload_rate = 0\n";
+    "#max_upload_rate = 0\n"
+    "\n"
+    "# Protocol encryption: \"prefer\" (try it, fall back to plain for peers\n"
+    "# that do not support it), \"require\" (encrypted peers only) or \"off\".\n"
+    "# Like -E.\n"
+    "#encryption = prefer\n";
 
 typedef struct lineContext {
     configWarningCallback warning;
@@ -265,6 +270,31 @@ int configParseRate(const char *text, uint64_t *bytesPerSecond)
     return 1;
 }
 
+int configParseEncryption(const char *text, uint8_t *mode)
+{
+    static const char *const names[] = { "off", "prefer", "require" };
+    char                     lower[16];
+    size_t                   i;
+
+    if (text == NULL || mode == NULL) {
+        return 0;
+    }
+    for (i = 0; text[i] != '\0' && i + 1u < sizeof(lower); i++) {
+        lower[i] = (char)((text[i] >= 'A' && text[i] <= 'Z') ? text[i] + 32 : text[i]);
+    }
+    if (text[i] != '\0') {
+        return 0;
+    }
+    lower[i] = '\0';
+    for (i = 0; i < 3u; i++) {
+        if (strcmp(lower, names[i]) == 0) {
+            *mode = (uint8_t)i;
+            return 1;
+        }
+    }
+    return 0;
+}
+
 static void parseSetting(lineContext *lc, configSettings *s, const char *key, size_t keyLength,
                          const char *start, const char *end)
 {
@@ -358,6 +388,12 @@ static void parseSetting(lineContext *lc, configSettings *s, const char *key, si
             s->maxUploadRate = rate;
             s->set |= CONFIG_SET_MAX_UPLOAD_RATE;
         }
+    } else if (sameKey(key, keyLength, "encryption")) {
+        if (!configParseEncryption(value, &s->encryption)) {
+            warn(lc, "%s: use prefer, require or off, not %s", keyText, value);
+            return;
+        }
+        s->set |= CONFIG_SET_ENCRYPTION;
     } else {
         warn(lc, "unknown setting \"%s\"%s", keyText, "");
     }

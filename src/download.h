@@ -147,6 +147,7 @@ typedef struct downloadProgress {
     uint32_t        peersInterested;    /* connected peers wanting our pieces  */
     uint32_t        peersUploading;     /* connected peers we are unchoking    */
     uint32_t        peersIncoming;      /* connected peers that came to us     */
+    uint32_t        peersEncrypted;     /* connected peers using encryption    */
     uint16_t        listenPort;         /* 0 if not accepting connections      */
     uint32_t        peersFromPex;       /* new peers heard of by peer exchange */
     uint8_t         checking;           /* still checking the files on disk    */

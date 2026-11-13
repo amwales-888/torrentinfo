@@ -11,7 +11,7 @@ torrentinfo file.torrent | magnet-link
 torrentinfo -o new.torrent [-a url]... [-w url]... [-c text] [-n name] [-l size] [-p] file...
 torrentinfo -t [-T seconds] [-C certs.pem] [-I interface] file.torrent
 torrentinfo -P [-T seconds] [-C certs.pem] [-I interface] file.torrent
-torrentinfo -D [-S] [-L port] [-N] [-X] [-d speed] [-u speed] [-f list] [-F pattern]...
+torrentinfo -D [-S] [-L port] [-N] [-X] [-E mode] [-d speed] [-u speed] [-f list] [-F pattern]...
                [-O folder] [-i piece] [-T seconds] [-C certs.pem] [-I interface]
                file.torrent | magnet-link
 torrentinfo -V [-O folder] [-f list] [-F pattern]... file.torrent
@@ -161,6 +161,13 @@ The program works in one of six ways, chosen by the first option.
   shell does not expand it. With a magnet link, use `-F`: the file numbers
   are not known until the torrent has been fetched.
 
+`-E mode`
+: Protocol encryption. `prefer` (the default) encrypts connections with
+  peers that support it and falls back to an ordinary connection with
+  those that do not. `require` talks only to peers that encrypt, and turns
+  the others away; you will find fewer peers. `off` never encrypts and
+  turns away peers that insist on it. See "Encryption" under NOTES.
+
 `-d speed`
 : Download no faster than this. Give it in KiB per second (`-d 500`) or
   with a unit: `500k`, `1.5M`, `2G`. `0` means no limit, the default. The
@@ -241,6 +248,17 @@ from people who connect to you, and from the peers themselves, which tell
 each other about the other peers they know ("peer exchange"). Private
 torrents only use their trackers.
 
+**Encryption.** BitTorrent's protocol encryption scrambles the
+connection between you and a peer so that it does not look like
+BitTorrent. Some internet providers slow down or cut BitTorrent traffic
+they recognise, and some peers only accept encrypted connections. It is
+not real security: it does not hide which torrents you share, or who you
+share them with. Each connection is reported as `encrypted`, as
+`handshake encrypted` (the peer asked to encrypt only the start of the
+connection), or with nothing for an ordinary one. With `prefer`, a peer
+that does not support encryption is retried at once without it; one that
+simply does not answer takes about five seconds.
+
 **Choosing files.** With `-f` or `-F` only the chosen files are
 downloaded; the others are not created at all. The download is complete
 when the chosen files are, and with `-S` the program then shares what it
@@ -315,6 +333,9 @@ and in `%APPDATA%\torrentinfo` on Windows (made when first needed):
 
   `max_download_rate = 2M`, `max_upload_rate = 500k`
   : Like `-d` and `-u`.
+
+  `encryption = prefer`
+  : Like `-E`: `prefer`, `require` or `off`.
 
 `blocklist.txt`
 : Addresses never to talk to (see "Blocking addresses" under NOTES). Used

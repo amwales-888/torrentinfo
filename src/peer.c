@@ -20,6 +20,28 @@
  * afterwards it ticks every 15 seconds to send keep-alives and to drop
  * peers that have gone quiet.
  *
+ * Protocol encryption (MSE/PE, see crypto.h) runs before the handshake
+ * when enabled. Outgoing (we are "A"):
+ *
+ *   A -> B  Ya, PadA
+ *   B -> A  Yb, PadB
+ *   A -> B  SHA1("req1", S), SHA1("req2", infohash) ^ SHA1("req3", S),
+ *           RC4(VC, crypto_provide, len(PadC), PadC, len(IA)), RC4(IA)
+ *   B -> A  RC4(VC, crypto_select, len(PadD), PadD), payload...
+ *
+ * where S is the Diffie-Hellman secret, VC eight zero bytes and IA our
+ * BitTorrent handshake. A finds the end of PadB by looking for VC as B's
+ * key stream would encrypt it; B finds the end of PadA by looking for
+ * SHA1("req1", S), and the torrent by trying the info hashes its listener
+ * serves (peerListenerAddInfoHash()). crypto_select picks RC4 for the whole
+ * connection, or plaintext after these headers. Incoming connections are
+ * told apart by their first bytes: a plain one starts with the 20-byte
+ * protocol header. Once negotiated, bytes are encrypted as they are queued
+ * (sendBytes()) and decrypted as they arrive (onRead()), so everything
+ * after the handshake works unchanged. An outgoing attempt that the peer
+ * drops during the exchange fails with PEER_ECRYPTO, so the caller can
+ * retry without encryption.
+ *
  * Lifetime: 'pending' counts libuv callbacks still to come (open handles
  * and writes in flight). A connection is freed only once peerClose() has
  * been called, pending is zero, and no callback for it is running.
@@ -35,6 +57,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "crypto.h"
 #include "net.h"
 #include "peer.h"
 #include "queue.h"
@@ -51,6 +74,35 @@
 #define PEER_INCOMING_SECONDS   30u             /* for an incoming peer's handshake */
 #define PEER_LISTEN_BACKLOG     64
 #endif
+
+/* Protocol encryption */
+#define MSE_MAX_PAD             512u            /* PadA..PadD                      */
+#define MSE_MAX_IA              8192u           /* the initial payload we accept   */
+#define MSE_VC_LENGTH           8u
+#define MSE_CRYPTO_PLAIN        0x01u           /* crypto_provide / crypto_select  */
+#define MSE_CRYPTO_RC4          0x02u
+#define MSE_DISCARD             1024u           /* RC4 key stream thrown away      */
+#ifndef MSE_REPLY_SECONDS
+#define MSE_REPLY_SECONDS       5u              /* for the peer's key: a peer that
+                                                   does encryption answers at once,
+                                                   one that does not may just wait */
+#endif
+
+enum {
+    MSE_NONE = 0,                               /* not encrypting, or finished     */
+    MSE_A_WAIT_Y,                               /* we sent Ya; waiting for Yb      */
+    MSE_A_FIND_VC,                              /* looking for B's encrypted VC    */
+    MSE_A_SELECT,                               /* VC, crypto_select, len(PadD)    */
+    MSE_A_PAD,                                  /* PadD                            */
+    MSE_B_WAIT_Y,                               /* waiting for Ya                  */
+    MSE_B_FIND_REQ1,                            /* looking for SHA1("req1", S)     */
+    MSE_B_PROVIDE,                              /* VC, crypto_provide, len(PadC)   */
+    MSE_B_PAD,                                  /* PadC, len(IA)                   */
+    MSE_B_IA                                    /* IA                              */
+};
+
+/* Policy for all connections (peerSetEncryption()). */
+static uint8_t peerEncryption = PEER_ENCRYPTION_PREFER;
 
 /* One message (or our handshake) on its way to the socket. */
 typedef struct peerWrite {
@@ -86,6 +138,27 @@ struct peerConnection {
     uint8_t                 tcpOpen;
     uint8_t                 timerOpen;
 
+    /* Protocol encryption */
+    uint8_t                 msePhase;       /* MSE_*                           */
+    uint8_t                 mseInitiator;   /* we connected out                */
+    uint8_t                 mseDecided;     /* incoming: plain or MSE known    */
+    uint8_t                 plaintextOnly;  /* peerConnectOptions.plaintext    */
+    uint8_t                 encryption;     /* PEER_ENCRYPTED_* once known     */
+    uint8_t                 rc4Active;      /* encrypting everything both ways */
+    uint8_t                 mseHashKnown;   /* incoming: mseInfoHash is set    */
+    uint8_t                 msePrivate[CRYPTO_PRIVATE_LENGTH];
+    uint8_t                 msePublic[CRYPTO_DH_LENGTH];
+    uint8_t                 mseSecret[CRYPTO_DH_LENGTH];
+    uint8_t                 mseInfoHash[PARSER_SHA1_LENGTH];
+    uint8_t                 msePattern[PARSER_SHA1_LENGTH];  /* what we look for */
+    uint32_t                msePos;         /* next field, in the buffer       */
+    uint32_t                mseDecrypted;   /* bytes before this are decrypted */
+    uint32_t                mseLength;      /* length of the current field     */
+    uint32_t                mseProvide;     /* incoming: crypto_provide        */
+    uint32_t                mseSelect;
+    cryptoRc4               rc4In;
+    cryptoRc4               rc4Out;
+
     uint8_t                *buffer;         /* received, not yet processed     */
     uint32_t                received;
     uint32_t                capacity;
@@ -119,6 +192,8 @@ struct peerListener {
     uint16_t                port;
     uint8_t                 closed;
     uint32_t                pendingConnections; /* accepted, info hash not seen */
+    uint8_t                 hashes[PEER_LISTENER_MAX_HASHES][PARSER_SHA1_LENGTH];
+    uint32_t                hashCount;          /* for encrypted connections    */
 };
 
 static struct {
@@ -243,6 +318,7 @@ static void deliverHandshake(peerConnection *connection, int32_t status)
     memcpy(result.peerId, connection->remotePeerId, PEER_ID_LENGTH);
     memcpy(result.reserved, connection->reserved, PEER_RESERVED_LENGTH);
     result.extensions = connection->extensions;
+    result.encryption = connection->encryption;
     result.errorMessage = (status == PEER_OK) ? NULL : connection->errorMessage;
 
     /* inCallback stops peerClose()/peerShutdown() freeing the connection
@@ -335,6 +411,9 @@ static int32_t sendBytes(peerConnection *connection, const uint8_t *data, uint32
         messageEncode(message, chunk->data, length, &written);
     } else {
         memcpy(chunk->data, data, length);
+    }
+    if (connection->rc4Active) {
+        cryptoRc4Apply(&connection->rc4Out, chunk->data, written);    /* in queue order */
     }
     chunk->connection = connection;
     chunk->write.data = chunk;
@@ -611,12 +690,14 @@ static void handshakeComplete(peerConnection *connection)
     processMessages(connection);
 }
 
+static int32_t mseCutShort(peerConnection *connection, int32_t status, const char *what);
+
 static void onTimeout(uv_timer_t *timer)
 {
     peerConnection *connection = timer->data;
 
     setError(connection, "no handshake within %" PRIu32 " seconds", connection->timeoutSeconds);
-    terminate(connection, PEER_ETIMEDOUT);
+    terminate(connection, mseCutShort(connection, PEER_ETIMEDOUT, "no reply"));
 }
 
 static void onRead(uv_stream_t *stream, ssize_t count, const uv_buf_t *buffer);
@@ -628,6 +709,7 @@ static void configure(peerConnection *connection, const peerConnectOptions *opti
 
     connection->timeoutSeconds = options->timeoutSeconds;
     connection->pieceCount = options->pieceCount;
+    connection->plaintextOnly = options->plaintext;
     memcpy(connection->infoHash, options->infoHash, PARSER_SHA1_LENGTH);
     memcpy(connection->localPeerId, options->peerId, PEER_ID_LENGTH);
     connection->amChoking = 1;                      /* BEP 3 initial state */
@@ -679,6 +761,12 @@ static int32_t routeIncoming(peerConnection *connection)
         return PEER_EPROTO;
     }
     memcpy(infoHash, connection->buffer + PEER_OFFSET_INFO_HASH, PARSER_SHA1_LENGTH);
+    if (connection->mseHashKnown &&
+        memcmp(infoHash, connection->mseInfoHash, PARSER_SHA1_LENGTH) != 0) {
+        setError(connection, "the encrypted and the BitTorrent handshakes name different "
+                 "torrents");
+        return PEER_EPROTO;
+    }
     connection->listener = NULL;
     listener->pendingConnections--;
     if (listener->closed || listener->callback == NULL) {
@@ -711,6 +799,405 @@ static int32_t routeIncoming(peerConnection *connection)
     return result;
 }
 
+/* ======================================================================== */
+/* Protocol encryption (MSE)                                                */
+/* ======================================================================== */
+
+static uint32_t get32(const uint8_t *p)
+{
+    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3];
+}
+
+static void put32(uint8_t *p, uint32_t value)
+{
+    p[0] = (uint8_t)(value >> 24);
+    p[1] = (uint8_t)(value >> 16);
+    p[2] = (uint8_t)(value >> 8);
+    p[3] = (uint8_t)value;
+}
+
+/* SHA1(tag, a, b): tag is 4 characters ("req1", "keyA", ...). */
+static void mseHash(const char *tag, const uint8_t *a, size_t aLength, const uint8_t *b,
+                    size_t bLength, uint8_t out[PARSER_SHA1_LENGTH])
+{
+    uint8_t input[4u + CRYPTO_DH_LENGTH + PARSER_SHA1_LENGTH];
+
+    memcpy(input, tag, 4u);
+    memcpy(input + 4u, a, aLength);
+    if (bLength > 0) {
+        memcpy(input + 4u + aLength, b, bLength);
+    }
+    parserSha1(input, 4u + aLength + bLength, out);
+}
+
+/* Our public key and random padding (PadA or PadB). */
+static int32_t mseSendKey(peerConnection *connection)
+{
+    uint8_t  message[CRYPTO_DH_LENGTH + MSE_MAX_PAD];
+    uint16_t random = 0;
+    uint32_t padLength;
+
+    if (cryptoDhKeyPair(connection->msePrivate, connection->msePublic) != 0 ||
+        cryptoRandom(&random, sizeof(random)) != 0) {
+        setError(connection, "could not make an encryption key");
+        return PEER_ERROR;
+    }
+    padLength = random % MSE_MAX_PAD;
+    memcpy(message, connection->msePublic, CRYPTO_DH_LENGTH);
+    if (padLength > 0 && cryptoRandom(message + CRYPTO_DH_LENGTH, padLength) != 0) {
+        padLength = 0;
+    }
+    return sendBytes(connection, message, CRYPTO_DH_LENGTH + padLength, NULL);
+}
+
+/* The peer's public key is in the first 96 bytes: work out S. */
+static int32_t mseSecret(peerConnection *connection)
+{
+    if (cryptoDhSecret(connection->msePrivate, connection->buffer, connection->mseSecret) != 0) {
+        setError(connection, "encrypted handshake: the peer's key is not valid");
+        return PEER_EPROTO;
+    }
+    return PEER_OK;
+}
+
+/* RC4 keys from S and the info hash; A sends with keyA, B with keyB. */
+static void mseKeys(peerConnection *connection, const uint8_t infoHash[PARSER_SHA1_LENGTH])
+{
+    uint8_t keyA[PARSER_SHA1_LENGTH];
+    uint8_t keyB[PARSER_SHA1_LENGTH];
+
+    mseHash("keyA", connection->mseSecret, CRYPTO_DH_LENGTH, infoHash, PARSER_SHA1_LENGTH, keyA);
+    mseHash("keyB", connection->mseSecret, CRYPTO_DH_LENGTH, infoHash, PARSER_SHA1_LENGTH, keyB);
+    cryptoRc4Init(&connection->rc4Out, connection->mseInitiator ? keyA : keyB, PARSER_SHA1_LENGTH,
+                  MSE_DISCARD);
+    cryptoRc4Init(&connection->rc4In, connection->mseInitiator ? keyB : keyA, PARSER_SHA1_LENGTH,
+                  MSE_DISCARD);
+}
+
+/* Decrypt the received bytes up to 'end' (each byte exactly once). */
+static void mseDecryptTo(peerConnection *connection, uint32_t end)
+{
+    if (end > connection->mseDecrypted) {
+        cryptoRc4Apply(&connection->rc4In, connection->buffer + connection->mseDecrypted,
+                       end - connection->mseDecrypted);
+        connection->mseDecrypted = end;
+    }
+}
+
+/* Look for msePattern (length bytes) from msePos, no further than 'limit'. */
+static int mseFind(peerConnection *connection, uint32_t length, uint32_t limit, uint32_t *at)
+{
+    uint32_t start;
+
+    for (start = connection->msePos; start + length <= connection->received && start <= limit;
+         start++) {
+        if (memcmp(connection->buffer + start, connection->msePattern, length) == 0) {
+            *at = start;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* A: Yb has arrived: send the request with our handshake as IA. */
+static int32_t mseSendRequest(peerConnection *connection)
+{
+    uint8_t  message[2u * PARSER_SHA1_LENGTH + MSE_VC_LENGTH + 8u + PEER_HANDSHAKE_LENGTH];
+    uint8_t  req2[PARSER_SHA1_LENGTH];
+    uint8_t  req3[PARSER_SHA1_LENGTH];
+    uint8_t *encrypted = message + 2u * PARSER_SHA1_LENGTH;
+    uint32_t i;
+
+    mseHash("req1", connection->mseSecret, CRYPTO_DH_LENGTH, NULL, 0, message);
+    mseHash("req2", connection->infoHash, PARSER_SHA1_LENGTH, NULL, 0, req2);
+    mseHash("req3", connection->mseSecret, CRYPTO_DH_LENGTH, NULL, 0, req3);
+    for (i = 0; i < PARSER_SHA1_LENGTH; i++) {
+        message[PARSER_SHA1_LENGTH + i] = (uint8_t)(req2[i] ^ req3[i]);
+    }
+    memset(encrypted, 0, MSE_VC_LENGTH);                            /* VC */
+    put32(encrypted + MSE_VC_LENGTH,
+          (peerEncryption == PEER_ENCRYPTION_REQUIRE) ? MSE_CRYPTO_RC4
+                                                      : (MSE_CRYPTO_RC4 | MSE_CRYPTO_PLAIN));
+    encrypted[MSE_VC_LENGTH + 4u] = 0;                              /* len(PadC) = 0 */
+    encrypted[MSE_VC_LENGTH + 5u] = 0;
+    encrypted[MSE_VC_LENGTH + 6u] = 0;                              /* len(IA) */
+    encrypted[MSE_VC_LENGTH + 7u] = (uint8_t)PEER_HANDSHAKE_LENGTH;
+    memcpy(encrypted + MSE_VC_LENGTH + 8u, connection->handshake, PEER_HANDSHAKE_LENGTH);
+    cryptoRc4Apply(&connection->rc4Out, encrypted, MSE_VC_LENGTH + 8u + PEER_HANDSHAKE_LENGTH);
+    return sendBytes(connection, message, sizeof(message), NULL);
+}
+
+/* The exchange is over: the payload starts at buffer[start]. */
+static void mseFinish(peerConnection *connection, uint32_t start)
+{
+    if (connection->mseSelect == MSE_CRYPTO_RC4) {
+        mseDecryptTo(connection, connection->received);
+        connection->rc4Active = 1;
+        connection->encryption = PEER_ENCRYPTED_RC4;
+    } else {
+        connection->encryption = PEER_ENCRYPTED_HEADER;
+    }
+    connection->received -= start;
+    memmove(connection->buffer, connection->buffer + start, connection->received);
+    connection->msePhase = MSE_NONE;
+    memset(connection->msePrivate, 0, sizeof(connection->msePrivate));
+}
+
+/*
+ * Advance the exchange with what has arrived. PEER_OK when it is complete
+ * (the buffer then holds the payload: the peer's BitTorrent handshake), 1
+ * if more bytes are needed, or an error.
+ */
+static int32_t mseProcess(peerConnection *connection)
+{
+    uint8_t *buffer;
+    uint32_t at;
+    uint32_t i;
+    int32_t  result;
+
+    for (;;) {
+        buffer = connection->buffer;
+        switch (connection->msePhase) {
+        case MSE_A_WAIT_Y:
+            if (connection->received < CRYPTO_DH_LENGTH) {
+                return 1;
+            }
+            result = mseSecret(connection);
+            if (result != PEER_OK) {
+                return result;
+            }
+            mseKeys(connection, connection->infoHash);
+            if (connection->timeoutSeconds == 0 || connection->timeoutSeconds > MSE_REPLY_SECONDS) {
+                /* It answered: back to the ordinary handshake time limit. */
+                uv_timer_stop(&connection->timer);
+                if (connection->timeoutSeconds > 0) {
+                    uv_timer_start(&connection->timer, onTimeout,
+                                   (uint64_t)connection->timeoutSeconds * 1000u, 0);
+                }
+            }
+            {
+                cryptoRc4 copy = connection->rc4In;   /* B's VC, as it will arrive */
+
+                memset(connection->msePattern, 0, MSE_VC_LENGTH);
+                cryptoRc4Apply(&copy, connection->msePattern, MSE_VC_LENGTH);
+            }
+            result = mseSendRequest(connection);
+            if (result != PEER_OK) {
+                setError(connection, "could not send the encrypted handshake");
+                return result;
+            }
+            connection->msePos = CRYPTO_DH_LENGTH;
+            connection->msePhase = MSE_A_FIND_VC;
+            break;
+        case MSE_A_FIND_VC:
+            if (!mseFind(connection, MSE_VC_LENGTH, CRYPTO_DH_LENGTH + MSE_MAX_PAD, &at)) {
+                if (connection->received >= CRYPTO_DH_LENGTH + MSE_MAX_PAD + MSE_VC_LENGTH) {
+                    setError(connection, "encrypted handshake: no valid reply from the peer");
+                    return PEER_EPROTO;
+                }
+                return 1;
+            }
+            connection->mseDecrypted = at;          /* B's encryption starts at VC */
+            connection->msePos = at;
+            connection->msePhase = MSE_A_SELECT;
+            break;
+        case MSE_A_SELECT:
+            if (connection->received < connection->msePos + MSE_VC_LENGTH + 6u) {
+                return 1;
+            }
+            mseDecryptTo(connection, connection->msePos + MSE_VC_LENGTH + 6u);
+            connection->mseSelect = get32(buffer + connection->msePos + MSE_VC_LENGTH);
+            connection->mseLength = ((uint32_t)buffer[connection->msePos + MSE_VC_LENGTH + 4u] << 8) |
+                                    buffer[connection->msePos + MSE_VC_LENGTH + 5u];
+            if (connection->mseLength > MSE_MAX_PAD ||
+                (connection->mseSelect != MSE_CRYPTO_RC4 &&
+                 (connection->mseSelect != MSE_CRYPTO_PLAIN ||
+                  peerEncryption == PEER_ENCRYPTION_REQUIRE))) {
+                setError(connection, "encrypted handshake: the peer chose a method we did not "
+                         "offer (%" PRIu32 ")", connection->mseSelect);
+                return PEER_EPROTO;
+            }
+            connection->msePos += MSE_VC_LENGTH + 6u;
+            connection->msePhase = MSE_A_PAD;
+            break;
+        case MSE_A_PAD:
+            if (connection->received < connection->msePos + connection->mseLength) {
+                return 1;
+            }
+            mseDecryptTo(connection, connection->msePos + connection->mseLength);
+            mseFinish(connection, connection->msePos + connection->mseLength);
+            return PEER_OK;
+
+        case MSE_B_WAIT_Y:
+            if (connection->received < CRYPTO_DH_LENGTH) {
+                return 1;
+            }
+            result = mseSendKey(connection);
+            if (result == PEER_OK) {
+                result = mseSecret(connection);
+            }
+            if (result != PEER_OK) {
+                return result;
+            }
+            mseHash("req1", connection->mseSecret, CRYPTO_DH_LENGTH, NULL, 0,
+                    connection->msePattern);
+            connection->msePos = CRYPTO_DH_LENGTH;
+            connection->msePhase = MSE_B_FIND_REQ1;
+            break;
+        case MSE_B_FIND_REQ1: {
+            struct peerListener *listener = connection->listener;
+            uint8_t              want[PARSER_SHA1_LENGTH];
+            uint8_t              candidate[PARSER_SHA1_LENGTH];
+            uint32_t             h;
+
+            if (!mseFind(connection, PARSER_SHA1_LENGTH, CRYPTO_DH_LENGTH + MSE_MAX_PAD, &at)) {
+                if (connection->received >= CRYPTO_DH_LENGTH + MSE_MAX_PAD + PARSER_SHA1_LENGTH) {
+                    setError(connection, "not a BitTorrent peer (no encrypted handshake)");
+                    return PEER_EPROTO;
+                }
+                return 1;
+            }
+            if (connection->received < at + 2u * PARSER_SHA1_LENGTH) {
+                return 1;
+            }
+            /* SHA1("req2", infohash) = what was sent ^ SHA1("req3", S) */
+            mseHash("req3", connection->mseSecret, CRYPTO_DH_LENGTH, NULL, 0, want);
+            for (i = 0; i < PARSER_SHA1_LENGTH; i++) {
+                want[i] ^= buffer[at + PARSER_SHA1_LENGTH + i];
+            }
+            for (h = 0; listener != NULL && h < listener->hashCount; h++) {
+                mseHash("req2", listener->hashes[h], PARSER_SHA1_LENGTH, NULL, 0, candidate);
+                if (memcmp(candidate, want, PARSER_SHA1_LENGTH) == 0) {
+                    break;
+                }
+            }
+            if (listener == NULL || h == listener->hashCount) {
+                setError(connection, "not serving that torrent (encrypted connection)");
+                return PEER_EHASH;
+            }
+            memcpy(connection->mseInfoHash, listener->hashes[h], PARSER_SHA1_LENGTH);
+            connection->mseHashKnown = 1;
+            mseKeys(connection, connection->mseInfoHash);
+            connection->msePos = at + 2u * PARSER_SHA1_LENGTH;
+            connection->mseDecrypted = connection->msePos;
+            connection->msePhase = MSE_B_PROVIDE;
+            break;
+        }
+        case MSE_B_PROVIDE:
+            if (connection->received < connection->msePos + MSE_VC_LENGTH + 6u) {
+                return 1;
+            }
+            mseDecryptTo(connection, connection->msePos + MSE_VC_LENGTH + 6u);
+            for (i = 0; i < MSE_VC_LENGTH; i++) {
+                if (buffer[connection->msePos + i] != 0) {
+                    setError(connection, "encrypted handshake: bad verification constant");
+                    return PEER_EPROTO;
+                }
+            }
+            connection->mseProvide = get32(buffer + connection->msePos + MSE_VC_LENGTH);
+            connection->mseLength = ((uint32_t)buffer[connection->msePos + MSE_VC_LENGTH + 4u] << 8) |
+                                    buffer[connection->msePos + MSE_VC_LENGTH + 5u];
+            if (connection->mseLength > MSE_MAX_PAD) {
+                setError(connection, "encrypted handshake: padding too long");
+                return PEER_EPROTO;
+            }
+            connection->msePos += MSE_VC_LENGTH + 6u;
+            connection->msePhase = MSE_B_PAD;
+            break;
+        case MSE_B_PAD:
+            if (connection->received < connection->msePos + connection->mseLength + 2u) {
+                return 1;
+            }
+            mseDecryptTo(connection, connection->msePos + connection->mseLength + 2u);
+            connection->msePos += connection->mseLength + 2u;
+            connection->mseLength = ((uint32_t)buffer[connection->msePos - 2u] << 8) |
+                                    buffer[connection->msePos - 1u];
+            if (connection->mseLength > MSE_MAX_IA) {
+                setError(connection, "encrypted handshake: initial payload too long");
+                return PEER_EPROTO;
+            }
+            connection->msePhase = MSE_B_IA;
+            break;
+        case MSE_B_IA: {
+            uint8_t reply[MSE_VC_LENGTH + 6u];
+
+            if (connection->received < connection->msePos + connection->mseLength) {
+                return 1;
+            }
+            mseDecryptTo(connection, connection->msePos + connection->mseLength);
+            if (connection->mseProvide & MSE_CRYPTO_RC4) {
+                connection->mseSelect = MSE_CRYPTO_RC4;
+            } else if ((connection->mseProvide & MSE_CRYPTO_PLAIN) &&
+                       peerEncryption != PEER_ENCRYPTION_REQUIRE) {
+                connection->mseSelect = MSE_CRYPTO_PLAIN;
+            } else {
+                setError(connection, "encrypted handshake: no method in common (%" PRIu32 ")",
+                         connection->mseProvide);
+                return PEER_EPROTO;
+            }
+            memset(reply, 0, sizeof(reply));        /* VC, select, len(PadD) = 0 */
+            put32(reply + MSE_VC_LENGTH, connection->mseSelect);
+            cryptoRc4Apply(&connection->rc4Out, reply, sizeof(reply));
+            result = sendBytes(connection, reply, sizeof(reply), NULL);
+            if (result != PEER_OK) {
+                setError(connection, "could not answer the encrypted handshake");
+                return result;
+            }
+            /* The payload is IA (the peer's handshake), then whatever followed. */
+            mseFinish(connection, connection->msePos);
+            return PEER_OK;
+        }
+        default:
+            return PEER_OK;
+        }
+    }
+}
+
+/*
+ * Incoming, nothing known yet: plain BitTorrent or encrypted? 1 to wait for
+ * more bytes, PEER_OK once decided (msePhase set if encrypted), or an error
+ * if our policy refuses it.
+ */
+static int32_t decideIncoming(peerConnection *connection)
+{
+    uint32_t compare = (connection->received > 1u) ? connection->received - 1u : 0u;
+    int      plain;
+
+    if (compare > PEER_PROTOCOL_LENGTH) {
+        compare = PEER_PROTOCOL_LENGTH;
+    }
+    plain = connection->buffer[0] == PEER_PROTOCOL_LENGTH &&
+            memcmp(connection->buffer + 1, PEER_PROTOCOL_NAME, compare) == 0;
+    if (plain && compare < PEER_PROTOCOL_LENGTH) {
+        return 1;                                   /* could still be either */
+    }
+    connection->mseDecided = 1;
+    if (plain) {
+        if (peerEncryption == PEER_ENCRYPTION_REQUIRE) {
+            setError(connection, "unencrypted connection refused (encryption is required)");
+            return PEER_ECRYPTO;
+        }
+        return PEER_OK;
+    }
+    if (peerEncryption == PEER_ENCRYPTION_OFF) {
+        setError(connection, "not a BitTorrent peer, or an encrypted connection "
+                 "(encryption is off)");
+        return PEER_EPROTO;
+    }
+    connection->msePhase = MSE_B_WAIT_Y;
+    return PEER_OK;
+}
+
+/* The status to report when an outgoing exchange is cut short. */
+static int32_t mseCutShort(peerConnection *connection, int32_t status, const char *what)
+{
+    if (connection->mseInitiator && connection->msePhase != MSE_NONE) {
+        setError(connection, "peer did not accept an encrypted connection (%s)", what);
+        return PEER_ECRYPTO;
+    }
+    return status;
+}
+
 static void onAlloc(uv_handle_t *handle, size_t suggested, uv_buf_t *buffer)
 {
     peerConnection *connection = handle->data;
@@ -731,12 +1218,39 @@ static void onRead(uv_stream_t *stream, ssize_t count, const uv_buf_t *buffer)
         return;
     }
     if (count > 0) {
+        if (connection->rc4Active) {
+            cryptoRc4Apply(&connection->rc4In, connection->buffer + connection->received,
+                           (size_t)count);
+        }
         connection->received += (uint32_t)count;
         connection->lastReceive = uv_now(peerModule.loop);
         if (connection->handshakeDone) {
             connection->bytesReceived += (uint64_t)count;
             processMessages(connection);
             return;
+        }
+        if (connection->incoming && !connection->accepted && !connection->mseDecided) {
+            result = decideIncoming(connection);
+            if (result == 1) {
+                return;
+            }
+            if (result != PEER_OK) {
+                terminate(connection, result);
+                return;
+            }
+        }
+        if (connection->msePhase != MSE_NONE) {
+            result = mseProcess(connection);
+            if (result == 1) {
+                return;
+            }
+            if (result != PEER_OK) {
+                terminate(connection, result);
+                return;
+            }
+            if (connection->received == 0) {
+                return;                             /* the handshake comes next */
+            }
         }
         if (connection->incoming && !connection->accepted) {
             result = routeIncoming(connection);
@@ -761,17 +1275,19 @@ static void onRead(uv_stream_t *stream, ssize_t count, const uv_buf_t *buffer)
     } else if (count == UV_EOF) {
         if (connection->handshakeDone) {
             setError(connection, "peer closed the connection");
-        } else {
+        } else if (connection->msePhase == MSE_NONE) {
             captureRemote(connection);
             setError(connection, "peer closed the connection during the handshake "
                      "(after %" PRIu32 " bytes)", connection->received);
+        } else {
+            setError(connection, "peer closed the connection during the encrypted handshake");
         }
-        terminate(connection, PEER_ECLOSED);
+        terminate(connection, mseCutShort(connection, PEER_ECLOSED, "it closed the connection"));
     } else if (count == UV_ENOBUFS) {
         terminate(connection, PEER_ENOMEM);
     } else if (count < 0) {
         setError(connection, "receive failed: %s", uv_strerror((int)count));
-        terminate(connection, PEER_ERROR);
+        terminate(connection, mseCutShort(connection, PEER_ERROR, uv_strerror((int)count)));
     }
 }
 
@@ -792,9 +1308,20 @@ static void onConnect(uv_connect_t *connect, int status)
     }
     uv_tcp_nodelay(&connection->tcp, 1);            /* small messages: no batching delay */
 
-    /* Send our handshake and start reading theirs; peers may send theirs
-     * before or after receiving ours. */
-    result = sendBytes(connection, connection->handshake, PEER_HANDSHAKE_LENGTH, NULL);
+    /* Send our handshake (or start the encrypted exchange, which carries it)
+     * and start reading theirs; peers may send theirs before or after
+     * receiving ours. */
+    if (peerEncryption != PEER_ENCRYPTION_OFF && !connection->plaintextOnly) {
+        connection->mseInitiator = 1;
+        connection->msePhase = MSE_A_WAIT_Y;
+        result = mseSendKey(connection);
+        if (connection->timeoutSeconds == 0 || connection->timeoutSeconds > MSE_REPLY_SECONDS) {
+            uv_timer_stop(&connection->timer);
+            uv_timer_start(&connection->timer, onTimeout, (uint64_t)MSE_REPLY_SECONDS * 1000u, 0);
+        }
+    } else {
+        result = sendBytes(connection, connection->handshake, PEER_HANDSHAKE_LENGTH, NULL);
+    }
     if (result != PEER_OK) {
         setError(connection, "could not send the handshake");
         terminate(connection, result);
@@ -919,6 +1446,30 @@ int32_t peerListen(int family, uint16_t port, peerIncomingCallback callback, voi
                                : ((struct sockaddr_in6 *)&local)->sin6_port);
     *handle = listener;
     return PEER_OK;
+}
+
+int32_t peerListenerAddInfoHash(peerListener *listener, const uint8_t infoHash[PARSER_SHA1_LENGTH])
+{
+    if (listener == NULL || infoHash == NULL) {
+        return PEER_EINVAL;
+    }
+    if (listener->hashCount == PEER_LISTENER_MAX_HASHES) {
+        return PEER_ENOMEM;
+    }
+    memcpy(listener->hashes[listener->hashCount++], infoHash, PARSER_SHA1_LENGTH);
+    return PEER_OK;
+}
+
+void peerSetEncryption(uint8_t mode)
+{
+    if (mode <= PEER_ENCRYPTION_REQUIRE) {
+        peerEncryption = mode;
+    }
+}
+
+uint8_t peerGetEncryption(void)
+{
+    return peerEncryption;
 }
 
 uint16_t peerListenerPort(const peerListener *listener)
@@ -1105,6 +1656,7 @@ int32_t peerGetState(peerConnection *connection, peerRemoteState *state)
     memcpy(state->peerId, connection->remotePeerId, PEER_ID_LENGTH);
     state->extensions = connection->extensions;
     state->incoming = connection->incoming;
+    state->encryption = connection->encryption;
     state->sendQueued = connection->tcpOpen
         ? (uint64_t)uv_stream_get_write_queue_size((const uv_stream_t *)&connection->tcp) : 0u;
     return PEER_OK;
@@ -1150,6 +1702,7 @@ const char *peerStatusString(int32_t status)
     case PEER_EHASH:     return "Different torrent";
     case PEER_ESELF:     return "Connected to ourselves";
     case PEER_EADDRINUSE: return "Port already in use";
+    case PEER_ECRYPTO:    return "Encrypted connection refused";
     case PEER_ECLOSED:   return "Connection closed";
     default:             return "Unknown status";
     }

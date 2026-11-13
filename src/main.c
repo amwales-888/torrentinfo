@@ -1308,6 +1308,7 @@ static uint32_t        settingsMaxPeers;
 static uint32_t        settingsUploadSlots;
 static uint64_t        maxDownloadRate;     /* -d, or max_download_rate; 0: none */
 static uint64_t        maxUploadRate;       /* -u, or max_upload_rate            */
+static uint8_t         encryptionMode = CONFIG_ENCRYPTION_PREFER;   /* -E, encryption */
 
 static int dataFilePath(const char *subdirectory, const char *name, char *path, size_t size)
 {
@@ -1474,17 +1475,18 @@ static void onProgressTick(uv_timer_t *timer)
                 sizeof(down));
     formatBytes((progress.bytesUploaded - run->reportSent) * 1000u / elapsed, up, sizeof(up));
     if (progress.seeding) {
-        printf("  seeding  up %9s/s  peers %" PRIu32 " connected (%" PRIu32 " incoming),"
-               " %" PRIu32 " interested, uploading to %" PRIu32 "\n",
-               up, progress.peersConnected, progress.peersIncoming, progress.peersInterested,
-               progress.peersUploading);
+        printf("  seeding  up %9s/s  peers %" PRIu32 " connected (%" PRIu32 " incoming, %"
+               PRIu32 " encrypted), %" PRIu32 " interested, uploading to %" PRIu32 "\n",
+               up, progress.peersConnected, progress.peersIncoming, progress.peersEncrypted,
+               progress.peersInterested, progress.peersUploading);
     } else {
         printf("  %5.1f%%  %" PRIu32 "/%" PRIu32 "  down %9s/s  up %9s/s  peers %" PRIu32
-               " (%" PRIu32 " in), %" PRIu32 " unchoking us, %" PRIu32 " sending, uploading to %"
-               PRIu32 "%s\n",
+               " (%" PRIu32 " in, %" PRIu32 " enc), %" PRIu32 " unchoking us, %" PRIu32
+               " sending, uploading to %" PRIu32 "%s\n",
                (progress.wanted > 0) ? 100.0 * progress.done / progress.wanted : 100.0,
                progress.done, progress.wanted, down, up, progress.peersConnected,
-               progress.peersIncoming, progress.peersUnchoking, progress.peersDownloading,
+               progress.peersIncoming, progress.peersEncrypted, progress.peersUnchoking,
+               progress.peersDownloading,
                progress.peersUploading, progress.endgame ? "  [endgame]" : "");
     }
     if (progress.peersBlocked != run->reportBlocked) {
@@ -3120,8 +3122,8 @@ static void usage(const char *program)
             "       %s -o <output.torrent> [options] <file>...\n"
             "       %s -t [-T seconds] [-C ca.pem] [-I interface] <file.torrent>\n"
             "       %s -P [-T seconds] [-C ca.pem] [-I interface] <file.torrent>\n"
-            "       %s -D [-S] [-L port] [-N] [-X] [-d rate] [-u rate] [-f list] [-F glob]...\n"
-            "            [-O dir] [-i piece]\n"
+            "       %s -D [-S] [-L port] [-N] [-X] [-E mode] [-d rate] [-u rate] [-f list]\n"
+            "            [-F glob]... [-O dir] [-i piece]\n"
             "            [-T seconds] [-C ca.pem] [-I interface] <file.torrent | magnet-link>\n"
             "       %s -V [-O dir] [-f list] [-F glob]... <file.torrent>\n"
             "       %s -m <file.torrent>\n"
@@ -3152,6 +3154,8 @@ static void usage(const char *program)
             "            listing shows: 1,3,5-7\n"
             "  -F glob   with -D or -V: only files whose path or name matches, like\n"
             "            '*.mkv' (any case; may be repeated, and combined with -f)\n"
+            "  -E mode   with -D: protocol encryption: prefer (the default: fall back\n"
+            "            to plain for peers without it), require, or off\n"
             "  -d rate   with -D: download no faster than this, in KiB/s or with a\n"
             "            unit: 500k, 1.5M (0: no limit)\n"
             "  -u rate   with -D: upload no faster than this (same units)\n"
@@ -3192,6 +3196,7 @@ int main(int argc, char **argv)
     uint8_t         dhtGiven = 0;       /* -X */
     uint8_t         downRateGiven = 0;  /* -d */
     uint8_t         upRateGiven = 0;    /* -u */
+    uint8_t         encryptionGiven = 0;    /* -E */
     const char     *interfaceSpec = NULL;   /* -I */
     netBinding      binding;
     uint8_t         directoryGiven = 0; /* -O */
@@ -3242,7 +3247,7 @@ int main(int argc, char **argv)
     options.trackers = (const char *const *)trackers;
     options.webSeeds = (const char *const *)webSeeds;
 
-    while ((option = nextOption(argc, argv, "o:a:w:c:n:l:ptPDVSNXmL:O:i:T:C:I:d:u:f:F:h")) != -1) {
+    while ((option = nextOption(argc, argv, "o:a:w:c:n:l:ptPDVSNXmL:O:i:T:C:I:d:u:f:F:E:h")) != -1) {
         switch (option) {
         case 'o':
             outputPath = optionValue;
@@ -3330,6 +3335,14 @@ int main(int argc, char **argv)
             break;
         case 'f':
             selectList = optionValue;
+            break;
+        case 'E':
+            if (!configParseEncryption(optionValue, &encryptionMode)) {
+                fprintf(stderr, "-E: use prefer, require or off, not %s\n", optionValue);
+                goto cleanup;
+            }
+            encryptionGiven = 1;
+            downloadOnly = 1;
             break;
         case 'F':
             if (selectPatternCount == SELECT_MAX_PATTERNS) {
@@ -3436,6 +3449,11 @@ int main(int argc, char **argv)
         if (!upRateGiven && (settingsFile.set & CONFIG_SET_MAX_UPLOAD_RATE) != 0) {
             maxUploadRate = settingsFile.maxUploadRate;
         }
+        if (!encryptionGiven && (settingsFile.set & CONFIG_SET_ENCRYPTION) != 0) {
+            encryptionMode = settingsFile.encryption;
+        }
+        /* CONFIG_ENCRYPTION_* and PEER_ENCRYPTION_* have the same values. */
+        peerSetEncryption(encryptionMode);
         if (mode == MODE_DOWNLOAD) {
             if (!directoryGiven && (settingsFile.set & CONFIG_SET_DOWNLOAD_DIRECTORY) != 0) {
                 outputDirectory = settingsFile.downloadDirectory;

@@ -138,6 +138,8 @@ typedef struct downloadPeer {
 
     /* Uploading to the peer */
     uint8_t                 incoming;       /* it connected to us           */
+    uint8_t                 plaintext;      /* refused encryption: connect plain */
+    uint8_t                 encryption;     /* PEER_ENCRYPTED_* when open   */
     uint8_t                 peerInterested; /* it wants our pieces          */
     uint8_t                 amChoking;      /* we are choking it            */
     uint8_t                 selected;       /* scratch, for rechoke()       */
@@ -1459,6 +1461,18 @@ static void onPeerHandshake(void *privateArg, peerConnection *connection,
     uint32_t      i;
 
     dl->connecting--;
+    if (result->status == PEER_ECRYPTO && !peer->incoming && !peer->plaintext &&
+        peerGetEncryption() == PEER_ENCRYPTION_PREFER) {
+        /* It does not do encryption: try again, plain, straight away. */
+        peerClose(connection);
+        peer->connection = NULL;
+        peer->plaintext = 1;
+        peer->attempts--;
+        peer->state = DOWNLOAD_PEER_QUEUED;
+        peer->retryAt = 0;
+        connectMore(dl);
+        return;
+    }
     if (result->status != PEER_OK) {
         peerClose(connection);
         peer->connection = NULL;
@@ -1492,6 +1506,7 @@ static void onPeerHandshake(void *privateArg, peerConnection *connection,
     peer->uploadedWindow = 0;
     peer->downloadedWindow = 0;
     memcpy(peer->remoteId, result->peerId, PEER_ID_LENGTH);
+    peer->encryption = result->encryption;
     peer->extended = (uint8_t)((result->extensions & PEER_EXTENSION_PROTOCOL) != 0);
     peer->pexId = 0;
     peer->metadataId = 0;
@@ -1526,8 +1541,10 @@ static void onPeerHandshake(void *privateArg, peerConnection *connection,
         client[i] = (c >= 0x20 && c < 0x7f) ? (char)c : '.';
     }
     client[i < 8u ? i : 8u] = '\0';
-    emit(dl, "%s: connected%s (peer id %s...)", peer->where,
-         peer->incoming ? " (incoming)" : "", client);
+    emit(dl, "%s: connected%s%s (peer id %s...)", peer->where,
+         peer->incoming ? " (incoming)" : "",
+         (peer->encryption == PEER_ENCRYPTED_RC4) ? ", encrypted"
+         : (peer->encryption == PEER_ENCRYPTED_HEADER) ? ", handshake encrypted" : "", client);
 }
 
 /* ------------------------------------------------------------------------ */
@@ -2070,10 +2087,11 @@ static void closeListeners(download *dl)
 /* Fill free connection slots from the queue. */
 static void connectMore(download *dl)
 {
-    peerCallbacks callbacks = { onPeerHandshake, onPeerMessage, onPeerClosed, onPeerDrain };
-    downloadPeer *peer;
-    uint64_t      now = uv_now(dl->loop);
-    int32_t       status;
+    peerCallbacks      callbacks = { onPeerHandshake, onPeerMessage, onPeerClosed, onPeerDrain };
+    peerConnectOptions options;
+    downloadPeer      *peer;
+    uint64_t           now = uv_now(dl->loop);
+    int32_t            status;
 
     if (stopped(dl) || !dl->ready) {
         return;
@@ -2086,7 +2104,9 @@ static void connectMore(download *dl)
             continue;
         }
         peer->attempts++;
-        status = peerConnect((const struct sockaddr *)&peer->address, &dl->connectOptions,
+        options = dl->connectOptions;
+        options.plaintext = peer->plaintext;
+        status = peerConnect((const struct sockaddr *)&peer->address, &options,
                              &callbacks, peer, &peer->connection);
         if (status == PEER_OK) {
             peer->state = DOWNLOAD_PEER_CONNECTING;
@@ -2455,6 +2475,9 @@ int32_t downloadBegin(uv_loop_t *loop, parserContext *context, const parserTorre
             if (v4 == PEER_OK || v6 == PEER_OK) {
                 dl->listenPort = port;
             }
+            /* So that encrypted connections can be recognised. */
+            peerListenerAddInfoHash(dl->listeners[0], torrent->infoHash);
+            peerListenerAddInfoHash(dl->listeners[1], torrent->infoHash);
             break;
         }
     }
@@ -2562,6 +2585,7 @@ void downloadGetProgress(const download *dl, downloadProgress *progress)
             progress->peersInterested += peer->peerInterested ? 1u : 0u;
             progress->peersUploading += peer->amChoking ? 0u : 1u;
             progress->peersIncoming += peer->incoming ? 1u : 0u;
+            progress->peersEncrypted += (peer->encryption != PEER_ENCRYPTED_NONE) ? 1u : 0u;
             break;
         default:
             break;

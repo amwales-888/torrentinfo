@@ -49,6 +49,7 @@ typedef struct metaPeer {
     uint8_t                 metadataId;     /* its id for ut_metadata          */
     uint8_t                 attempts;       /* connections made                */
     uint8_t                 refused;        /* said it has no metadata to give */
+    uint8_t                 plaintext;      /* refused encryption: connect plain */
     uint64_t                retryAt;        /* uv_now() before which to wait   */
     uint32_t                requests[METADATA_REQUESTS_PER_PEER];
     uint32_t                requestCount;
@@ -441,6 +442,17 @@ static void onHandshake(void *privateArg, peerConnection *connection,
     size_t             length;
 
     f->connecting--;
+    if (result->status == PEER_ECRYPTO && !peer->plaintext &&
+        peerGetEncryption() == PEER_ENCRYPTION_PREFER) {
+        peerClose(connection);                      /* try again, plain, at once */
+        peer->connection = NULL;
+        peer->plaintext = 1;
+        peer->attempts--;
+        peer->state = PEER_QUEUED;
+        peer->retryAt = 0;
+        connectMore(f);
+        return;
+    }
     if (result->status != PEER_OK) {
         peerClose(connection);
         peer->connection = NULL;
@@ -501,9 +513,10 @@ static void onClosed(void *privateArg, peerConnection *connection, int32_t statu
 
 static void connectMore(metadataFetch *f)
 {
-    peerCallbacks callbacks = { onHandshake, onMessage, onClosed, NULL };
-    metaPeer     *peer;
-    uint64_t      now = uv_now(f->loop);
+    peerCallbacks      callbacks = { onHandshake, onMessage, onClosed, NULL };
+    peerConnectOptions options;
+    metaPeer          *peer;
+    uint64_t           now = uv_now(f->loop);
 
     TAILQ_FOREACH(peer, &f->peers, entries) {
         if (stopped(f) || f->connecting + f->open >= f->maxPeers) {
@@ -513,7 +526,9 @@ static void connectMore(metadataFetch *f)
             continue;
         }
         peer->attempts++;
-        if (peerConnect((const struct sockaddr *)&peer->address, &f->connectOptions, &callbacks,
+        options = f->connectOptions;
+        options.plaintext = peer->plaintext;
+        if (peerConnect((const struct sockaddr *)&peer->address, &options, &callbacks,
                         peer, &peer->connection) == PEER_OK) {
             peer->state = PEER_CONNECTING;
             f->connecting++;

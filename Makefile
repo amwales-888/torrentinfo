@@ -25,6 +25,8 @@ INCLUDEDIR := $(PREFIX)/include/torrentinfo
 PROGRAM    := torrentinfo
 LIBRARY    := libtorrentinfo.a
 
+SRCDIR      := src
+
 LIB_SOURCES := platform.c parser.c encoder.c http.c udp.c tracker.c message.c peer.c piece.c storage.c download.c
 APP_SOURCES := main.c
 HEADERS     := queue.h platform.h parser.h encoder.h http.h udp.h tracker.h message.h peer.h piece.h storage.h download.h
@@ -48,7 +50,8 @@ CFLAGS   += -std=c99 -Wall -Wextra -Wpedantic -Wshadow -Wconversion
 CFLAGS   += -MMD -MP $(PKG_CFLAGS)
 LDLIBS   += $(PKG_LIBS)
 
-# Release builds go in build/release, debug builds in build/debug.
+# Sources are in src/; release builds go in build/release, debug builds in
+# build/debug.
 BUILD := build/release
 ifeq ($(MAKECMDGOALS),debug)
   BUILD   := build/debug
@@ -92,7 +95,7 @@ $(BUILD)/$(LIBRARY): $(LIB_OBJECTS)
 	$(Q)rm -f $@
 	$(Q)$(AR) rcs $@ $^
 
-$(BUILD)/%.o: %.c | $(BUILD)
+$(BUILD)/%.o: $(SRCDIR)/%.c | $(BUILD)
 	$(call say,CC,$<)
 	$(Q)$(CC) $(CPPFLAGS) $(CFLAGS) -c -o $@ $<
 
@@ -103,7 +106,7 @@ install: all
 	install -d $(DESTDIR)$(BINDIR) $(DESTDIR)$(LIBDIR) $(DESTDIR)$(INCLUDEDIR)
 	install -m 755 $(BUILD)/$(PROGRAM) $(DESTDIR)$(BINDIR)/$(PROGRAM)
 	install -m 644 $(BUILD)/$(LIBRARY) $(DESTDIR)$(LIBDIR)/$(LIBRARY)
-	install -m 644 $(HEADERS) $(DESTDIR)$(INCLUDEDIR)/
+	install -m 644 $(addprefix $(SRCDIR)/,$(HEADERS)) $(DESTDIR)$(INCLUDEDIR)/
 
 uninstall:
 	rm -f $(DESTDIR)$(BINDIR)/$(PROGRAM)

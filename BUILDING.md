@@ -1,9 +1,10 @@
 # Building torrentinfo
 
 The library and the `torrentinfo` program build on Linux and Windows from the
-same sources. Platform differences are confined to `platform.c` (file access),
-the certificate loading in `http.c`, and a few `#ifdef _WIN32` lines in
-`main.c`. Lists use the bundled 4.4BSD `queue.h` on every platform.
+same sources, which are all in `src/`; build output goes in `build/`.
+Platform differences are confined to `src/platform.c` (file access), the
+certificate loading in `src/http.c`, and a few `#ifdef _WIN32` lines in
+`src/main.c`. Lists use the bundled 4.4BSD `queue.h` on every platform.
 
 Dependencies: **libuv** and **OpenSSL 3**.
 
@@ -106,7 +107,8 @@ project's *Properties > Debugging > Command Arguments*.
   `< > : " | ? *` and control characters become `_`, a trailing `.` or space
   becomes `_`, and reserved names such as `CON` or `LPT1` get a `_` prefix.
 - **Using the library in your own project:** add `libtorrentinfo.vcxproj` as
-  a project reference, enable vcpkg manifest mode, define
+  a project reference, add `src` to *C/C++ > Additional Include
+  Directories*, enable vcpkg manifest mode, define
   `WIN32_LEAN_AND_MEAN`, and link the Windows libraries listed in
   `torrentinfo.vcxproj` (*Linker > Input*).
 - **Other architectures:** only x64 is configured. To add ARM64, add an

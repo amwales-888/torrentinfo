@@ -14,75 +14,75 @@
     </Filter>
   </ItemGroup>
   <ItemGroup>
-    <ClCompile Include="platform.c">
+    <ClCompile Include="src\platform.c">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="parser.c">
+    <ClCompile Include="src\parser.c">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="encoder.c">
+    <ClCompile Include="src\encoder.c">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="http.c">
+    <ClCompile Include="src\http.c">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="udp.c">
+    <ClCompile Include="src\udp.c">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="tracker.c">
+    <ClCompile Include="src\tracker.c">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="message.c">
+    <ClCompile Include="src\message.c">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="peer.c">
+    <ClCompile Include="src\peer.c">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="piece.c">
+    <ClCompile Include="src\piece.c">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="storage.c">
+    <ClCompile Include="src\storage.c">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="download.c">
+    <ClCompile Include="src\download.c">
       <Filter>Source Files</Filter>
     </ClCompile>
   </ItemGroup>
   <ItemGroup>
-    <ClInclude Include="queue.h">
+    <ClInclude Include="src\queue.h">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="platform.h">
+    <ClInclude Include="src\platform.h">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="parser.h">
+    <ClInclude Include="src\parser.h">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="encoder.h">
+    <ClInclude Include="src\encoder.h">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="http.h">
+    <ClInclude Include="src\http.h">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="udp.h">
+    <ClInclude Include="src\udp.h">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="tracker.h">
+    <ClInclude Include="src\tracker.h">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="message.h">
+    <ClInclude Include="src\message.h">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="peer.h">
+    <ClInclude Include="src\peer.h">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="piece.h">
+    <ClInclude Include="src\piece.h">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="storage.h">
+    <ClInclude Include="src\storage.h">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="download.h">
+    <ClInclude Include="src\download.h">
       <Filter>Header Files</Filter>
     </ClInclude>
   </ItemGroup>

@@ -83,31 +83,31 @@
   </ItemDefinitionGroup>
 
   <ItemGroup>
-    <ClCompile Include="platform.c" />
-    <ClCompile Include="parser.c" />
-    <ClCompile Include="encoder.c" />
-    <ClCompile Include="http.c" />
-    <ClCompile Include="udp.c" />
-    <ClCompile Include="tracker.c" />
-    <ClCompile Include="message.c" />
-    <ClCompile Include="peer.c" />
-    <ClCompile Include="piece.c" />
-    <ClCompile Include="storage.c" />
-    <ClCompile Include="download.c" />
+    <ClCompile Include="src\platform.c" />
+    <ClCompile Include="src\parser.c" />
+    <ClCompile Include="src\encoder.c" />
+    <ClCompile Include="src\http.c" />
+    <ClCompile Include="src\udp.c" />
+    <ClCompile Include="src\tracker.c" />
+    <ClCompile Include="src\message.c" />
+    <ClCompile Include="src\peer.c" />
+    <ClCompile Include="src\piece.c" />
+    <ClCompile Include="src\storage.c" />
+    <ClCompile Include="src\download.c" />
   </ItemGroup>
   <ItemGroup>
-    <ClInclude Include="queue.h" />
-    <ClInclude Include="platform.h" />
-    <ClInclude Include="parser.h" />
-    <ClInclude Include="encoder.h" />
-    <ClInclude Include="http.h" />
-    <ClInclude Include="udp.h" />
-    <ClInclude Include="tracker.h" />
-    <ClInclude Include="message.h" />
-    <ClInclude Include="peer.h" />
-    <ClInclude Include="piece.h" />
-    <ClInclude Include="storage.h" />
-    <ClInclude Include="download.h" />
+    <ClInclude Include="src\queue.h" />
+    <ClInclude Include="src\platform.h" />
+    <ClInclude Include="src\parser.h" />
+    <ClInclude Include="src\encoder.h" />
+    <ClInclude Include="src\http.h" />
+    <ClInclude Include="src\udp.h" />
+    <ClInclude Include="src\tracker.h" />
+    <ClInclude Include="src\message.h" />
+    <ClInclude Include="src\peer.h" />
+    <ClInclude Include="src\piece.h" />
+    <ClInclude Include="src\storage.h" />
+    <ClInclude Include="src\download.h" />
   </ItemGroup>
   <ItemGroup>
     <None Include="vcpkg.json" />

@@ -96,6 +96,8 @@
     <ClCompile Include="src\storage.c" />
     <ClCompile Include="src\download.c" />
     <ClCompile Include="src\announce.c" />
+    <ClCompile Include="src\extension.c" />
+    <ClCompile Include="src\portmap.c" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="src\queue.h" />
@@ -112,6 +114,8 @@
     <ClInclude Include="src\storage.h" />
     <ClInclude Include="src\download.h" />
     <ClInclude Include="src\announce.h" />
+    <ClInclude Include="src\extension.h" />
+    <ClInclude Include="src\portmap.h" />
   </ItemGroup>
   <ItemGroup>
     <None Include="vcpkg.json" />

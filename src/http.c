@@ -768,32 +768,51 @@ static void onResolved(uv_getaddrinfo_t *resolver, int status, struct addrinfo *
     tcpConnectNext(request);
 }
 
-/* GET <path> HTTP/1.0 with the headers we always send. */
-static int32_t buildRequestText(httpRequest *request, const httpUrl *url)
+/* <method> <path> HTTP/1.0 with the headers we always send, any extra
+ * headers (each ending in CRLF), and for POST the body. */
+static int32_t buildRequestText(httpRequest *request, const httpUrl *url, const char *method,
+                                const char *contentType, const char *extraHeaders,
+                                const uint8_t *body, uint64_t bodyLength)
 {
     const char *slash = (url->pathLength == 0 || url->path[0] != '/') ? "/" : "";
+    char        length[64] = "";
     uint64_t    size = (uint64_t)url->pathLength + url->authorityLength +
-                       strlen(httpState.userAgent) + 128u;
+                       strlen(httpState.userAgent) + 256u +
+                       ((contentType != NULL) ? strlen(contentType) : 0u) +
+                       ((extraHeaders != NULL) ? strlen(extraHeaders) : 0u) + bodyLength;
     int         written;
 
+    if (body != NULL) {
+        snprintf(length, sizeof(length), "Content-Length: %llu\r\n",
+                 (unsigned long long)bodyLength);
+    }
     request->requestText = allocate(size);
     if (request->requestText == NULL) {
         return HTTP_ENOMEM;
     }
     written = snprintf(request->requestText, (size_t)size,
-                       "GET %s%.*s HTTP/1.0\r\n"
+                       "%s %s%.*s HTTP/1.0\r\n"
                        "Host: %.*s\r\n"
                        "User-Agent: %s\r\n"
                        "Accept: */*\r\n"
                        "Connection: close\r\n"
+                       "%s%s%s%s%s"
                        "\r\n",
-                       slash, (int)url->pathLength, url->path,
+                       method, slash, (int)url->pathLength, url->path,
                        (int)url->authorityLength, url->authority,
-                       httpState.userAgent);
-    if (written < 0 || (uint64_t)written >= size) {
+                       httpState.userAgent,
+                       (contentType != NULL) ? "Content-Type: " : "",
+                       (contentType != NULL) ? contentType : "",
+                       (contentType != NULL) ? "\r\n" : "",
+                       length,
+                       (extraHeaders != NULL) ? extraHeaders : "");
+    if (written < 0 || (uint64_t)written + bodyLength >= size) {
         return HTTP_EINVAL;
     }
-    request->requestLength = (uint64_t)written;
+    if (body != NULL && bodyLength > 0) {
+        memcpy(request->requestText + written, body, (size_t)bodyLength);
+    }
+    request->requestLength = (uint64_t)written + bodyLength;
     return HTTP_OK;
 }
 
@@ -1038,8 +1057,38 @@ int32_t httpInit(uv_loop_t *loop, parserContext *context, const httpConfig *conf
     return HTTP_OK;
 }
 
+static int32_t startRequest(const char *url, const char *method, const char *contentType,
+                            const char *extraHeaders, const uint8_t *body, uint64_t bodyLength,
+                            uint32_t timeoutSeconds, uint64_t maxResponse, httpCallback callback,
+                            void *privateArg, httpRequest **handle);
+
 int32_t httpGet(const char *url, uint32_t timeoutSeconds, uint64_t maxResponse,
                 httpCallback callback, void *privateArg, httpRequest **handle)
+{
+    return startRequest(url, "GET", NULL, NULL, NULL, 0, timeoutSeconds, maxResponse, callback,
+                        privateArg, handle);
+}
+
+int32_t httpPost(const char *url, const char *contentType, const char *extraHeaders,
+                 const uint8_t *body, uint64_t bodyLength, uint32_t timeoutSeconds,
+                 uint64_t maxResponse, httpCallback callback, void *privateArg,
+                 httpRequest **handle)
+{
+    if (handle != NULL) {
+        *handle = NULL;
+    }
+    if (body == NULL && bodyLength > 0) {
+        return HTTP_EINVAL;
+    }
+    return startRequest(url, "POST", contentType, extraHeaders,
+                        (body != NULL) ? body : (const uint8_t *)"", bodyLength, timeoutSeconds,
+                        maxResponse, callback, privateArg, handle);
+}
+
+static int32_t startRequest(const char *url, const char *method, const char *contentType,
+                            const char *extraHeaders, const uint8_t *body, uint64_t bodyLength,
+                            uint32_t timeoutSeconds, uint64_t maxResponse, httpCallback callback,
+                            void *privateArg, httpRequest **handle)
 {
     httpRequest    *request;
     httpUrl         parts;
@@ -1072,7 +1121,10 @@ int32_t httpGet(const char *url, uint32_t timeoutSeconds, uint64_t maxResponse,
     request->maxResponse = (maxResponse != 0) ? maxResponse : HTTP_DEFAULT_MAX_RESPONSE;
     request->secure = schemeIs(&parts, "https");
     request->host = copyBytes(parts.host, parts.hostLength);
-    result = (request->host != NULL) ? buildRequestText(request, &parts) : HTTP_ENOMEM;
+    result = (request->host != NULL)
+                 ? buildRequestText(request, &parts, method, contentType, extraHeaders, body,
+                                    bodyLength)
+                 : HTTP_ENOMEM;
     if (result != HTTP_OK) {
         freeRequest(request);                       /* no handles open yet */
         return result;

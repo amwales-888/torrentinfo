@@ -114,6 +114,9 @@ typedef struct peerConnectOptions {
                                                piece indexes                    */
     uint32_t    timeoutSeconds;             /* for connecting and the handshake;
                                                0 means no limit                 */
+    uint32_t    extensions;                 /* PEER_EXTENSION_* we advertise in
+                                               the handshake (only _PROTOCOL so
+                                               far); 0 for none                  */
 } peerConnectOptions;
 
 /* The outcome of a handshake. Valid only during the callback. */

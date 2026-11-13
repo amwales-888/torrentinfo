@@ -162,6 +162,16 @@ void httpShutdown(void);
  */
 int32_t httpUrlParse(const char *url, httpUrl *parts);
 
+/*
+ * As httpGet(), but a POST with 'body' (copied). 'contentType' (e.g.
+ * "text/xml; charset=\"utf-8\"") may be NULL; 'extraHeaders' are added as
+ * given, each ending in "\r\n" (e.g. "SOAPAction: \"...\"\r\n"), or NULL.
+ */
+int32_t httpPost(const char *url, const char *contentType, const char *extraHeaders,
+                 const uint8_t *body, uint64_t bodyLength, uint32_t timeoutSeconds,
+                 uint64_t maxResponse, httpCallback callback, void *privateArg,
+                 httpRequest **handle);
+
 /* Human-readable description of an HTTP_* status. Never NULL. */
 const char *httpStatusString(int32_t status);
 

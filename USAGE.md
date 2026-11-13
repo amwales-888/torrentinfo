@@ -11,7 +11,7 @@ torrentinfo file.torrent
 torrentinfo -o new.torrent [-a url]... [-w url]... [-c text] [-n name] [-l size] [-p] file...
 torrentinfo -t [-T seconds] [-C certs.pem] [-I interface] file.torrent
 torrentinfo -P [-T seconds] [-C certs.pem] [-I interface] file.torrent
-torrentinfo -D [-S] [-L port] [-O folder] [-i piece] [-T seconds] [-C certs.pem]
+torrentinfo -D [-S] [-L port] [-N] [-O folder] [-i piece] [-T seconds] [-C certs.pem]
                [-I interface] file.torrent
 torrentinfo -V [-O folder] file.torrent
 ```
@@ -116,6 +116,11 @@ The program works in one of six ways, chosen by the first option.
   the program then only makes connections itself, which still works for
   downloading. See NOTES about firewalls.
 
+`-N`
+: Don't ask the router to forward the port. Normally the program asks the
+  router (using UPnP or NAT-PMP) to let other peers reach you, and removes
+  the forwarding again when it ends.
+
 `-i piece`
 : Download just one piece, given by its number (starting at 0). Mostly
   useful for testing.
@@ -171,14 +176,19 @@ same command again continues the download.
 
 **Firewalls and routers.** Other peers can connect to you only if the port
 (6881 unless you chose another with `-L`) is allowed through your firewall
-and, on a home network, forwarded by your router to your computer. Windows
-asks about this the first time. Without it, downloading still works; you
-just meet fewer peers and can share with fewer people.
+and, on a home network, forwarded by your router to your computer. The
+program asks the router to do this itself and says whether it worked, for
+example "router 192.168.1.1 forwards port 6881 to us (UPnP)". If your router
+has this switched off, you can turn on UPnP in its settings or forward the
+port by hand. Windows asks about the firewall the first time. Without any of
+this, downloading still works; you just meet fewer peers and can share with
+fewer people.
 
-**Finding peers.** Peers come from the torrent's trackers and from people
-who connect to you. The program does not yet use the tracker-less ways of
-finding peers (DHT and peer exchange), nor magnet links: you need the
-*.torrent* file.
+**Finding peers.** Peers come from the torrent's trackers, from people who
+connect to you, and from the peers themselves, which tell each other about
+the other peers they know ("peer exchange"). Private torrents only use their
+trackers. The program does not yet use DHT, the tracker-less way of finding
+peers, nor magnet links: you need the *.torrent* file.
 
 **Bad data.** Every piece is checked when it arrives. A peer that sends
 damaged data is disconnected and not used again, and the piece is fetched

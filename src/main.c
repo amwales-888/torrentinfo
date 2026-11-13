@@ -31,6 +31,7 @@
 #include "net.h"
 #include "parser.h"
 #include "peer.h"
+#include "portmap.h"
 #include "piece.h"
 #include "platform.h"
 #include "storage.h"
@@ -1106,6 +1107,7 @@ typedef struct downloadRun {
     uv_loop_t      *loop;
     download       *transfer;
     announce       *trackers;           /* NULL if the torrent lists none   */
+    portmap        *mapper;             /* router port forwarding, or NULL  */
     uv_timer_t      timer;              /* progress line                    */
     uv_signal_t     interrupt;          /* Ctrl-C                           */
 #ifndef _WIN32
@@ -1222,10 +1224,34 @@ static void onAnnounceResult(void *privateArg, const char *url, uint32_t event, 
     fflush(stdout);
 }
 
+/* --- Router port forwarding -------------------------------------------- */
+
+static void onPortmap(void *privateArg, portmap *mapper, const portmapResult *result)
+{
+    (void)privateArg;
+    (void)mapper;
+    if (result->status == PORTMAP_OK) {
+        printf("  router %s forwards port %u to us (%s)", result->router,
+               (unsigned)result->externalPort, portmapMethodName(result->method));
+        if (result->externalAddress[0] != '\0') {
+            printf("; our public address is %s", result->externalAddress);
+        }
+        printf("\n");
+    } else {
+        printf("  port forwarding: %s; peers outside your network may not reach you\n",
+               result->message);
+    }
+    fflush(stdout);
+}
+
 /* --- Shutting down ------------------------------------------------------ */
 
 static void closeRun(downloadRun *run)
 {
+    if (run->mapper != NULL) {
+        portmapEnd(run->mapper);                    /* removes the forwarding */
+        run->mapper = NULL;
+    }
     if (run->trackers != NULL) {
         announceEnd(run->trackers);
         run->trackers = NULL;
@@ -1415,7 +1441,8 @@ static void onDownloadFinished(void *privateArg, download *transfer, int32_t sta
  */
 static int downloadTorrent(uv_loop_t *loop, parserContext *context, const parserTorrent *torrent,
                            const trackerConfig *config, uint32_t timeoutSeconds, int64_t wanted,
-                           const char *directory, uint16_t listenPort, uint8_t seed)
+                           const char *directory, uint16_t listenPort, uint8_t seed,
+                           uint8_t mapPort)
 {
     downloadEvents  events = { onDownloadReady, onDownloadEvent, onDownloadFinished,
                                onDownloadComplete };
@@ -1469,6 +1496,17 @@ static int downloadTorrent(uv_loop_t *loop, parserContext *context, const parser
         if (downloadListenPort(run.transfer) != 0) {
             printf("Listening:  port %u\n", (unsigned)downloadListenPort(run.transfer));
             trackerSettings.port = downloadListenPort(run.transfer);
+            if (mapPort) {
+                portmapOptions mapping;
+
+                memset(&mapping, 0, sizeof(mapping));
+                mapping.port = downloadListenPort(run.transfer);
+                mapping.binding = config->binding;
+                if (portmapBegin(loop, context, &mapping, onPortmap, &run, &run.mapper) !=
+                    PORTMAP_OK) {
+                    run.mapper = NULL;
+                }
+            }
         } else {
             printf("Listening:  could not open ports %u-%u; outgoing connections only\n",
                    (unsigned)listenPort, (unsigned)(listenPort + DOWNLOAD_LISTEN_ATTEMPTS - 1u));
@@ -1755,7 +1793,8 @@ done:
 static int announceTorrent(parserContext *context, const parserAllocator *allocator,
                            const char *path, uint32_t timeoutSeconds, const char *caFile,
                            uint32_t mode, int64_t wanted, const char *outputDirectory,
-                           const netBinding *binding, uint16_t listenPort, uint8_t seed)
+                           const netBinding *binding, uint16_t listenPort, uint8_t seed,
+                           uint8_t mapPort)
 {
     static const char alphabet[] = "0123456789abcdefghijklmnopqrstuvwxyz";
     const parserTier *tier;
@@ -1808,7 +1847,7 @@ static int announceTorrent(parserContext *context, const parserAllocator *alloca
     uv_loop_init(&loop);
     if (mode == MODE_DOWNLOAD) {
         downloaded = (downloadTorrent(&loop, context, &torrent, &config, timeoutSeconds, wanted,
-                                      outputDirectory, listenPort, seed) == 0);
+                                      outputDirectory, listenPort, seed, mapPort) == 0);
         uv_loop_close(&loop);
         parserFree(context, &torrent);
         return downloaded ? 0 : -1;
@@ -2004,7 +2043,7 @@ static void usage(const char *program)
             "       %s -o <output.torrent> [options] <file>...\n"
             "       %s -t [-T seconds] [-C ca.pem] [-I interface] <file.torrent>\n"
             "       %s -P [-T seconds] [-C ca.pem] [-I interface] <file.torrent>\n"
-            "       %s -D [-S] [-L port] [-O dir] [-i piece] [-T seconds] [-C ca.pem]\n"
+            "       %s -D [-S] [-L port] [-N] [-O dir] [-i piece] [-T seconds] [-C ca.pem]\n"
             "            [-I interface] <file.torrent>\n"
             "       %s -V [-O dir] <file.torrent>\n"
             "\n"
@@ -2026,6 +2065,8 @@ static void usage(const char *program)
             "  -S        with -D: keep running once complete, seeding until Ctrl-C\n"
             "  -L port   with -D: accept peer connections on this port, or the next\n"
             "            free one of the 9 after it (default 6881; 0: do not listen)\n"
+            "  -N        with -D: do not ask the router to forward the port (UPnP and\n"
+            "            NAT-PMP are tried by default)\n"
             "  -V        verify downloaded data against the torrent (no network, changes\n"
             "            nothing): each file's state, bytes verified, missing pieces;\n"
             "            exit status 0 if complete, 2 if not, 1 on error\n"
@@ -2053,7 +2094,8 @@ int main(int argc, char **argv)
     uint8_t         verify = 0;         /* -V */
     uint8_t         seed = 0;           /* -S */
     uint32_t        listenPort = 6881;  /* -L */
-    uint8_t         downloadOnly = 0;   /* -S or -L given */
+    uint8_t         downloadOnly = 0;   /* -S, -L or -N given */
+    uint8_t         mapPort = 1;        /* -N turns it off */
     const char     *interfaceSpec = NULL;   /* -I */
     netBinding      binding;
     uint8_t         directoryGiven = 0; /* -O */
@@ -2104,7 +2146,7 @@ int main(int argc, char **argv)
     options.trackers = (const char *const *)trackers;
     options.webSeeds = (const char *const *)webSeeds;
 
-    while ((option = nextOption(argc, argv, "o:a:w:c:n:l:ptPDVSL:O:i:T:C:I:h")) != -1) {
+    while ((option = nextOption(argc, argv, "o:a:w:c:n:l:ptPDVSNL:O:i:T:C:I:h")) != -1) {
         switch (option) {
         case 'o':
             outputPath = optionValue;
@@ -2150,6 +2192,10 @@ int main(int argc, char **argv)
             break;
         case 'S':
             seed = 1;
+            downloadOnly = 1;
+            break;
+        case 'N':
+            mapPort = 0;
             downloadOnly = 1;
             break;
         case 'L': {
@@ -2246,7 +2292,7 @@ int main(int argc, char **argv)
         }
         status = announceTorrent(&context, &allocator, argv[optionIndex], timeoutSeconds, caFile,
                                  mode, wanted, outputDirectory, &binding, (uint16_t)listenPort,
-                                 seed);
+                                 seed, mapPort);
     } else if (outputPath != NULL) {
         if (optionIndex >= argc) {
             usage(argv[0]);

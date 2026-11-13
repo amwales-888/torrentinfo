@@ -44,6 +44,11 @@
  *     other peers until downloadEnd(); peers that are complete themselves
  *     are disconnected, since neither side needs the other.
  *
+ * Peer exchange (BEP 10/11, not for private torrents): peers that support
+ * the extension protocol are told every minute which peers we have
+ * connected to or dropped, and the peers they tell us about are added as if
+ * a tracker had given them.
+ *
  * The torrent passed to downloadBegin() must stay valid until downloadEnd().
  * Memory comes from the allocator in the parserContext. Call peerInit()
  * before downloadBegin(): the download uses the peer module.
@@ -129,6 +134,7 @@ typedef struct downloadProgress {
     uint32_t        peersUploading;     /* connected peers we are unchoking    */
     uint32_t        peersIncoming;      /* connected peers that came to us     */
     uint16_t        listenPort;         /* 0 if not accepting connections      */
+    uint32_t        peersFromPex;       /* new peers heard of by peer exchange */
 } downloadProgress;
 
 typedef struct downloadEvents {

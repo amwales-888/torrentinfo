@@ -27,6 +27,7 @@
 #include <string.h>
 
 #include "download.h"
+#include "extension.h"
 #include "piece.h"
 #include "storage.h"
 #include "queue.h"
@@ -67,6 +68,13 @@
 #define DOWNLOAD_OPTIMISTIC_SECONDS 30u
 #define DOWNLOAD_INCOMING_EXTRA     10u     /* incoming peers beyond maxPeers    */
 #define DOWNLOAD_INCOMING_TIMEOUT   30u     /* seconds for their handshake       */
+#ifndef DOWNLOAD_PEX_SECONDS
+#define DOWNLOAD_PEX_SECONDS        60u     /* between PEX messages to a peer    */
+#endif
+#define DOWNLOAD_PEX_FIRST_SECONDS  10u     /* the first, after connecting       */
+#define DOWNLOAD_PEX_MIN_RECEIVED   20u     /* ignore PEX more often than this   */
+#define DOWNLOAD_PEX_TRACKED        128u    /* peers we remember telling about   */
+#define DOWNLOAD_CLIENT_NAME        "torrentinfo 0.7"
 #ifndef DOWNLOAD_NOPEERS_SECONDS
 #define DOWNLOAD_NOPEERS_SECONDS    60u     /* no peer at all this long: give up */
 #endif
@@ -136,6 +144,16 @@ typedef struct downloadPeer {
     uint64_t                uploaded;       /* total sent to it             */
     uint64_t                uploadedWindow; /* sent since the last rechoke  */
     uint64_t                downloadedWindow;   /* received since then      */
+
+    /* Extension protocol and peer exchange */
+    uint8_t                 extended;       /* both support BEP 10          */
+    uint8_t                 pexId;          /* its id for ut_pex; 0: none   */
+    uint16_t                remotePort;     /* the port it accepts on, if told */
+    uint64_t                nextPex;        /* uv_now() of our next PEX to it */
+    uint64_t                lastPexIn;      /* uv_now() of its last PEX to us */
+    struct downloadPeer   **advertised;     /* peers we have told it about  */
+    uint32_t                advertisedCount;
+    char                    client[EXTENSION_CLIENT_LENGTH];
 } downloadPeer;
 
 TAILQ_HEAD(activeList, activePiece);
@@ -191,6 +209,8 @@ struct download {
     uint64_t                lastRechoke;
     uint64_t                lastOptimistic;
     uint64_t                noPeersSince;   /* 0 while there are peers      */
+    uint8_t                 pexEnabled;     /* not for private torrents     */
+    uint32_t                pexLearned;     /* new peers heard of by PEX    */
 
     uint8_t                 ready;          /* storage open                 */
     uint8_t                 endgame;
@@ -355,6 +375,7 @@ static void sendBlockMessage(downloadPeer *peer, uint32_t id, const activePiece 
 /* ------------------------------------------------------------------------ */
 
 static void fillPeer(download *dl, downloadPeer *peer);
+static int sameHost(const struct sockaddr_storage *a, const struct sockaddr *b);
 static void fillAll(download *dl);
 static void connectMore(download *dl);
 static void finish(download *dl, int32_t status, const char *message);
@@ -948,6 +969,195 @@ static void sendBitfield(download *dl, downloadPeer *peer)
     (void)sendFrame(peer, &frame);
 }
 
+/* ------------------------------------------------------------------------ */
+/* Extension protocol and peer exchange                                     */
+/* ------------------------------------------------------------------------ */
+
+static void sendExtended(downloadPeer *peer, const uint8_t *payload, size_t length)
+{
+    messageFrame frame;
+
+    memset(&frame, 0, sizeof(frame));
+    frame.id = EXTENSION_MESSAGE_ID;
+    frame.payload = payload;
+    frame.payloadLength = (uint32_t)length;
+    (void)sendFrame(peer, &frame);
+}
+
+static void sendExtendedHandshake(download *dl, downloadPeer *peer)
+{
+    extensionHandshake handshake;
+    uint8_t            buffer[1 + 256];
+    size_t             length = 0;
+
+    memset(&handshake, 0, sizeof(handshake));
+    handshake.pexId = dl->pexEnabled ? (uint8_t)EXTENSION_PEX_ID : 0u;
+    handshake.port = dl->listenPort;
+    handshake.requestQueue = DOWNLOAD_UPLOAD_QUEUE;
+    snprintf(handshake.client, sizeof(handshake.client), "%s", DOWNLOAD_CLIENT_NAME);
+    buffer[0] = (uint8_t)EXTENSION_HANDSHAKE;
+    if (extensionEncodeHandshake(&handshake, buffer + 1, sizeof(buffer) - 1u, &length) ==
+        EXTENSION_OK) {
+        sendExtended(peer, buffer, 1u + length);
+    }
+}
+
+/* Where a connected peer accepts connections, if we know: an incoming
+ * peer's address has a temporary port, so only what it told us counts. */
+static int listenAddress(const downloadPeer *peer, extensionPeer *out)
+{
+    uint16_t port;
+
+    memset(out, 0, sizeof(*out));
+    if (peer->address.ss_family == AF_INET) {
+        const struct sockaddr_in *v4 = (const struct sockaddr_in *)&peer->address;
+
+        out->family = 4u;
+        memcpy(out->address, &v4->sin_addr, 4);
+        port = ntohs(v4->sin_port);
+    } else {
+        const struct sockaddr_in6 *v6 = (const struct sockaddr_in6 *)&peer->address;
+
+        out->family = 6u;
+        memcpy(out->address, &v6->sin6_addr, 16);
+        port = ntohs(v6->sin6_port);
+    }
+    out->port = peer->incoming ? peer->remotePort : port;
+    return out->port != 0;
+}
+
+static int advertisedIndex(const downloadPeer *peer, const downloadPeer *other)
+{
+    uint32_t i;
+
+    for (i = 0; i < peer->advertisedCount; i++) {
+        if (peer->advertised[i] == other) {
+            return (int)i;
+        }
+    }
+    return -1;
+}
+
+/* Tell the peer which peers we have connected to, and dropped, since last time. */
+static void sendPex(download *dl, downloadPeer *peer)
+{
+    extensionPeer added[EXTENSION_MAX_PEX_PEERS];
+    extensionPeer dropped[EXTENSION_MAX_PEX_PEERS];
+    downloadPeer *addedPeer[EXTENSION_MAX_PEX_PEERS];
+    downloadPeer *other;
+    uint8_t       buffer[1 + EXTENSION_PEX_BUFFER];
+    uint32_t      addedCount = 0;
+    uint32_t      droppedCount = 0;
+    uint32_t      i;
+    size_t        length = 0;
+
+    /* Dropped: told about before, no longer connected. */
+    for (i = peer->advertisedCount; i > 0 && droppedCount < EXTENSION_MAX_PEX_PEERS; i--) {
+        other = peer->advertised[i - 1u];
+        if (other->state != DOWNLOAD_PEER_OPEN || other->excluded) {
+            if (listenAddress(other, &dropped[droppedCount])) {
+                droppedCount++;
+            }
+            peer->advertised[i - 1u] = peer->advertised[--peer->advertisedCount];
+        }
+    }
+    /* Added: connected, with a known address, not told about yet. */
+    TAILQ_FOREACH(other, &dl->peers, entries) {
+        if (addedCount >= EXTENSION_MAX_PEX_PEERS ||
+            peer->advertisedCount + addedCount >= DOWNLOAD_PEX_TRACKED) {
+            break;
+        }
+        if (other == peer || other->state != DOWNLOAD_PEER_OPEN || other->excluded ||
+            advertisedIndex(peer, other) >= 0 || !listenAddress(other, &added[addedCount])) {
+            continue;
+        }
+        added[addedCount].flags =
+            (uint8_t)((other->haveCount >= dl->torrent->pieceCount ? EXTENSION_PEX_SEED : 0u) |
+                      (other->incoming ? 0u : EXTENSION_PEX_CONNECTABLE));
+        addedPeer[addedCount++] = other;
+    }
+    for (i = 0; i < addedCount; i++) {
+        peer->advertised[peer->advertisedCount++] = addedPeer[i];
+    }
+    if (addedCount == 0 && droppedCount == 0) {
+        return;
+    }
+    buffer[0] = peer->pexId;
+    if (extensionEncodePex(added, addedCount, dropped, droppedCount, buffer + 1,
+                           sizeof(buffer) - 1u, &length) == EXTENSION_OK) {
+        sendExtended(peer, buffer, 1u + length);
+    }
+}
+
+typedef struct pexContext {
+    download     *dl;
+    uint32_t      learned;
+} pexContext;
+
+static void onPexPeer(void *privateArg, const extensionPeer *peer, int added)
+{
+    pexContext             *context = privateArg;
+    struct sockaddr_storage address;
+    uint32_t                before = context->dl->peerCount;
+
+    if (!added) {
+        return;                                     /* we keep our own view */
+    }
+    memset(&address, 0, sizeof(address));
+    if (peer->family == 4u) {
+        struct sockaddr_in *v4 = (struct sockaddr_in *)&address;
+
+        v4->sin_family = AF_INET;
+        memcpy(&v4->sin_addr, peer->address, 4);
+        v4->sin_port = htons(peer->port);
+    } else {
+        struct sockaddr_in6 *v6 = (struct sockaddr_in6 *)&address;
+
+        v6->sin6_family = AF_INET6;
+        memcpy(&v6->sin6_addr, peer->address, 16);
+        v6->sin6_port = htons(peer->port);
+    }
+    (void)downloadAddPeer(context->dl, (const struct sockaddr *)&address);
+    if (context->dl->peerCount > before) {
+        context->learned++;
+    }
+}
+
+static void receiveExtended(download *dl, downloadPeer *peer, const messageFrame *message)
+{
+    extensionHandshake handshake;
+    pexContext         context;
+    uint64_t           now = uv_now(dl->loop);
+
+    if (!peer->extended || message->payloadLength < 1u) {
+        return;
+    }
+    if (message->payload[0] == EXTENSION_HANDSHAKE) {
+        if (extensionDecodeHandshake(message->payload + 1, message->payloadLength - 1u,
+                                     &handshake) == EXTENSION_OK) {
+            peer->pexId = dl->pexEnabled ? handshake.pexId : 0u;
+            peer->remotePort = handshake.port;
+            snprintf(peer->client, sizeof(peer->client), "%s", handshake.client);
+        }
+        return;
+    }
+    if (message->payload[0] != EXTENSION_PEX_ID || !dl->pexEnabled ||
+        (peer->lastPexIn != 0 &&
+         now - peer->lastPexIn < (uint64_t)DOWNLOAD_PEX_MIN_RECEIVED * 1000u)) {
+        return;                                     /* unknown, private, or too often */
+    }
+    peer->lastPexIn = now;
+    context.dl = dl;
+    context.learned = 0;
+    (void)extensionDecodePex(message->payload + 1, message->payloadLength - 1u, onPexPeer,
+                             &context);
+    if (context.learned > 0) {
+        dl->pexLearned += context.learned;
+        emit(dl, "%s: peer exchange: %u new peer%s", peer->where, (unsigned)context.learned,
+             (context.learned == 1u) ? "" : "s");
+    }
+}
+
 /* When we are complete, a peer that is complete too is of no use. */
 static int bothComplete(const download *dl, const downloadPeer *peer)
 {
@@ -1050,8 +1260,11 @@ static int allocatePeerState(download *dl, downloadPeer *peer)
     if (peer->reading == NULL) {
         peer->reading = allocate(dl, sizeof(*peer->reading) * DOWNLOAD_UPLOAD_READS);
     }
+    if (peer->advertised == NULL) {
+        peer->advertised = allocate(dl, sizeof(*peer->advertised) * DOWNLOAD_PEX_TRACKED);
+    }
     return (peer->have != NULL && peer->requests != NULL && peer->uploadQueue != NULL &&
-            peer->reading != NULL) ? 0 : -1;
+            peer->reading != NULL && peer->advertised != NULL) ? 0 : -1;
 }
 
 static void onPeerHandshake(void *privateArg, peerConnection *connection,
@@ -1096,6 +1309,13 @@ static void onPeerHandshake(void *privateArg, peerConnection *connection,
     peer->uploadedWindow = 0;
     peer->downloadedWindow = 0;
     memcpy(peer->remoteId, result->peerId, PEER_ID_LENGTH);
+    peer->extended = (uint8_t)((result->extensions & PEER_EXTENSION_PROTOCOL) != 0);
+    peer->pexId = 0;
+    peer->remotePort = 0;
+    peer->lastPexIn = 0;
+    peer->advertisedCount = 0;
+    peer->client[0] = '\0';
+    peer->nextPex = peer->openedAt + (uint64_t)DOWNLOAD_PEX_FIRST_SECONDS * 1000u;
     dl->open++;
 
     /* The same client by another route (it connected to us as we to it). */
@@ -1112,6 +1332,9 @@ static void onPeerHandshake(void *privateArg, peerConnection *connection,
         }
     }
     sendBitfield(dl, peer);
+    if (peer->extended) {
+        sendExtendedHandshake(dl, peer);
+    }
 
     for (i = 0; i < PEER_ID_LENGTH; i++) {
         uint8_t c = result->peerId[i];
@@ -1486,6 +1709,9 @@ static void onPeerMessage(void *privateArg, peerConnection *connection,
     case MESSAGE_CANCEL:
         cancelUpload(peer, message);
         break;
+    case EXTENSION_MESSAGE_ID:
+        receiveExtended(dl, peer, message);
+        break;
     case MESSAGE_CHOKE:
         if (!peer->choked) {
             peer->choked = 1;
@@ -1740,6 +1966,14 @@ static void onTick(uv_timer_t *timer)
             return;
         }
     }
+    if (dl->pexEnabled) {
+        TAILQ_FOREACH(peer, &dl->peers, entries) {
+            if (peer->state == DOWNLOAD_PEER_OPEN && peer->pexId != 0 && now >= peer->nextPex) {
+                peer->nextPex = now + (uint64_t)DOWNLOAD_PEX_SECONDS * 1000u;
+                sendPex(dl, peer);
+            }
+        }
+    }
     fillAll(dl);
     connectMore(dl);
 }
@@ -1756,6 +1990,7 @@ static void onTimerClosed(uv_handle_t *handle)
         release(dl, peer->requests);
         release(dl, peer->uploadQueue);
         release(dl, peer->reading);
+        release(dl, (void *)peer->advertised);
         release(dl, peer);
     }
     while ((piece = TAILQ_FIRST(&dl->active)) != NULL) {
@@ -1881,6 +2116,8 @@ int32_t downloadBegin(uv_loop_t *loop, parserContext *context, const parserTorre
     memcpy(dl->connectOptions.peerId, options->peerId, PEER_ID_LENGTH);
     dl->connectOptions.pieceCount = torrent->pieceCount;
     dl->connectOptions.timeoutSeconds = options->handshakeTimeoutSeconds;
+    dl->connectOptions.extensions = PEER_EXTENSION_PROTOCOL;
+    dl->pexEnabled = (uint8_t)!torrent->isPrivate;      /* BEP 27: trackers only */
 
     if (uv_random(NULL, NULL, &seed, sizeof(seed), 0, NULL) != 0) {
         seed = 0;
@@ -1953,6 +2190,13 @@ int32_t downloadAddPeer(download *dl, const struct sockaddr *address)
         if (sameAddress(&peer->address, address)) {
             return DOWNLOAD_OK;                     /* already known */
         }
+        if (peer->incoming && peer->remotePort != 0 && peer->state == DOWNLOAD_PEER_OPEN &&
+            sameHost(&peer->address, address) &&
+            peer->remotePort == ntohs((address->sa_family == AF_INET)
+                                          ? ((const struct sockaddr_in *)address)->sin_port
+                                          : ((const struct sockaddr_in6 *)address)->sin6_port)) {
+            return DOWNLOAD_OK;                     /* connected to us already */
+        }
     }
     if (dl->peerCount >= DOWNLOAD_MAX_KNOWN_PEERS) {
         return DOWNLOAD_OK;                         /* plenty to be going on with */
@@ -1998,6 +2242,7 @@ void downloadGetProgress(const download *dl, downloadProgress *progress)
     progress->left = dl->left;
     progress->bytesUploaded = dl->bytesUploaded;
     progress->listenPort = dl->listenPort;
+    progress->peersFromPex = dl->pexLearned;
     TAILQ_FOREACH(peer, &dl->peers, entries) {
         switch (peer->state) {
         case DOWNLOAD_PEER_QUEUED:

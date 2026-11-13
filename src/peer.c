@@ -627,9 +627,13 @@ static void configure(peerConnection *connection, const peerConnectOptions *opti
         connection->maxMessage = bitfieldMessage;
     }
 
-    /* Our handshake. Reserved bytes are zero: no extensions yet. */
+    /* Our handshake: reserved bytes zero except the extensions we support. */
     connection->handshake[0] = (uint8_t)PEER_PROTOCOL_LENGTH;
     memcpy(connection->handshake + 1, PEER_PROTOCOL_NAME, PEER_PROTOCOL_LENGTH);
+    memset(connection->handshake + PEER_OFFSET_RESERVED, 0, PEER_RESERVED_LENGTH);
+    if (options->extensions & PEER_EXTENSION_PROTOCOL) {
+        connection->handshake[PEER_OFFSET_RESERVED + 5u] = 0x10u;   /* BEP 10 */
+    }
     memcpy(connection->handshake + PEER_OFFSET_INFO_HASH, options->infoHash, PARSER_SHA1_LENGTH);
     memcpy(connection->handshake + PEER_OFFSET_PEER_ID, options->peerId, PEER_ID_LENGTH);
 }

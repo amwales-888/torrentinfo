@@ -110,9 +110,16 @@ project's *Properties > Debugging > Command Arguments*.
   disconnects is retried after 30 seconds (three connections at most). Near
   the end, slow blocks are also requested from a second peer ("endgame").
   The download stops if no data arrives for 2 minutes, or if there is no
-  peer at all for 1 minute. Progress is printed every 2 seconds. DHT and
-  peer exchange are not implemented yet, so the trackers (and peers that
-  connect to us) are the only source of peers.
+  peer at all for 1 minute. Progress is printed every 2 seconds. Peers come
+  from the trackers, from peer exchange, and from peers that connect to us;
+  DHT is not implemented yet.
+
+- **Peer exchange.** Peers that support the extension protocol (BEP 10;
+  nearly all current clients do) are sent an extended handshake, and with
+  peer exchange (BEP 11, "ut_pex") tell each other every minute which peers
+  they are connected to; the peers we hear of join the download. The first
+  exchange with a peer happens 10 seconds after connecting. Private
+  torrents never use it (BEP 27): their peers come from the trackers only.
 
 - **Trackers** are announced to throughout the download: every tracker the
   torrent lists, all tiers at once, starting with "started" once the files
@@ -138,6 +145,15 @@ project's *Properties > Debugging > Command Arguments*.
   port is open in your firewall and, behind a home router, forwarded to
   this computer; Windows Firewall asks the first time. Without that,
   downloading still works through outgoing connections.
+
+- **Port forwarding.** While listening, `-D` asks the router to forward the
+  port: NAT-PMP to the default gateway first (about 4 seconds), then UPnP
+  (discovery by multicast, then the router's control URL; a router that only
+  allows permanent mappings is asked for one). The result is printed, the
+  mapping is renewed before it expires, and it is removed when the program
+  ends. With `-I`, the gateway of that interface is used (some VPN services
+  support NAT-PMP). `-N` turns this off. Many routers have UPnP switched off
+  by default; then forward the port by hand in the router's settings.
 
 - **Seeding (`-S`).** Without `-S`, `-D` exits once the download is complete.
   With it, the program keeps serving peers (dropping ones that are complete

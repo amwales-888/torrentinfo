@@ -27,9 +27,9 @@ LIBRARY    := libtorrentinfo.a
 
 SRCDIR      := src
 
-LIB_SOURCES := platform.c net.c parser.c encoder.c http.c udp.c tracker.c message.c peer.c piece.c storage.c download.c announce.c
+LIB_SOURCES := platform.c net.c extension.c parser.c encoder.c http.c udp.c tracker.c message.c peer.c piece.c storage.c download.c announce.c portmap.c
 APP_SOURCES := main.c
-HEADERS     := queue.h platform.h net.h parser.h encoder.h http.h udp.h tracker.h message.h peer.h piece.h storage.h download.h announce.h
+HEADERS     := queue.h platform.h net.h extension.h parser.h encoder.h http.h udp.h tracker.h message.h peer.h piece.h storage.h download.h announce.h portmap.h
 
 PKGS := libuv openssl
 

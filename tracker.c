@@ -4,8 +4,12 @@
  * Each announce is a trackerRequest that moves through:
  *
  *   resolve (uv_getaddrinfo)
- *     HTTP: connect (uv_tcp, trying each address) -> write GET -> read to EOF
- *           -> parse bencoded body
+ *     HTTP:  connect (uv_tcp, trying each address) -> write GET -> read to EOF
+ *            -> parse bencoded body
+ *     HTTPS: as HTTP, but the bytes pass through OpenSSL memory BIOs: what
+ *            arrives on the socket is fed to OpenSSL, and whatever OpenSSL
+ *            wants to send is written to the socket. OpenSSL never touches
+ *            the socket itself.
  *     UDP:  connect request -> connect response -> announce request
  *           -> announce response, retransmitting on a timer (BEP 15)
  *
@@ -26,14 +30,19 @@
 #include <string.h>
 #include <sys/queue.h>
 
+#include <openssl/err.h>
+#include <openssl/ssl.h>
+#include <openssl/x509v3.h>
+
 #include "tracker.h"
 
 #define TRACKER_STATE_MAGIC         0x5452434Bu     /* "TRCK" */
 #define TRACKER_PROTOCOL_HTTP       1u
 #define TRACKER_PROTOCOL_UDP        2u
+#define TRACKER_PROTOCOL_HTTPS      3u
 #define TRACKER_MAX_ADDRESSES       8u
 #define TRACKER_READ_CHUNK          16384u
-#define TRACKER_UDP_BUFFER          8192u
+#define TRACKER_IO_BUFFER           16384u          /* UDP datagrams / TLS records */
 #define TRACKER_UDP_RETRY_MS        2000u           /* first retransmit      */
 #define TRACKER_UDP_MAX_RETRY_MS    16000u          /* retransmit back-off cap */
 #define TRACKER_UDP_PROTOCOL_ID     0x41727101980ull
@@ -107,7 +116,12 @@ typedef struct trackerRequest {
     uint32_t                retryCount;
     uint8_t                 packet[TRACKER_UDP_ANNOUNCE_SIZE];
     uint32_t                packetLength;
-    uint8_t                 datagram[TRACKER_UDP_BUFFER];
+    uint8_t                 ioBuffer[TRACKER_IO_BUFFER];   /* raw bytes in */
+
+    /* HTTPS */
+    SSL                    *ssl;
+    uint8_t                 tlsHandshakeDone;
+    uint8_t                 tlsRequestSent;
 
     /* Results */
     uint32_t                interval;
@@ -133,7 +147,15 @@ static struct {
     uint32_t                  nextId;
     uint32_t                  magic;
     struct trackerRequestList requests;
+    SSL_CTX                  *tls;
 } trackerState;
+
+/* One chunk of TLS output on its way to the socket. */
+typedef struct trackerTlsWrite {
+    uv_write_t      write;
+    trackerRequest *request;
+    uint8_t         data[];
+} trackerTlsWrite;
 
 static void tcpConnectNext(trackerRequest *request);
 
@@ -294,6 +316,9 @@ static void freeRequest(trackerRequest *request)
     release(request->failureReason);
     release(request->warningMessage);
     release(request->peers);
+    if (request->ssl != NULL) {
+        SSL_free(request->ssl);                     /* also frees its BIOs */
+    }
     release(request);
 }
 
@@ -435,11 +460,15 @@ static int32_t parseUrl(trackerRequest *request, const char *url)
         request->protocol = TRACKER_PROTOCOL_HTTP;
         authority = url + 7;
         port = 80;
+    } else if (hasPrefix(url, "https://")) {
+        request->protocol = TRACKER_PROTOCOL_HTTPS;
+        authority = url + 8;
+        port = 443;
     } else if (hasPrefix(url, "udp://")) {
         request->protocol = TRACKER_PROTOCOL_UDP;
         authority = url + 6;
     } else if (strstr(url, "://") != NULL) {
-        return TRACKER_ENOTSUP;                     /* https, wss, ... */
+        return TRACKER_ENOTSUP;                     /* wss, ... */
     } else {
         return TRACKER_EINVAL;
     }
@@ -841,18 +870,17 @@ static void handleHttpResponse(trackerRequest *request)
     finish(request, parseAnnounce(request, data + headerEnd, length - headerEnd));
 }
 
-static void onHttpAlloc(uv_handle_t *handle, size_t suggested, uv_buf_t *buffer)
+/*
+ * Make room at the end of the response buffer. Returns the number of bytes
+ * free, or 0 if the size limit is reached or memory has run out.
+ */
+static uint64_t growResponse(trackerRequest *request)
 {
-    trackerRequest *request = handle->data;
-    uint64_t        capacity;
-    uint8_t        *data;
-
-    (void)suggested;
-    buffer->base = NULL;
-    buffer->len = 0;                                /* leads to UV_ENOBUFS */
+    uint64_t capacity;
+    uint8_t *data;
 
     if (request->responseLength >= TRACKER_MAX_RESPONSE) {
-        return;
+        return 0;
     }
     if (request->responseCapacity - request->responseLength < TRACKER_READ_CHUNK) {
         capacity = request->responseLength + TRACKER_READ_CHUNK;
@@ -861,13 +889,30 @@ static void onHttpAlloc(uv_handle_t *handle, size_t suggested, uv_buf_t *buffer)
         }
         data = resize(request->response, capacity);
         if (data == NULL) {
-            return;
+            return 0;
         }
         request->response = data;
         request->responseCapacity = capacity;
     }
-    buffer->base = (char *)request->response + request->responseLength;
-    buffer->len = (size_t)(request->responseCapacity - request->responseLength);
+    return request->responseCapacity - request->responseLength;
+}
+
+static void failTooLarge(trackerRequest *request)
+{
+    setError(request, "response too large (limit %u bytes) or out of memory",
+             (unsigned)TRACKER_MAX_RESPONSE);
+    finish(request, TRACKER_EPROTO);
+}
+
+static void onHttpAlloc(uv_handle_t *handle, size_t suggested, uv_buf_t *buffer)
+{
+    trackerRequest *request = handle->data;
+    uint64_t        space = growResponse(request);
+
+    (void)suggested;
+    /* A zero-length buffer makes libuv report UV_ENOBUFS to onHttpRead(). */
+    buffer->base = (space > 0) ? (char *)request->response + request->responseLength : NULL;
+    buffer->len = (size_t)space;
 }
 
 static void onHttpRead(uv_stream_t *stream, ssize_t count, const uv_buf_t *buffer)
@@ -883,9 +928,7 @@ static void onHttpRead(uv_stream_t *stream, ssize_t count, const uv_buf_t *buffe
     } else if (count == UV_EOF) {
         handleHttpResponse(request);
     } else if (count == UV_ENOBUFS) {
-        setError(request, "response too large (limit %u bytes) or out of memory",
-                 (unsigned)TRACKER_MAX_RESPONSE);
-        finish(request, TRACKER_EPROTO);
+        failTooLarge(request);
     } else if (count < 0) {
         setError(request, "receive failed: %s", uv_strerror((int)count));
         finish(request, TRACKER_ERROR);
@@ -907,6 +950,232 @@ static void onHttpWrite(uv_write_t *write, int status)
     }
 }
 
+/* ======================================================================== */
+/* HTTPS: TLS over the TCP stream                                           */
+/* ======================================================================== */
+
+/* Describe a TLS failure as precisely as OpenSSL allows. */
+static void tlsFail(trackerRequest *request, const char *stage)
+{
+    char          reason[120];
+    unsigned long error = ERR_get_error();
+    long          verify = (request->ssl != NULL) ? SSL_get_verify_result(request->ssl)
+                                                  : X509_V_OK;
+
+    if (verify != X509_V_OK) {
+        setError(request, "TLS certificate rejected: %s",
+                 X509_verify_cert_error_string(verify));
+    } else if (error != 0) {
+        ERR_error_string_n(error, reason, sizeof(reason));
+        setError(request, "TLS %s failed: %s", stage, reason);
+    } else {
+        setError(request, "TLS %s failed", stage);
+    }
+    ERR_clear_error();
+    finish(request, TRACKER_ETLS);
+}
+
+static void onTlsWrite(uv_write_t *write, int status)
+{
+    trackerTlsWrite *chunk = write->data;
+    trackerRequest  *request = chunk->request;
+
+    release(chunk);
+    request->pending--;
+    if (request->finished) {
+        maybeFree(request);
+        return;
+    }
+    if (status < 0) {
+        setError(request, "send failed: %s", uv_strerror(status));
+        finish(request, TRACKER_ERROR);
+    }
+}
+
+/* Send whatever OpenSSL has queued in its output BIO. Returns 0 on failure. */
+static uint8_t tlsFlush(trackerRequest *request)
+{
+    BIO             *output = SSL_get_wbio(request->ssl);
+    trackerTlsWrite *chunk;
+    uv_buf_t         buffer;
+    size_t           waiting;
+    int              count;
+    int              result;
+
+    while ((waiting = BIO_ctrl_pending(output)) > 0) {
+        if (waiting > TRACKER_IO_BUFFER) {
+            waiting = TRACKER_IO_BUFFER;
+        }
+        chunk = allocate(sizeof(*chunk) + waiting);
+        if (chunk == NULL) {
+            finish(request, TRACKER_ENOMEM);
+            return 0;
+        }
+        count = BIO_read(output, chunk->data, (int)waiting);
+        if (count <= 0) {
+            release(chunk);
+            tlsFail(request, "write");
+            return 0;
+        }
+        chunk->request = request;
+        chunk->write.data = chunk;
+        buffer = uv_buf_init((char *)chunk->data, (unsigned int)count);
+        result = uv_write(&chunk->write, (uv_stream_t *)&request->tcp, &buffer, 1, onTlsWrite);
+        if (result < 0) {
+            release(chunk);
+            setError(request, "send failed: %s", uv_strerror(result));
+            finish(request, TRACKER_ERROR);
+            return 0;
+        }
+        request->pending++;
+    }
+    return 1;
+}
+
+/*
+ * Move the TLS session forward after new input: finish the handshake, send
+ * the HTTP request once, then decrypt any response data available.
+ */
+static void tlsAdvance(trackerRequest *request)
+{
+    uint64_t space;
+    int      result;
+    int      error;
+
+    if (!request->tlsHandshakeDone) {
+        result = SSL_do_handshake(request->ssl);
+        if (result != 1) {
+            error = SSL_get_error(request->ssl, result);
+            if (error == SSL_ERROR_WANT_READ || error == SSL_ERROR_WANT_WRITE) {
+                tlsFlush(request);                  /* send our handshake data */
+                return;
+            }
+            tlsFail(request, "handshake");
+            return;
+        }
+        request->tlsHandshakeDone = 1;
+    }
+
+    if (!request->tlsRequestSent) {
+        /* A memory BIO accepts everything, so this completes in one call. */
+        result = SSL_write(request->ssl, request->httpRequest,
+                           (int)request->httpRequestLength);
+        if (result <= 0) {
+            tlsFail(request, "write");
+            return;
+        }
+        request->tlsRequestSent = 1;
+    }
+
+    for (;;) {
+        space = growResponse(request);
+        if (space == 0) {
+            failTooLarge(request);
+            return;
+        }
+        if (space > INT32_MAX) {
+            space = INT32_MAX;
+        }
+        result = SSL_read(request->ssl, request->response + request->responseLength,
+                          (int)space);
+        if (result > 0) {
+            request->responseLength += (uint64_t)result;
+            continue;
+        }
+        error = SSL_get_error(request->ssl, result);
+        if (error == SSL_ERROR_WANT_READ) {
+            break;                                  /* need more from the socket */
+        }
+        if (error == SSL_ERROR_ZERO_RETURN) {       /* server sent close_notify */
+            handleHttpResponse(request);
+            return;
+        }
+        tlsFail(request, "read");
+        return;
+    }
+    tlsFlush(request);
+}
+
+static void onTlsAlloc(uv_handle_t *handle, size_t suggested, uv_buf_t *buffer)
+{
+    trackerRequest *request = handle->data;
+
+    (void)suggested;
+    buffer->base = (char *)request->ioBuffer;
+    buffer->len = sizeof(request->ioBuffer);
+}
+
+static void onTlsRead(uv_stream_t *stream, ssize_t count, const uv_buf_t *buffer)
+{
+    trackerRequest *request = stream->data;
+
+    if (request->finished) {
+        return;
+    }
+    if (count > 0) {
+        if (BIO_write(SSL_get_rbio(request->ssl), buffer->base, (int)count) != (int)count) {
+            finish(request, TRACKER_ENOMEM);
+            return;
+        }
+        tlsAdvance(request);
+    } else if (count == UV_EOF) {
+        /*
+         * Many servers close without a TLS close_notify. The response is
+         * read until the connection closes and must then parse as complete
+         * bencode, so a cut-off reply is still caught as malformed.
+         */
+        if (request->tlsRequestSent) {
+            handleHttpResponse(request);
+        } else {
+            setError(request, "connection closed during TLS handshake");
+            finish(request, TRACKER_ETLS);
+        }
+    } else if (count < 0) {
+        setError(request, "receive failed: %s", uv_strerror((int)count));
+        finish(request, TRACKER_ERROR);
+    }
+}
+
+static void tlsStart(trackerRequest *request)
+{
+    uint8_t address[16];
+    BIO    *input = BIO_new(BIO_s_mem());
+    BIO    *output = BIO_new(BIO_s_mem());
+    int     result;
+
+    request->ssl = SSL_new(trackerState.tls);
+    if (request->ssl == NULL || input == NULL || output == NULL) {
+        BIO_free(input);
+        BIO_free(output);
+        tlsFail(request, "setup");
+        return;
+    }
+    SSL_set_bio(request->ssl, input, output);       /* the SSL now owns both */
+    SSL_set_connect_state(request->ssl);
+
+    /* Check the certificate names this host: an IP address or a DNS name
+     * (the DNS name is also sent as SNI). */
+    if (uv_inet_pton(AF_INET, request->host, address) == 0 ||
+        uv_inet_pton(AF_INET6, request->host, address) == 0) {
+        result = X509_VERIFY_PARAM_set1_ip_asc(SSL_get0_param(request->ssl), request->host);
+    } else {
+        result = (SSL_set_tlsext_host_name(request->ssl, request->host) == 1 &&
+                  SSL_set1_host(request->ssl, request->host) == 1);
+    }
+    if (result != 1) {
+        tlsFail(request, "setup");
+        return;
+    }
+
+    result = uv_read_start((uv_stream_t *)&request->tcp, onTlsAlloc, onTlsRead);
+    if (result < 0) {
+        setError(request, "receive failed: %s", uv_strerror(result));
+        finish(request, TRACKER_ERROR);
+        return;
+    }
+    tlsAdvance(request);                            /* sends the ClientHello */
+}
+
 static void onTcpConnect(uv_connect_t *connect, int status)
 {
     trackerRequest *request = connect->data;
@@ -924,6 +1193,11 @@ static void onTcpConnect(uv_connect_t *connect, int status)
         request->addressIndex++;
         request->tcpRetry = 1;
         uv_close((uv_handle_t *)&request->tcp, onHandleClosed);
+        return;
+    }
+
+    if (request->protocol == TRACKER_PROTOCOL_HTTPS) {
+        tlsStart(request);
         return;
     }
 
@@ -1057,15 +1331,15 @@ static void onUdpAlloc(uv_handle_t *handle, size_t suggested, uv_buf_t *buffer)
     trackerRequest *request = handle->data;
 
     (void)suggested;
-    buffer->base = (char *)request->datagram;
-    buffer->len = sizeof(request->datagram);
+    buffer->base = (char *)request->ioBuffer;
+    buffer->len = sizeof(request->ioBuffer);
 }
 
 static void onUdpRead(uv_udp_t *udp, ssize_t count, const uv_buf_t *buffer,
                       const struct sockaddr *from, unsigned flags)
 {
     trackerRequest *request = udp->data;
-    const uint8_t  *data = request->datagram;
+    const uint8_t  *data = request->ioBuffer;
     uint64_t        length;
     uint32_t        action;
     int32_t         result;
@@ -1185,7 +1459,7 @@ static void onResolved(uv_getaddrinfo_t *resolver, int status, struct addrinfo *
     if (request->addressCount == 0) {
         setError(request, "DNS lookup for %s returned no usable address", request->host);
         finish(request, TRACKER_ERROR);
-    } else if (request->protocol == TRACKER_PROTOCOL_HTTP) {
+    } else if (request->protocol != TRACKER_PROTOCOL_UDP) {
         tcpConnectNext(request);
     } else {
         udpStart(request);
@@ -1205,6 +1479,24 @@ int32_t trackerInit(uv_loop_t *loop, parserContext *context, const trackerConfig
     if (trackerState.magic == TRACKER_STATE_MAGIC) {
         return TRACKER_EINVAL;                      /* already initialised */
     }
+
+    /* Shared TLS settings: TLS 1.2 or later, certificates must verify. */
+    trackerState.tls = SSL_CTX_new(TLS_client_method());
+    if (trackerState.tls == NULL) {
+        ERR_clear_error();
+        return TRACKER_ETLS;
+    }
+    SSL_CTX_set_min_proto_version(trackerState.tls, TLS1_2_VERSION);
+    SSL_CTX_set_verify(trackerState.tls, SSL_VERIFY_PEER, NULL);
+    if ((config->caFile != NULL)
+            ? SSL_CTX_load_verify_locations(trackerState.tls, config->caFile, NULL) != 1
+            : SSL_CTX_set_default_verify_paths(trackerState.tls) != 1) {
+        SSL_CTX_free(trackerState.tls);
+        trackerState.tls = NULL;
+        ERR_clear_error();
+        return TRACKER_ETLS;
+    }
+
     trackerState.loop = loop;
     trackerState.context = context;
     trackerState.config = *config;
@@ -1247,7 +1539,7 @@ int32_t trackerConnect(const uint8_t infoHash[PARSER_SHA1_LENGTH],
     memcpy(request->infoHash, infoHash, PARSER_SHA1_LENGTH);
 
     result = parseUrl(request, trackerUrl);
-    if (result == TRACKER_OK && request->protocol == TRACKER_PROTOCOL_HTTP) {
+    if (result == TRACKER_OK && request->protocol != TRACKER_PROTOCOL_UDP) {
         result = buildHttpRequest(request);
     }
     if (result != TRACKER_OK) {
@@ -1264,7 +1556,7 @@ int32_t trackerConnect(const uint8_t infoHash[PARSER_SHA1_LENGTH],
 
     memset(&hints, 0, sizeof(hints));
     hints.ai_family = AF_UNSPEC;
-    hints.ai_socktype = (request->protocol == TRACKER_PROTOCOL_HTTP) ? SOCK_STREAM : SOCK_DGRAM;
+    hints.ai_socktype = (request->protocol == TRACKER_PROTOCOL_UDP) ? SOCK_DGRAM : SOCK_STREAM;
     snprintf(portText, sizeof(portText), "%u", (unsigned)request->port);
 
     request->resolver.data = request;
@@ -1375,7 +1667,10 @@ void trackerShutdown(void)
     while ((request = TAILQ_FIRST(&trackerState.requests)) != NULL) {
         trackerClose(request->id);
     }
-    /* loop and context stay set: closing requests still need the allocator. */
+    /* loop and context stay set: closing requests still need the allocator.
+     * The TLS context is reference counted, so open sessions keep it alive. */
+    SSL_CTX_free(trackerState.tls);
+    trackerState.tls = NULL;
     trackerState.magic = 0;
 }
 
@@ -1393,6 +1688,7 @@ const char *trackerStatusString(int32_t status)
     case TRACKER_EFAILURE:  return "Tracker returned a failure";
     case TRACKER_EPROTO:    return "Invalid tracker response";
     case TRACKER_ENOTINIT:  return "Tracker module not initialised";
+    case TRACKER_ETLS:      return "TLS error";
     default:                return "Unknown status";
     }
 }

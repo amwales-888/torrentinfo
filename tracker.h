@@ -4,9 +4,14 @@
  * Supports:
  *   - HTTP trackers (BEP 3), compact (BEP 23) and dictionary peer lists,
  *     plus IPv6 peers (BEP 7 "peers6")
+ *   - HTTPS trackers: the same over TLS 1.2+ (OpenSSL), with certificate
+ *     and host name verification
  *   - UDP trackers (BEP 15)
- * HTTPS trackers are not supported (no TLS); trackerConnect() returns
- * TRACKER_ENOTSUP for them.
+ *
+ * TLS runs over libuv's TCP handles using OpenSSL memory BIOs: libuv does all
+ * the socket I/O, OpenSSL only encrypts and decrypts in memory. OpenSSL
+ * allocates through its own hook, CRYPTO_set_mem_functions(), which the
+ * application may point at the same allocator if wanted.
  *
  * Model:
  *   trackerConnect() starts an announce and returns at once with a unique
@@ -36,7 +41,8 @@
  *
  * Building: <uv.h> needs POSIX types, so with -std=c99 define
  * _POSIX_C_SOURCE=200809L (before any #include, or with -D on the command
- * line), or use -std=gnu99. Link with $(pkg-config --cflags --libs libuv).
+ * line), or use -std=gnu99. Link with
+ * $(pkg-config --cflags --libs libuv openssl).
  */
 #ifndef TRACKER_H
 #define TRACKER_H
@@ -76,6 +82,8 @@ extern "C" {
 #define TRACKER_EFAILURE                (-7)    /* Tracker refused: failureReason */
 #define TRACKER_EPROTO                  (-8)    /* Bad or unexpected response     */
 #define TRACKER_ENOTINIT                (-9)    /* trackerInit() not called       */
+#define TRACKER_ETLS                    (-10)   /* TLS setup, handshake or
+                                                   certificate check failed      */
 
 /* ------------------------------------------------------------------------ */
 /* Types                                                                    */
@@ -89,6 +97,9 @@ typedef struct trackerConfig {
     uint8_t     peerId[TRACKER_PEER_ID_LENGTH]; /* Our 20-byte peer id        */
     uint16_t    port;                           /* Port we accept peers on    */
     uint32_t    numWant;                        /* Peers to ask for; 0 = default */
+    const char *caFile;     /* PEM file of trusted CA certificates for HTTPS,
+                               or NULL for the system's default store. Only
+                               read during trackerInit().                    */
 } trackerConfig;
 
 /* A peer returned by a tracker. */
@@ -125,7 +136,10 @@ typedef struct trackerResult {
 /* API                                                                      */
 /* ------------------------------------------------------------------------ */
 
-/* Set up the module. 'loop' and 'context' must outlive all tracker use. */
+/*
+ * Set up the module. 'loop' and 'context' must outlive all tracker use.
+ * Returns TRACKER_ETLS if the TLS context or CA certificates cannot be loaded.
+ */
 int32_t trackerInit(uv_loop_t *loop, parserContext *context, const trackerConfig *config);
 
 /*

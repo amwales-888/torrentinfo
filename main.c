@@ -3,10 +3,10 @@
  *
  * Inspect:  ./torrentinfo file.torrent
  * Create:   ./torrentinfo -o out.torrent [options] file1 [file2 ...]
- * Announce: ./torrentinfo -t [-T seconds] file.torrent
+ * Announce: ./torrentinfo -t [-T seconds] [-C ca.pem] file.torrent
  *
  * Build:    cc -std=c99 -Wall -Wextra -O2 -o torrentinfo main.c parser.c encoder.c \
- *               tracker.c $(pkg-config --cflags --libs libuv)
+ *               tracker.c $(pkg-config --cflags --libs libuv openssl)
  */
 #define _POSIX_C_SOURCE 200809L
 
@@ -618,7 +618,7 @@ static uint32_t startAnnounces(const parserTorrent *torrent, const char **seen,
 }
 
 static int announceTorrent(parserContext *context, const parserAllocator *allocator,
-                           const char *path, uint32_t timeoutSeconds)
+                           const char *path, uint32_t timeoutSeconds, const char *caFile)
 {
     static const char alphabet[] = "0123456789abcdefghijklmnopqrstuvwxyz";
     const parserTier *tier;
@@ -657,6 +657,7 @@ static int announceTorrent(parserContext *context, const parserAllocator *alloca
         config.peerId[8 + i] = (uint8_t)alphabet[randomBytes[i] % (sizeof(alphabet) - 1u)];
     }
     config.port = 6881;
+    config.caFile = caFile;
 
     uv_loop_init(&loop);
     status = trackerInit(&loop, context, &config);
@@ -720,7 +721,7 @@ static void usage(const char *program)
     fprintf(stderr,
             "usage: %s <file.torrent>\n"
             "       %s -o <output.torrent> [options] <file>...\n"
-            "       %s -t [-T seconds] <file.torrent>\n"
+            "       %s -t [-T seconds] [-C ca.pem] <file.torrent>\n"
             "\n"
             "  -o file   create a torrent from the given files and write it to 'file'\n"
             "  -a url    tracker announce URL (repeat for more; one tier each)\n"
@@ -732,7 +733,9 @@ static void usage(const char *program)
             "  -p        mark the torrent private\n"
             "\n"
             "  -t        announce to every tracker in the torrent and list the peers\n"
-            "  -T secs   announce timeout (default 15)\n",
+            "  -T secs   announce timeout (default 15)\n"
+            "  -C file   trust the CA certificates in this PEM file for HTTPS\n"
+            "            trackers (default: the system's certificate store)\n",
             program, program, program);
 }
 
@@ -746,7 +749,8 @@ int main(int argc, char **argv)
     const char     *outputPath = NULL;
     uint8_t         createOnly = 0;     /* an option that only makes sense with -o */
     uint8_t         announce = 0;
-    uint8_t         timeoutGiven = 0;  /* -T only makes sense with -t */
+    uint8_t         announceOnly = 0;   /* -T or -C: only make sense with -t */
+    const char     *caFile = NULL;
     uint32_t        timeoutSeconds = defaultAnnounceTimeout;
     unsigned long   number;
     char           *end;
@@ -772,7 +776,7 @@ int main(int argc, char **argv)
     options.trackers = (const char *const *)trackers;
     options.webSeeds = (const char *const *)webSeeds;
 
-    while ((option = getopt(argc, argv, "o:a:w:c:n:l:ptT:h")) != -1) {
+    while ((option = getopt(argc, argv, "o:a:w:c:n:l:ptT:C:h")) != -1) {
         switch (option) {
         case 'o':
             outputPath = optarg;
@@ -815,7 +819,11 @@ int main(int argc, char **argv)
                 goto cleanup;
             }
             timeoutSeconds = (uint32_t)number;
-            timeoutGiven = 1;
+            announceOnly = 1;
+            break;
+        case 'C':
+            caFile = optarg;
+            announceOnly = 1;
             break;
         case 'h':
             usage(argv[0]);
@@ -827,7 +835,7 @@ int main(int argc, char **argv)
         }
     }
 
-    if (timeoutGiven && !announce) {
+    if (announceOnly && !announce) {
         usage(argv[0]);
         goto cleanup;
     }
@@ -837,7 +845,7 @@ int main(int argc, char **argv)
             usage(argv[0]);
             goto cleanup;
         }
-        status = announceTorrent(&context, &allocator, argv[optind], timeoutSeconds);
+        status = announceTorrent(&context, &allocator, argv[optind], timeoutSeconds, caFile);
     } else if (outputPath != NULL) {
         if (optind >= argc) {
             usage(argv[0]);

@@ -15,3 +15,5 @@ Future direction may include a service/daemon, interaction with the service/daem
 See **[Usage Instructions](USAGE.md)**
 
 See **[Build Instructions](BUILDING.md)**
+
+See **[Architecture](ARCHITECTURE.md)**

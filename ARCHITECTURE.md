@@ -1,7 +1,8 @@
-# torrentinfo — Architecture
+# libaTorrent and torrentinfo — Architecture
 
-*13 November 2026. Covers the state of the code at the time of writing:
-about 27,000 lines of C99 in `src/` (23 library modules plus `main.c`).*
+*13 November 2026; updated 27 November 2026 after Phases 0 to 2 of
+DAEMON.md. Covers about 30,000 lines of C99 in `src/` (32 library modules
+plus `main.c`) and 1,800 lines of unit tests in `tests/`.*
 
 This document describes how the library and the `torrentinfo` program are
 put together. It covers:
@@ -20,8 +21,11 @@ For building see *BUILDING.md*; for using the program see *USAGE.md*.
 
 ## 1. Overview
 
-`torrentinfo` is a BitTorrent client library (`libtorrentinfo.a`) and a
-command-line program built on it. The program can:
+**libaTorrent** is a BitTorrent client library (`libaTorrent.a`, and the
+shared `libaTorrent.so`, `libaTorrent.dylib` or `libaTorrent.dll`), and
+`torrentinfo` is a command-line program built on it. The shared libraries
+export only the public `aTorrent…` functions of `aTorrent.h`; the modules
+below are internal. The program can:
 
 - inspect a torrent;
 - create one;
@@ -74,9 +78,15 @@ The library is layered. Lower layers know nothing of the ones above them.
 ```mermaid
 flowchart TB
     subgraph App["Program"]
-        main["main.c — command line, settings, orchestration, progress"]
+        main["main.c — command line, output, progress"]
+    end
+    subgraph Public["Public interface"]
+        api["aTorrent.c — aTorrent… functions (ATORRENT_API)"]
     end
     subgraph Orchestration["Orchestration"]
+        session["session.c — many torrents: one port, DHT node, port mapping, limits, tick"]
+        torrent["torrent.c — one torrent: magnet metadata, download, trackers, stopping"]
+        bandwidth["bandwidth.c — token buckets, shares of a session limit"]
         download["download.c — piece picking, peers, choking, uploads, web seeds, resume"]
         metadata["metadata.c — magnet: fetch the info dictionary (BEP 9)"]
         announce["announce.c — tracker schedule (all tiers, re-announce, backoff)"]
@@ -102,14 +112,25 @@ flowchart TB
         magnet["magnet.c — magnet links"]
         blocklist["blocklist.c — IP ranges"]
         config["config.c — settings file"]
+        settings["settings.c — defaults, settings file, overrides"]
+        selection["selection.c — choosing files"]
+        datafile["datafile.c — the data directory, whole-file I/O"]
+        bencode["bencode.c — the bencode writer"]
+        event["event.c — event levels and codes"]
     end
     subgraph Platform["Platform"]
         platform["platform.c — files, interface binding, gateway, certificates, data directory"]
         net["net.c — choosing a network interface"]
     end
-    main --> download & metadata & announce & dht & portmap
+    main --> session & settings & selection & datafile & api
+    session --> torrent & dht & portmap & bandwidth
+    torrent --> download & metadata & announce
+    download --> bandwidth
+    settings --> config & blocklist & datafile
     download --> peer & storage & piece & webseed & resume & extension
+    download & metadata --> event
     metadata --> peer & extension
+    dht & extension & magnet & encoder --> bencode
     announce --> tracker
     tracker --> http & udp
     webseed --> http
@@ -124,21 +145,21 @@ flowchart TB
 | Module | Lines | Responsibility |
 |---|---:|---|
 | `parser` | 932 | Bencode decoding, `.torrent` parsing into `parserTorrent`, SHA-1, the `parserContext` (allocator). Keeps the raw info dictionary's position for magnet links. |
-| `encoder` | 981 | Creating `.torrent` files: walks files, hashes pieces on the thread pool. |
+| `encoder` | 868 | Creating `.torrent` files: walks files, hashes pieces on the thread pool. |
 | `message` | 262 | Encoding and decoding peer-wire messages; bitfield helpers. |
 | `piece` | 203 | Assembling one piece from 16 KiB blocks, tracking block states, SHA-1 check. |
 | `storage` | 1336 | Files on disk: creation, the part file for skipped files, the parallel check of existing data, fast-resume trust, positional reads and writes on the thread pool, a handle cache. |
-| `peer` | 1709 | One TCP connection to a peer: handshake, message stream, keep-alives, listening and routing incoming connections, and the MSE/PE encryption layer. |
-| `extension` | 442 | BEP 10 extended handshake, peer exchange (BEP 11), metadata messages (BEP 9). |
+| `peer` | 1732 | One TCP connection to a peer: handshake, message stream, keep-alives, listening and routing incoming connections, and the MSE/PE encryption layer. |
+| `extension` | 395 | BEP 10 extended handshake, peer exchange (BEP 11), metadata messages (BEP 9). |
 | `crypto` | 127 | 768-bit Diffie-Hellman (OpenSSL BIGNUM) and RC4. |
 | `http` | 1215 | A small HTTP/1.0 client over libuv TCP, with TLS through OpenSSL memory BIOs; GET (with extra headers) and POST. |
 | `udp` | 645 | UDP tracker protocol (BEP 15). |
-| `tracker` | 944 | One announce to one tracker (HTTP or UDP), results normalised. |
-| `announce` | 418 | Keeps every tracker of a torrent announced: tiers, intervals, retries, event `started`/`completed`/`stopped`. |
-| `dht` | 1653 | A DHT node: routing table, lookups, `get_peers`/`announce_peer`, tokens, saved state. |
-| `metadata` | 696 | Fetching a magnet link's info dictionary from peers. |
-| `magnet` | 400 | Parsing magnet links, building a `.torrent` from fetched metadata, making a magnet link from a torrent. |
-| `download` | 3345 | The heart: one torrent's download and seeding. Piece selection, request pipelines, endgame, choking, uploads, PEX, web seeds, rate limits, blocklist, fast resume. |
+| `tracker` | 985 | One announce to one tracker (HTTP or UDP), results normalised. |
+| `announce` | 419 | Keeps every tracker of a torrent announced: tiers, intervals, retries, event `started`/`completed`/`stopped`. |
+| `dht` | 1630 | A DHT node: routing table, lookups, `get_peers`/`announce_peer`, tokens, saved state. |
+| `metadata` | 711 | Fetching a magnet link's info dictionary from peers. |
+| `magnet` | 348 | Parsing magnet links, building a `.torrent` from fetched metadata, making a magnet link from a torrent. |
+| `download` | 3430 | The heart: one torrent's download and seeding. Piece selection, request pipelines, endgame, choking, uploads, PEX, web seeds, rate limits, blocklist, fast resume. |
 | `webseed` | 474 | Fetching byte ranges of a torrent from an HTTP server. |
 | `resume` | 455 | The fast-resume file: encode, seal, write atomically, load and validate. |
 | `portmap` | 921 | NAT-PMP and UPnP IGD port mapping. |
@@ -146,7 +167,16 @@ flowchart TB
 | `config` | 569 | The `key = value` settings file. |
 | `net` | 441 | Resolving `-I` (an interface name or address) into a binding applied to every socket. |
 | `platform` | 936 | Everything that differs by operating system (section 8). |
-| `main` | 3598 | The program: options, settings, and wiring the modules together for each mode. |
+| `bencode` | 185 | The bencode writer used by the DHT, extension messages, magnet links and the torrent creator: a fixed buffer or a growing one, with a sticky error. |
+| `settings` | 248 | Defaults, then the settings file, then the caller's overrides; loading the settings file (writing the template on first run) and the blocklist. |
+| `selection` | 290 | File numbers (`1,3,5-7`) and patterns (`*.mkv`) into one byte per file; errors as codes, nothing printed. |
+| `datafile` | 209 | Paths in the data directory; reading and writing whole files, atomically when asked. |
+| `event` | 46 | Names for event levels and codes (`event.h` defines `eventInfo`). |
+| `aTorrent` | 25 | The public entry points (`aTorrentVersion`, …), the only names the shared libraries export. |
+| `bandwidth` | 130 | Token buckets (a download's own limits) and shares of a session limit, divided every tick among the downloads that are sending. |
+| `session` | 585 | Many torrents on one loop: the peer and tracker modules, one listening port whose connections go to the torrent asked for (plain, or encrypted via `SHA1("req2", hash)`), port mapping, one DHT node, session-wide speed limits and connection caps, one 100 ms tick, and a clean stop of everything. |
+| `torrent` | 860 | One torrent inside a session, from start to stop: for a magnet link the torrent kept from before or its metadata from peers; then the file choice, the download, DHT lookups and trackers, and a clean stop. Reports through structured callbacks; prints nothing. |
+| `main` | 2988 | The program: options, output, the probing modes, and a session for `-D` (several torrents at once). |
 
 ---
 
@@ -200,7 +230,7 @@ flowchart LR
 | `uv_timer_t` | almost every module | Handshake timeouts, keep-alives (peer: 15 s tick), the download's 100 ms tick (rate limits) and 1 s logic, re-announces, DHT upkeep, retries with backoff, mapping renewals. |
 | `uv_queue_work` | `storage`, `download`, `encoder` | Disk I/O, the parallel check of existing data (4 jobs), per-piece SHA-1 checks, resume saves, hashing new torrents. |
 | `uv_getaddrinfo` | `http`, `udp`, `dht` | Tracker host names and DHT bootstrap routers. |
-| `uv_signal_t` | `main` | Ctrl-C (SIGINT) and SIGTERM: a clean stop (tell trackers, save resume data, remove the port mapping). |
+| `uv_signal_t` | `main` | Ctrl-C (SIGINT) and SIGTERM: `torrentStop`, a clean stop (tell trackers, save resume data, remove the port mapping). |
 | `uv_random` | `crypto`, `dht`, `download`, `udp`, `tracker`, `main` | Keys, peer ids, transaction ids, tokens, randomised choices. |
 | `uv_interface_addresses`, `uv_os_homedir`, `uv_os_getenv` | `net`, `platform` | Interface discovery and data-directory location. |
 
@@ -243,7 +273,10 @@ once at start-up, so a handshake never reads files on the loop thread.
 Several modules are driven by a single repeating timer per object rather
 than many one-shot timers.
 
-**The download's timer** ticks every **100 ms**:
+**The session's timer** ticks every **100 ms**: it divides the session-wide
+speed limits among the downloads, then runs each download's tick, starting
+with a different one each time. (A download outside a session runs the same
+tick on a timer of its own.) **A download's tick**:
 
 - refills the speed-limit token buckets;
 - lets uploads and requests through, round-robin between peers;
@@ -312,9 +345,10 @@ pattern.
   3. the storage closes;
   4. the last outstanding callback frees the download.
 
-`main.c` keeps calling `uv_run()` until the loop has nothing left, which
-is how it waits for all of this. Its leak counter then confirms that
-nothing was missed.
+The program keeps calling `uv_run()` until the loop has nothing left,
+which is how it waits for all of this; only then does it release the
+torrent task (`torrentEnd`). Its leak counter then confirms that nothing
+was missed.
 
 ---
 
@@ -372,7 +406,7 @@ pieces don't overlap.
 
 ```mermaid
 sequenceDiagram
-    participant M as main
+    participant M as torrent
     participant D as download
     participant S as storage (pool)
     participant A as announce/tracker
@@ -405,13 +439,17 @@ sequenceDiagram
 
 ### 5.1 Steps in more detail
 
-1. **Starting.** `main` parses the torrent, or for a magnet link runs
-   `metadata` first: it fetches the info dictionary from peers, checks it
-   against the info hash and caches it. It also:
-   - loads the settings file and the blocklist;
-   - sets the encryption policy;
-   - computes the file selection (`-f`/`-F`) and the resume file's path;
-   - calls `downloadBegin`.
+1. **Starting.** The program (`main`) loads the settings file and the
+   blocklist, sets the encryption policy, and starts a torrent task
+   (`torrent.c`) with a `.torrent` or a magnet link. For a magnet link the
+   task uses the torrent kept from before, or runs `metadata` first: it
+   fetches the info dictionary from peers, checks it against the info hash
+   and keeps it. Both phases run on the same loop and share the peer and
+   tracker modules and the DHT node. The task then:
+   - applies the file selection (`-f`/`-F`) and finds the resume file;
+   - calls `downloadBegin`;
+   - listens, asks the router to forward the port, and starts the DHT
+     lookup; trackers are announced to once the files are ready.
 2. **Opening storage.** On the pool, the files are created or resized,
    and each file's size and time are compared with the resume file. Only
    pieces in changed or unknown data are hashed, in 4 parallel jobs. Back
@@ -683,6 +721,36 @@ since then.
     unfinished pieces kept.
 19. **macOS port (experimental):** `Makefile-macOS`, `IP_BOUND_IF`, the
     Darwin routing sysctl, the macOS data directory.
+20. **Groundwork for a daemon (Phase 0 of DAEMON.md):**
+    - the library renamed **libaTorrent**, built static and shared, with
+      the public header `aTorrent.h` and everything else hidden;
+    - `bencode.c` replaces four separate writers;
+    - `settings.c`, `selection.c` and `datafile.c` take over code from
+      `main.c`, which no longer has globals;
+    - `event.c`: levels and codes for everything the engine reports;
+    - unit tests (`make check`).
+21. **The torrent task (Phase 1 of DAEMON.md):** `torrent.c` takes over
+    the download and magnet modes from `main.c`: the metadata phase, the
+    download, trackers, the DHT, port mapping and a clean stop, reported
+    through callbacks. Both phases of a magnet link now share one loop,
+    one DHT node and one tracker module (`trackerSetPort`). The program's
+    output is unchanged.
+22. **The session (Phase 2 of DAEMON.md):** `session.c` runs many torrents
+    on one loop and owns what they share: one listening port (incoming
+    connections routed by info hash, and encrypted ones through a lookup
+    callback, `peerListenerSetHashLookup`, instead of a list of 16), one
+    DHT node, one port mapping, session-wide speed limits divided fairly
+    (`bandwidth.c`), caps on open and half-open connections, and one tick.
+    The tracker module is now reference-counted and takes the port per
+    announce. `-D` accepts several torrents. Two long-standing faults
+    found on the way:
+    - a download whose requests had all been answered waited for its
+      1 s tick before starting new pieces, so our own client seeding to
+      itself ran at about 80 KiB/s with 16 KiB pieces (now over 100 MB/s
+      on loopback);
+    - a peer that refused or dropped the handshake was never tried again,
+      so a seed that was still checking its files was lost for good; such
+      peers are now retried (3 attempts, 30 s apart).
 
 ---
 
@@ -705,6 +773,17 @@ since then.
   - DHT both ways;
   - magnet metadata;
   - encryption forced, disabled and header-only, in both directions.
+- **Unit tests** (`make check`, `tests/`): 464 checks of the bencode
+  writer (exact output, sticky errors, a 2,000-value fuzz round trip
+  through `parserCursor`), a three-node DHT on loopback, file selection,
+  settings precedence and blocklist rules, data files, bandwidth shares
+  (simulated over time), and two sessions on loopback: a magnet-link
+  download and the torrent kept for next time, two torrents on one port
+  with plain and with encrypted connections, a session-wide limit split
+  fairly between two torrents, 100 torrents at once, and every early end;
+  with a counting
+  allocator that fails a suite that leaks. They run under the sanitizers
+  and on Windows.
 - **A regression script** runs 24 checks covering every feature against
   those servers and libtorrent. After the macOS changes it passed:
   - on Linux release, ASan/UBSan and TSan builds;
@@ -746,9 +825,11 @@ Roughly in order of value and size.
 - **Sparse files on Windows** (`FSCTL_SET_SPARSE`), to avoid NTFS
   zero-filling when writing into the middle of new large files.
 - **Logging** with levels and a callback, instead of `printf` from `main`.
+  *Done: `event.c` (Phase 0) and `torrent.c`'s callbacks (Phase 1).*
 - **Moving the orchestration out of `main.c`.** Announce, DHT and port
   mapping wiring, progress and stopping would move into the library, so
-  that embedders and the daemon get it for free.
+  that embedders and the daemon get it for free. *Done for one torrent:
+  `torrent.c` (Phase 1); the session for many is next.*
 - **Live reload** of settings and the blocklist.
 
 ### 11.3 Platforms and packaging
@@ -763,7 +844,10 @@ Roughly in order of value and size.
 
 ## 12. Proposed service (daemon) with shared memory
 
-The goal is a long-running `torrentinfod` that manages many torrents.
+The goal is a long-running daemon (`torrentinfo daemon`) that manages many
+torrents. DAEMON.md turns this section into a plan and records the
+decisions taken (one process, one thread, a bencoded control protocol);
+where the two differ, DAEMON.md is current.
 Client programs — a command-line tool, a terminal dashboard, a GUI, a
 script — need to:
 

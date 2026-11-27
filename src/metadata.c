@@ -111,13 +111,18 @@ static int stopped(const metadataFetch *f)
     return f->done || f->ended;
 }
 
+/* Report something: level and code for programs, a message for people,
+ * and the peer concerned (or NULL). */
 #if defined(__GNUC__)
-static void emit(metadataFetch *f, const char *format, ...) __attribute__((format(printf, 2, 3)));
+static void emit(metadataFetch *f, uint32_t level, uint32_t code, const struct sockaddr *peer,
+                 const char *format, ...) __attribute__((format(printf, 5, 6)));
 #endif
 
-static void emit(metadataFetch *f, const char *format, ...)
+static void emit(metadataFetch *f, uint32_t level, uint32_t code, const struct sockaddr *peer,
+                 const char *format, ...)
 {
-    va_list arguments;
+    eventInfo event;
+    va_list   arguments;
 
     if (stopped(f) || f->events.onEvent == NULL) {
         return;
@@ -125,7 +130,13 @@ static void emit(metadataFetch *f, const char *format, ...)
     va_start(arguments, format);
     vsnprintf(f->message, sizeof(f->message), format, arguments);
     va_end(arguments);
-    f->events.onEvent(f->privateArg, f, f->message);
+    event.level = level;
+    event.code = code;
+    event.message = f->message;
+    event.peer = peer;
+    event.piece = EVENT_NO_PIECE;
+    event.url = NULL;
+    f->events.onEvent(f->privateArg, f, &event);
 }
 
 static void formatAddress(const struct sockaddr *address, char *out, size_t size)
@@ -212,7 +223,8 @@ static void dropPeer(metaPeer *peer, const char *reason, int exclude)
     peer->excluded = (uint8_t)(peer->excluded || exclude);
     requeue(f, peer);
     if (reason != NULL) {
-        emit(f, "%s: %s", peer->where, reason);
+        emit(f, EVENT_LEVEL_DEBUG, EVENT_METADATA_PEER, (const struct sockaddr *)&peer->address,
+             "%s: %s", peer->where, reason);
     }
     if (stopped(f)) {
         return;
@@ -278,7 +290,8 @@ static void checkMetadata(metadataFetch *f)
         return;
     }
     /* Wrong: whoever sent pieces of it is not asked again. */
-    emit(f, "the metadata received does not match the info hash; fetching it again");
+    emit(f, EVENT_LEVEL_WARNING, EVENT_METADATA_MISMATCH, NULL,
+         "the metadata received does not match the info hash; fetching it again");
     for (i = 0; i < f->pieces; i++) {
         peer = f->pieceFrom[i];
         f->pieceState[i] = PIECE_MISSING;
@@ -389,7 +402,8 @@ static void receiveHandshake(metadataFetch *f, metaPeer *peer, const uint8_t *da
          * none offers it, say what that probably means, once. */
         if (!f->offered && !f->hinted && f->refusals >= 3u) {
             f->hinted = 1;
-            emit(f, "%u peers have the torrent but none will send its details: it is most "
+            emit(f, EVENT_LEVEL_WARNING, EVENT_METADATA_REFUSED, NULL,
+                 "%u peers have the torrent but none will send its details: it is most "
                  "likely a private torrent, which cannot be fetched from a magnet link. Use "
                  "the .torrent file instead.", (unsigned)f->refusals);
         }
@@ -414,7 +428,8 @@ static void receiveHandshake(metadataFetch *f, metaPeer *peer, const uint8_t *da
             dropPeer(peer, "metadata too large for memory", 0);
             return;
         }
-        emit(f, "metadata is %u bytes in %u piece%s", (unsigned)f->size, (unsigned)f->pieces,
+        emit(f, EVENT_LEVEL_INFO, EVENT_METADATA_SIZE, NULL,
+             "metadata is %u bytes in %u piece%s", (unsigned)f->size, (unsigned)f->pieces,
              (f->pieces == 1u) ? "" : "s");
         TAILQ_FOREACH(other, &f->peers, entries) {
             if (other != peer) {

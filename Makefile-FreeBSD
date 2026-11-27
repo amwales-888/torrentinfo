@@ -1,10 +1,13 @@
-# Makefile-FreeBSD - torrentinfo for FreeBSD (the system's make)
+# Makefile-FreeBSD - libaTorrent and the torrentinfo program for FreeBSD
+# (the system's make)
 #
-#   make -f Makefile-FreeBSD             build the library and the torrentinfo program
+#   make -f Makefile-FreeBSD             build the libraries and the torrentinfo program
 #   make -f Makefile-FreeBSD debug       build with AddressSanitizer and UBSan in
 #                                        build/freebsd/debug
-#   make -f Makefile-FreeBSD lib         build only libtorrentinfo.a
-#   make -f Makefile-FreeBSD install     install program, library and headers under
+#   make -f Makefile-FreeBSD lib         build only libaTorrent.a and libaTorrent.so
+#   make -f Makefile-FreeBSD check       build and run the unit tests (with debug:
+#                                        under the sanitizers)
+#   make -f Makefile-FreeBSD install     install program, libraries and headers under
 #                                        ${PREFIX} (as root, or with DESTDIR)
 #   make -f Makefile-FreeBSD uninstall   remove what 'install' installed
 #   make -f Makefile-FreeBSD clean       remove the FreeBSD build output
@@ -32,21 +35,37 @@ PKG_CONFIG?=    pkgconf
 
 BINDIR=         ${PREFIX}/bin
 LIBDIR=         ${PREFIX}/lib
-INCLUDEDIR=     ${PREFIX}/include/torrentinfo
+INCLUDEDIR=     ${PREFIX}/include/aTorrent
+
+# The library's version; the shared library's soname changes with MAJOR.
+VERSION_MAJOR=  0
+VERSION=        0.1.0
 
 PROGRAM=        torrentinfo
-LIBRARY=        libtorrentinfo.a
+LIBRARY=        libaTorrent.a
+SONAME=         libaTorrent.so.${VERSION_MAJOR}
+SHARED=         libaTorrent.so.${VERSION}
+SHAREDLINK=     libaTorrent.so
+CHECK=          check
 SRCDIR=         src
+TESTDIR=        tests
 
-LIB_SOURCES=    platform.c net.c extension.c parser.c encoder.c http.c udp.c \
-                tracker.c message.c peer.c piece.c storage.c download.c \
-                announce.c portmap.c magnet.c metadata.c dht.c blocklist.c \
-                config.c crypto.c webseed.c resume.c
+LIB_SOURCES=    aTorrent.c bandwidth.c bencode.c datafile.c event.c \
+                selection.c session.c settings.c torrent.c platform.c net.c \
+                extension.c parser.c encoder.c http.c udp.c tracker.c \
+                message.c peer.c piece.c storage.c download.c announce.c \
+                portmap.c magnet.c metadata.c dht.c blocklist.c config.c \
+                crypto.c webseed.c resume.c
 APP_SOURCES=    main.c
-HEADERS=        queue.h platform.h net.h extension.h parser.h encoder.h http.h \
-                udp.h tracker.h message.h peer.h piece.h storage.h download.h \
-                announce.h portmap.h magnet.h metadata.h dht.h blocklist.h \
-                config.h crypto.h webseed.h resume.h
+CHECK_SOURCES=  check.c check_bencode.c check_datafile.c check_dht.c \
+                check_selection.c check_settings.c check_bandwidth.c \
+                check_session.c
+HEADERS=        aTorrent.h queue.h bandwidth.h bencode.h datafile.h event.h \
+                selection.h session.h settings.h torrent.h platform.h net.h \
+                extension.h parser.h encoder.h http.h udp.h tracker.h \
+                message.h peer.h piece.h storage.h download.h announce.h \
+                portmap.h magnet.h metadata.h dht.h blocklist.h config.h \
+                crypto.h webseed.h resume.h
 
 # Release builds in build/freebsd/release, debug builds in build/freebsd/debug.
 BUILDROOT=      build/freebsd
@@ -81,6 +100,10 @@ CFLAGS+=        -g -std=c99 -Wall -Wextra -Wpedantic -Wshadow -Wconversion
 # OpenSSL first, so that OPENSSLBASE wins over any copy under LOCALBASE.
 CFLAGS+=        ${SSL_CFLAGS} ${UV_CFLAGS}
 LDLIBS+=        ${UV_LIBS} ${SSL_LIBS} -lpthread
+# One set of objects serves both libraries: position-independent for the
+# shared one, and with only ATORRENT_API names exported from it (hidden
+# names still link normally from the static library).
+LIBFLAGS=       -fPIC -fvisibility=hidden
 
 .if make(debug)
 CFLAGS+=        -O1 -fno-omit-frame-pointer -fsanitize=address,undefined
@@ -99,10 +122,11 @@ Q=              @
 # ---------------------------------------------------------------------------
 
 .MAIN: all
-.PHONY: all debug lib install uninstall clean
+.PHONY: all debug lib check install uninstall clean
 
 LIB_OBJECTS=
 APP_OBJECTS=
+CHECK_OBJECTS=
 DEPEND_HEADERS= ${HEADERS:S,^,${SRCDIR}/,}
 
 # One rule per source file; every object depends on every header, which is
@@ -112,7 +136,7 @@ LIB_OBJECTS+=   ${BUILD}/${source:R}.o
 ${BUILD}/${source:R}.o: ${SRCDIR}/${source} ${DEPEND_HEADERS}
 	@mkdir -p ${BUILD}
 	@echo "  CC     ${SRCDIR}/${source}"
-	${Q}${CC} ${CPPFLAGS} ${CFLAGS} -c -o ${.TARGET} ${SRCDIR}/${source}
+	${Q}${CC} ${CPPFLAGS} ${CFLAGS} ${LIBFLAGS} -c -o ${.TARGET} ${SRCDIR}/${source}
 .endfor
 .for source in ${APP_SOURCES}
 APP_OBJECTS+=   ${BUILD}/${source:R}.o
@@ -121,14 +145,36 @@ ${BUILD}/${source:R}.o: ${SRCDIR}/${source} ${DEPEND_HEADERS}
 	@echo "  CC     ${SRCDIR}/${source}"
 	${Q}${CC} ${CPPFLAGS} ${CFLAGS} -c -o ${.TARGET} ${SRCDIR}/${source}
 .endfor
+.for source in ${CHECK_SOURCES}
+CHECK_OBJECTS+= ${BUILD}/tests/${source:R}.o
+${BUILD}/tests/${source:R}.o: ${TESTDIR}/${source} ${TESTDIR}/check.h ${DEPEND_HEADERS}
+	@mkdir -p ${BUILD}/tests
+	@echo "  CC     ${TESTDIR}/${source}"
+	${Q}${CC} ${CPPFLAGS} -I${SRCDIR} ${CFLAGS} -c -o ${.TARGET} ${TESTDIR}/${source}
+.endfor
 
-all: ${BUILD}/${PROGRAM}
+all: ${BUILD}/${PROGRAM} ${BUILD}/${SHARED}
 	${Q}ln -sf ${BUILD}/${PROGRAM} ${PROGRAM}
 
 debug: ${BUILD}/${PROGRAM}
 	@echo "Debug build: ${BUILD}/${PROGRAM}"
 
-lib: ${BUILD}/${LIBRARY}
+lib: ${BUILD}/${LIBRARY} ${BUILD}/${SHARED}
+
+# The unit tests, run in a scratch directory under the build directory.
+check: ${BUILD}/${CHECK}
+	${Q}rm -rf ${BUILD}/check-scratch && mkdir -p ${BUILD}/check-scratch
+	${Q}${BUILD}/${CHECK} ${.CURDIR}/${BUILD}/check-scratch
+
+${BUILD}/${CHECK}: ${CHECK_OBJECTS} ${BUILD}/${LIBRARY}
+	@echo "  LINK   ${.TARGET}"
+	${Q}${CC} ${LDFLAGS} -o ${.TARGET} ${CHECK_OBJECTS} ${BUILD}/${LIBRARY} ${LDLIBS}
+
+${BUILD}/${SHARED}: ${LIB_OBJECTS}
+	@echo "  LINK   ${.TARGET}"
+	${Q}${CC} ${LDFLAGS} -shared -Wl,-soname,${SONAME} -o ${.TARGET} ${LIB_OBJECTS} ${LDLIBS}
+	${Q}ln -sf ${SHARED} ${BUILD}/${SONAME}
+	${Q}ln -sf ${SONAME} ${BUILD}/${SHAREDLINK}
 
 ${BUILD}/${PROGRAM}: ${APP_OBJECTS} ${BUILD}/${LIBRARY}
 	@echo "  LINK   ${.TARGET}"
@@ -143,11 +189,16 @@ install: all
 	install -d ${DESTDIR}${BINDIR} ${DESTDIR}${LIBDIR} ${DESTDIR}${INCLUDEDIR}
 	install -m 755 ${BUILD}/${PROGRAM} ${DESTDIR}${BINDIR}/${PROGRAM}
 	install -m 644 ${BUILD}/${LIBRARY} ${DESTDIR}${LIBDIR}/${LIBRARY}
+	install -m 755 ${BUILD}/${SHARED} ${DESTDIR}${LIBDIR}/${SHARED}
+	ln -sf ${SHARED} ${DESTDIR}${LIBDIR}/${SONAME}
+	ln -sf ${SONAME} ${DESTDIR}${LIBDIR}/${SHAREDLINK}
 	install -m 644 ${DEPEND_HEADERS} ${DESTDIR}${INCLUDEDIR}/
 
 uninstall:
 	rm -f ${DESTDIR}${BINDIR}/${PROGRAM}
 	rm -f ${DESTDIR}${LIBDIR}/${LIBRARY}
+	rm -f ${DESTDIR}${LIBDIR}/${SHARED} ${DESTDIR}${LIBDIR}/${SONAME} \
+	      ${DESTDIR}${LIBDIR}/${SHAREDLINK}
 	rm -f ${HEADERS:S,^,${DESTDIR}${INCLUDEDIR}/,}
 	-rmdir ${DESTDIR}${INCLUDEDIR} 2>/dev/null
 

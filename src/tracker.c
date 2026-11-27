@@ -88,6 +88,7 @@ static struct {
     uint32_t                  key;          /* random, sent in announces */
     uint32_t                  nextId;
     uint32_t                  magic;
+    uint32_t                  users;        /* trackerInit() calls not yet shut down */
     struct trackerRequestList requests;
 } trackerState;
 
@@ -404,7 +405,9 @@ static char *buildAnnounceUrl(const trackerRequest *request, const httpUrl *part
                        "&key=%08" PRIx32 "%s",
                        (int)baseLength, request->url,
                        (memchr(parts->path, '?', parts->pathLength) != NULL) ? '&' : '?',
-                       infoHashText, peerIdText, (unsigned)trackerState.config.port,
+                       infoHashText, peerIdText,
+                       (unsigned)((request->params.port != 0) ? request->params.port
+                                                              : trackerState.config.port),
                        request->params.uploaded, request->params.downloaded,
                        request->params.left,
                        (request->params.event == TRACKER_EVENT_STOPPED) ? 0u : numWant(),
@@ -708,7 +711,11 @@ int32_t trackerInit(uv_loop_t *loop, parserContext *context, const trackerConfig
         return TRACKER_EINVAL;
     }
     if (trackerState.magic == TRACKER_STATE_MAGIC) {
-        return TRACKER_EINVAL;                      /* already initialised */
+        if (loop != trackerState.loop || context != trackerState.context) {
+            return TRACKER_EINVAL;                  /* one loop and context per process */
+        }
+        trackerState.users++;                       /* the first caller's settings stay */
+        return TRACKER_OK;
     }
 
     /* HTTP and HTTPS trackers go through the http module. */
@@ -731,6 +738,7 @@ int32_t trackerInit(uv_loop_t *loop, parserContext *context, const trackerConfig
     trackerState.key = random32();
     trackerState.nextId = 1;
     TAILQ_INIT(&trackerState.requests);
+    trackerState.users = 1;
     trackerState.magic = TRACKER_STATE_MAGIC;
     return TRACKER_OK;
 }
@@ -806,7 +814,8 @@ int32_t trackerAnnounce(const uint8_t infoHash[PARSER_SHA1_LENGTH], const char *
         params.key = trackerState.key;
         params.numWant = (request->params.event == TRACKER_EVENT_STOPPED)
                              ? 0 : (int32_t)numWant();
-        params.port = trackerState.config.port;
+        params.port = (request->params.port != 0) ? request->params.port
+                                                  : trackerState.config.port;
         result = fromUdpStatus(udpAnnounce(trackerUrl, &params, 0, onUdpDone, request,
                                            &request->udp));
     }
@@ -908,12 +917,44 @@ int32_t trackerList(uint32_t *ids, uint32_t capacity, uint32_t *count)
     return TRACKER_OK;
 }
 
+void trackerSetPort(uint16_t port)
+{
+    if (trackerState.magic == TRACKER_STATE_MAGIC) {
+        trackerState.config.port = port;
+    }
+}
+
+void trackerPeerAddress(const trackerPeer *peer, struct sockaddr_storage *address)
+{
+    uint8_t *port;
+
+    memset(address, 0, sizeof(*address));
+    if (peer->family == TRACKER_FAMILY_IPV4) {
+        struct sockaddr_in *in = (struct sockaddr_in *)address;
+
+        in->sin_family = AF_INET;
+        memcpy(&in->sin_addr, peer->address, 4);
+        port = (uint8_t *)&in->sin_port;
+    } else {
+        struct sockaddr_in6 *in6 = (struct sockaddr_in6 *)address;
+
+        in6->sin6_family = AF_INET6;
+        memcpy(&in6->sin6_addr, peer->address, 16);
+        port = (uint8_t *)&in6->sin6_port;
+    }
+    port[0] = (uint8_t)(peer->port >> 8);           /* network byte order */
+    port[1] = (uint8_t)(peer->port & 0xFFu);
+}
+
 void trackerShutdown(void)
 {
     trackerRequest *request;
 
     if (trackerState.magic != TRACKER_STATE_MAGIC) {
         return;
+    }
+    if (--trackerState.users > 0) {
+        return;                                     /* others still use it */
     }
     while ((request = TAILQ_FIRST(&trackerState.requests)) != NULL) {
         trackerClose(request->id);

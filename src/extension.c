@@ -2,69 +2,20 @@
  * extension.c - BEP 10 extended handshake and BEP 11 peer exchange
  * messages. See extension.h.
  */
-#include <stdio.h>
 #include <string.h>
 
 #include "extension.h"
 #include "parser.h"
-
-/* ------------------------------------------------------------------------ */
-/* Writing bencode into a fixed buffer                                      */
-/* ------------------------------------------------------------------------ */
-
-typedef struct writer {
-    uint8_t *out;
-    size_t   size;
-    size_t   used;
-    int      failed;
-} writer;
-
-static void put(writer *w, const void *data, size_t length)
-{
-    if (w->failed || length > w->size - w->used) {
-        w->failed = 1;
-        return;
-    }
-    memcpy(w->out + w->used, data, length);
-    w->used += length;
-}
-
-static void putText(writer *w, const char *text)
-{
-    put(w, text, strlen(text));
-}
-
-static void putString(writer *w, const void *data, size_t length)
-{
-    char prefix[24];
-
-    snprintf(prefix, sizeof(prefix), "%lu:", (unsigned long)length);
-    putText(w, prefix);
-    put(w, data, length);
-}
-
-static void putKey(writer *w, const char *key)
-{
-    putString(w, key, strlen(key));
-}
-
-static void putInteger(writer *w, uint64_t value)
-{
-    char text[32];
-
-    snprintf(text, sizeof(text), "i%llue", (unsigned long long)value);
-    putText(w, text);
-}
+#include "bencode.h"
 
 /* The compact form of the peers of one family, and optionally their flags. */
-static void putPeers(writer *w, const char *key, const extensionPeer *peers, uint32_t count,
+static void putPeers(bencodeWriter *w, const char *key, const extensionPeer *peers, uint32_t count,
                      uint8_t family, int flags)
 {
     uint8_t  entry[18];
     size_t   width = (family == 4u) ? 6u : 18u;
     uint32_t total = 0;
     uint32_t i;
-    char     prefix[24];
 
     for (i = 0; i < count && i < EXTENSION_MAX_PEX_PEERS; i++) {
         total += (peers[i].family == family) ? 1u : 0u;
@@ -72,30 +23,29 @@ static void putPeers(writer *w, const char *key, const extensionPeer *peers, uin
     if (total == 0) {
         return;
     }
-    putKey(w, key);
-    snprintf(prefix, sizeof(prefix), "%lu:", (unsigned long)(flags ? total : total * width));
-    putText(w, prefix);
+    bencodeText(w, key);
+    bencodeStringHeader(w, flags ? total : total * width);
     for (i = 0; i < count && i < EXTENSION_MAX_PEX_PEERS; i++) {
         if (peers[i].family != family) {
             continue;
         }
         if (flags) {
-            put(w, &peers[i].flags, 1);
+            bencodeRaw(w, &peers[i].flags, 1);
         } else {
             memcpy(entry, peers[i].address, width - 2u);
             entry[width - 2u] = (uint8_t)(peers[i].port >> 8);
             entry[width - 1u] = (uint8_t)(peers[i].port & 0xffu);
-            put(w, entry, width);
+            bencodeRaw(w, entry, width);
         }
     }
 }
 
-static int32_t finish(writer *w, size_t *length)
+static int32_t finish(const bencodeWriter *w, size_t *length)
 {
-    if (w->failed) {
+    if (w->error != BENCODE_OK) {
         return EXTENSION_EINVAL;
     }
-    *length = w->used;
+    *length = (size_t)w->length;
     return EXTENSION_OK;
 }
 
@@ -106,41 +56,42 @@ static int32_t finish(writer *w, size_t *length)
 int32_t extensionEncodeHandshake(const extensionHandshake *handshake, uint8_t *out, size_t size,
                                  size_t *length)
 {
-    writer w = { out, size, 0, 0 };
+    bencodeWriter w;
 
     if (handshake == NULL || out == NULL || length == NULL) {
         return EXTENSION_EINVAL;
     }
+    bencodeWriterInitFixed(&w, out, size);
     /* Keys in sorted order: m, metadata_size, p, reqq, v. */
-    putText(&w, "d");
-    putKey(&w, "m");
-    putText(&w, "d");
+    bencodeDictBegin(&w);
+    bencodeText(&w, "m");
+    bencodeDictBegin(&w);
     if (handshake->metadataId != 0) {
-        putKey(&w, "ut_metadata");
-        putInteger(&w, handshake->metadataId);
+        bencodeText(&w, "ut_metadata");
+        bencodeUnsigned(&w, handshake->metadataId);
     }
     if (handshake->pexId != 0) {
-        putKey(&w, "ut_pex");
-        putInteger(&w, handshake->pexId);
+        bencodeText(&w, "ut_pex");
+        bencodeUnsigned(&w, handshake->pexId);
     }
-    putText(&w, "e");
+    bencodeEnd(&w);
     if (handshake->metadataSize != 0) {
-        putKey(&w, "metadata_size");
-        putInteger(&w, handshake->metadataSize);
+        bencodeText(&w, "metadata_size");
+        bencodeUnsigned(&w, handshake->metadataSize);
     }
     if (handshake->port != 0) {
-        putKey(&w, "p");
-        putInteger(&w, handshake->port);
+        bencodeText(&w, "p");
+        bencodeUnsigned(&w, handshake->port);
     }
     if (handshake->requestQueue != 0) {
-        putKey(&w, "reqq");
-        putInteger(&w, handshake->requestQueue);
+        bencodeText(&w, "reqq");
+        bencodeUnsigned(&w, handshake->requestQueue);
     }
     if (handshake->client[0] != '\0') {
-        putKey(&w, "v");
-        putString(&w, handshake->client, strlen(handshake->client));
+        bencodeText(&w, "v");
+        bencodeText(&w, handshake->client);
     }
-    putText(&w, "e");
+    bencodeEnd(&w);
     return finish(&w, length);
 }
 
@@ -251,21 +202,22 @@ int32_t extensionEncodePex(const extensionPeer *added, uint32_t addedCount,
                            const extensionPeer *dropped, uint32_t droppedCount, uint8_t *out,
                            size_t size, size_t *length)
 {
-    writer w = { out, size, 0, 0 };
+    bencodeWriter w;
 
     if (out == NULL || length == NULL || (addedCount > 0 && added == NULL) ||
         (droppedCount > 0 && dropped == NULL)) {
         return EXTENSION_EINVAL;
     }
+    bencodeWriterInitFixed(&w, out, size);
     /* Keys in sorted order. */
-    putText(&w, "d");
+    bencodeDictBegin(&w);
     putPeers(&w, "added", added, addedCount, 4u, 0);
     putPeers(&w, "added.f", added, addedCount, 4u, 1);
     putPeers(&w, "added6", added, addedCount, 6u, 0);
     putPeers(&w, "added6.f", added, addedCount, 6u, 1);
     putPeers(&w, "dropped", dropped, droppedCount, 4u, 0);
     putPeers(&w, "dropped6", dropped, droppedCount, 6u, 0);
-    putText(&w, "e");
+    bencodeEnd(&w);
     return finish(&w, length);
 }
 
@@ -361,22 +313,23 @@ int32_t extensionDecodePex(const uint8_t *data, size_t length, extensionPeerCall
 int32_t extensionEncodeMetadata(uint32_t type, uint32_t piece, uint32_t totalSize,
                                 uint8_t *out, size_t size, size_t *length)
 {
-    writer w = { out, size, 0, 0 };
+    bencodeWriter w;
 
     if (out == NULL || length == NULL || type > EXTENSION_METADATA_REJECT) {
         return EXTENSION_EINVAL;
     }
+    bencodeWriterInitFixed(&w, out, size);
     /* Keys in sorted order: msg_type, piece, total_size. */
-    putText(&w, "d");
-    putKey(&w, "msg_type");
-    putInteger(&w, type);
-    putKey(&w, "piece");
-    putInteger(&w, piece);
+    bencodeDictBegin(&w);
+    bencodeText(&w, "msg_type");
+    bencodeUnsigned(&w, type);
+    bencodeText(&w, "piece");
+    bencodeUnsigned(&w, piece);
     if (type == EXTENSION_METADATA_DATA) {
-        putKey(&w, "total_size");
-        putInteger(&w, totalSize);
+        bencodeText(&w, "total_size");
+        bencodeUnsigned(&w, totalSize);
     }
-    putText(&w, "e");
+    bencodeEnd(&w);
     return finish(&w, length);
 }
 

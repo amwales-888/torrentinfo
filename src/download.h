@@ -59,7 +59,9 @@
 #include <stdint.h>
 #include <uv.h>
 
+#include "bandwidth.h"
 #include "blocklist.h"
+#include "event.h"
 #include "http.h"
 #include "parser.h"
 #include "peer.h"
@@ -100,6 +102,14 @@ extern "C" {
 
 typedef struct download download;
 
+#define DOWNLOAD_RATE_TICK_MS       100u    /* the tick: refilling speed limits */
+
+/* Asked before a connection is made or taken: 1 to go ahead. */
+typedef struct downloadGate {
+    int  (*mayConnect)(void *privateArg, int incoming);
+    void  *privateArg;
+} downloadGate;
+
 typedef struct downloadOptions {
     uint8_t         peerId[PEER_ID_LENGTH];
     const char     *directory;          /* where to save; "" or NULL = current */
@@ -138,6 +148,17 @@ typedef struct downloadOptions {
      * read (every piece on disk is checked) but is still written. */
     const char     *resumePath;
     uint8_t         resumeRecheck;
+    /* For a session running many downloads (session.c):
+     * - shares of its speed limits, divided every tick (bandwidth.h); NULL:
+     *   none. They must outlive the download;
+     * - externalTick: no timer of its own; the owner calls downloadTick()
+     *   every DOWNLOAD_RATE_TICK_MS once the download is ready;
+     * - a gate asked before each connection (incoming or not), for the
+     *   session's caps; copied. */
+    bandwidthShare *downShare;
+    bandwidthShare *upShare;
+    uint8_t         externalTick;
+    const downloadGate *gate;
 } downloadOptions;
 
 typedef struct downloadProgress {
@@ -182,8 +203,9 @@ typedef struct downloadProgress {
 typedef struct downloadEvents {
     /* The files are ready (status DOWNLOAD_OK) or could not be prepared. */
     void (*onReady)(void *privateArg, download *transfer, int32_t status, const char *message);
-    /* Something worth reporting: a peer dropped, a piece failed, endgame. */
-    void (*onEvent)(void *privateArg, download *transfer, const char *message);
+    /* Something worth reporting: a peer dropped, a piece failed, endgame
+     * (see event.h). May be NULL. */
+    void (*onEvent)(void *privateArg, download *transfer, const eventInfo *event);
     /* The download has ended: DOWNLOAD_OK when everything is on disk. Runs
      * once; call downloadEnd() afterwards (it may be called from here). */
     void (*onFinished)(void *privateArg, download *transfer, int32_t status, const char *message);
@@ -216,6 +238,23 @@ void downloadGetProgress(const download *transfer, downloadProgress *progress);
 void downloadSetRateLimits(download *transfer, uint64_t maxDownloadRate, uint64_t maxUploadRate);
 
 uint16_t downloadListenPort(const download *transfer);
+
+/*
+ * For a listener shared by many downloads: take an incoming connection for
+ * this download, as a peerIncomingCallback would (1 taken, 0 refused).
+ */
+int downloadAcceptIncoming(download *transfer, peerConnection *connection,
+                           const struct sockaddr *address,
+                           const uint8_t infoHash[PARSER_SHA1_LENGTH],
+                           peerConnectOptions *options, peerCallbacks *callbacks,
+                           void **privateArg);
+
+/* With externalTick: the work of one tick (speed limits, timeouts,
+ * rechoking, connecting). Does nothing before the download is ready. */
+void downloadTick(download *transfer);
+
+/* Connections open and being made, for a session's caps. */
+void downloadConnections(const download *transfer, uint32_t *open, uint32_t *connecting);
 
 /* The download's top-level path (file, or directory of a multi-file torrent). */
 const char *downloadRoot(const download *transfer);

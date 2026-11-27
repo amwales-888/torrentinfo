@@ -107,6 +107,8 @@ typedef struct trackerAnnounceParams {
     uint64_t    uploaded;       /* bytes sent to peers since 'started'      */
     uint64_t    downloaded;     /* bytes received from peers since 'started' */
     uint64_t    left;           /* bytes still needed (0: we are a seed)    */
+    uint16_t    port;           /* port peers can reach us on; 0: the one
+                                   given to trackerInit()                   */
 } trackerAnnounceParams;
 
 /* Called once when an announce finishes. Not called after trackerClose(). */
@@ -162,6 +164,9 @@ typedef struct trackerResult {
  * Set up the module. 'loop' and 'context' must outlive all tracker use.
  * Returns TRACKER_ETLS if the TLS context or CA certificates cannot be loaded.
  */
+/* Calls are counted, as for peerInit(): later calls with the same loop and
+ * context share the module (the first call's settings stay), and each needs
+ * its trackerShutdown(). */
 int32_t trackerInit(uv_loop_t *loop, parserContext *context, const trackerConfig *config);
 
 /*
@@ -213,6 +218,15 @@ int32_t trackerClose(uint32_t uniqueId);
  * again with a larger array. 'ids' may be NULL when capacity is 0.
  */
 int32_t trackerList(uint32_t *ids, uint32_t capacity, uint32_t *count);
+
+/*
+ * Change the port announces tell trackers peers can reach us on (once the
+ * listening port is known). Requests already under way keep the old one.
+ */
+void trackerSetPort(uint16_t port);
+
+/* A peer from a tracker as a socket address (IPv4 or IPv6, port included). */
+void trackerPeerAddress(const trackerPeer *peer, struct sockaddr_storage *address);
 
 /*
  * Close every id and stop accepting new requests. Network handles close

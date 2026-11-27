@@ -194,6 +194,8 @@ struct peerListener {
     uint32_t                pendingConnections; /* accepted, info hash not seen */
     uint8_t                 hashes[PEER_LISTENER_MAX_HASHES][PARSER_SHA1_LENGTH];
     uint32_t                hashCount;          /* for encrypted connections    */
+    peerHashLookup          lookup;             /* or, for many torrents, this  */
+    void                   *lookupArg;
 };
 
 static struct {
@@ -1065,17 +1067,25 @@ static int32_t mseProcess(peerConnection *connection)
             for (i = 0; i < PARSER_SHA1_LENGTH; i++) {
                 want[i] ^= buffer[at + PARSER_SHA1_LENGTH + i];
             }
-            for (h = 0; listener != NULL && h < listener->hashCount; h++) {
-                mseHash("req2", listener->hashes[h], PARSER_SHA1_LENGTH, NULL, 0, candidate);
-                if (memcmp(candidate, want, PARSER_SHA1_LENGTH) == 0) {
-                    break;
+            if (listener != NULL && listener->lookup != NULL) {
+                if (!listener->lookup(listener->lookupArg, want, connection->mseInfoHash)) {
+                    setError(connection, "not serving that torrent (encrypted connection)");
+                    return PEER_EHASH;
                 }
+            } else {
+                for (h = 0; listener != NULL && h < listener->hashCount; h++) {
+                    mseHash("req2", listener->hashes[h], PARSER_SHA1_LENGTH, NULL, 0,
+                            candidate);
+                    if (memcmp(candidate, want, PARSER_SHA1_LENGTH) == 0) {
+                        break;
+                    }
+                }
+                if (listener == NULL || h == listener->hashCount) {
+                    setError(connection, "not serving that torrent (encrypted connection)");
+                    return PEER_EHASH;
+                }
+                memcpy(connection->mseInfoHash, listener->hashes[h], PARSER_SHA1_LENGTH);
             }
-            if (listener == NULL || h == listener->hashCount) {
-                setError(connection, "not serving that torrent (encrypted connection)");
-                return PEER_EHASH;
-            }
-            memcpy(connection->mseInfoHash, listener->hashes[h], PARSER_SHA1_LENGTH);
             connection->mseHashKnown = 1;
             mseKeys(connection, connection->mseInfoHash);
             connection->msePos = at + 2u * PARSER_SHA1_LENGTH;
@@ -1458,6 +1468,19 @@ int32_t peerListenerAddInfoHash(peerListener *listener, const uint8_t infoHash[P
     }
     memcpy(listener->hashes[listener->hashCount++], infoHash, PARSER_SHA1_LENGTH);
     return PEER_OK;
+}
+
+void peerListenerSetHashLookup(peerListener *listener, peerHashLookup lookup, void *privateArg)
+{
+    if (listener != NULL) {
+        listener->lookup = lookup;
+        listener->lookupArg = privateArg;
+    }
+}
+
+void peerReq2Hash(const uint8_t infoHash[PARSER_SHA1_LENGTH], uint8_t out[PARSER_SHA1_LENGTH])
+{
+    mseHash("req2", infoHash, PARSER_SHA1_LENGTH, NULL, 0, out);
 }
 
 void peerSetEncryption(uint8_t mode)

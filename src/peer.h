@@ -288,6 +288,18 @@ uint16_t peerListenerPort(const peerListener *listener);
 int32_t peerListenerAddInfoHash(peerListener *listener,
                                 const uint8_t infoHash[PARSER_SHA1_LENGTH]);
 
+/*
+ * For a listener serving many torrents: instead of the list kept by
+ * peerListenerAddInfoHash(), encrypted connections are matched by asking
+ * 'lookup' with SHA1("req2", info hash), which is all such a peer reveals
+ * (peerReq2Hash() computes it). It fills in the info hash and returns 1 if
+ * the torrent is served, else 0.
+ */
+typedef int (*peerHashLookup)(void *privateArg, const uint8_t req2[PARSER_SHA1_LENGTH],
+                              uint8_t infoHash[PARSER_SHA1_LENGTH]);
+void peerListenerSetHashLookup(peerListener *listener, peerHashLookup lookup, void *privateArg);
+void peerReq2Hash(const uint8_t infoHash[PARSER_SHA1_LENGTH], uint8_t out[PARSER_SHA1_LENGTH]);
+
 /* Protocol encryption for all connections from now on: PEER_ENCRYPTION_*. */
 void peerSetEncryption(uint8_t mode);
 uint8_t peerGetEncryption(void);

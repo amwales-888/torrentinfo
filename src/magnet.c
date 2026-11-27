@@ -5,6 +5,7 @@
 #include <string.h>
 
 #include "magnet.h"
+#include "bencode.h"
 
 /* ------------------------------------------------------------------------ */
 /* Helpers                                                                  */
@@ -234,95 +235,44 @@ void magnetFree(parserContext *context, magnetLink *link)
     memset(link, 0, sizeof(*link));
 }
 
-/* Append bencode to a growing buffer. */
-typedef struct builder {
-    parserContext *context;
-    uint8_t       *data;
-    uint64_t       used;
-    uint64_t       size;
-    int            failed;
-} builder;
-
-static void add(builder *b, const void *bytes, uint64_t length)
-{
-    if (b->failed) {
-        return;
-    }
-    if (b->used + length > b->size) {
-        uint64_t size = (b->size == 0) ? 1024u : b->size;
-        uint8_t *grown;
-
-        while (size < b->used + length) {
-            size *= 2u;
-        }
-        grown = b->context->allocator.realloc(b->data, (size_t)size);
-        if (grown == NULL) {
-            b->failed = 1;
-            return;
-        }
-        b->data = grown;
-        b->size = size;
-    }
-    memcpy(b->data + b->used, bytes, (size_t)length);
-    b->used += length;
-}
-
-static void addString(builder *b, const char *text)
-{
-    char prefix[24];
-
-    snprintf(prefix, sizeof(prefix), "%lu:", (unsigned long)strlen(text));
-    add(b, prefix, strlen(prefix));
-    add(b, text, strlen(text));
-}
-
 int32_t magnetBuildTorrent(parserContext *context, const magnetLink *link, const uint8_t *info,
                            uint64_t infoLength, uint8_t **torrent, uint64_t *length)
 {
-    builder  b;
-    uint32_t i;
+    bencodeWriter w;
+    uint32_t      i;
 
     if (context == NULL || link == NULL || info == NULL || torrent == NULL || length == NULL) {
         return MAGNET_EINVAL;
     }
-    memset(&b, 0, sizeof(b));
-    b.context = context;
+    bencodeWriterInit(&w, &context->allocator);
     /* Keys in sorted order: announce, announce-list, created by, info, url-list. */
-    add(&b, "d", 1);
+    bencodeDictBegin(&w);
     if (link->trackerCount > 0) {
-        addString(&b, "announce");
-        addString(&b, link->trackers[0]);
-        addString(&b, "announce-list");
-        add(&b, "l", 1);
+        bencodeText(&w, "announce");
+        bencodeText(&w, link->trackers[0]);
+        bencodeText(&w, "announce-list");
+        bencodeListBegin(&w);
         for (i = 0; i < link->trackerCount; i++) {
-            add(&b, "l", 1);                        /* each tracker its own tier */
-            addString(&b, link->trackers[i]);
-            add(&b, "e", 1);
+            bencodeListBegin(&w);                   /* each tracker its own tier */
+            bencodeText(&w, link->trackers[i]);
+            bencodeEnd(&w);
         }
-        add(&b, "e", 1);
+        bencodeEnd(&w);
     }
-    addString(&b, "created by");
-    addString(&b, "torrentinfo (from a magnet link)");
-    addString(&b, "info");
-    add(&b, info, infoLength);
+    bencodeText(&w, "created by");
+    bencodeText(&w, "torrentinfo (from a magnet link)");
+    bencodeText(&w, "info");
+    bencodeRaw(&w, info, infoLength);
     if (link->webSeedCount > 0) {
-        addString(&b, "url-list");
-        add(&b, "l", 1);
+        bencodeText(&w, "url-list");
+        bencodeListBegin(&w);
         for (i = 0; i < link->webSeedCount; i++) {
-            addString(&b, link->webSeeds[i]);
+            bencodeText(&w, link->webSeeds[i]);
         }
-        add(&b, "e", 1);
+        bencodeEnd(&w);
     }
-    add(&b, "e", 1);
-    if (b.failed) {
-        if (b.data != NULL) {
-            context->allocator.free(b.data);
-        }
-        return MAGNET_ENOMEM;
-    }
-    *torrent = b.data;
-    *length = b.used;
-    return MAGNET_OK;
+    bencodeEnd(&w);
+    return (bencodeWriterTake(&w, torrent, length) == BENCODE_OK) ? MAGNET_OK : MAGNET_ENOMEM;
 }
 
 /* ------------------------------------------------------------------------ */
@@ -330,25 +280,25 @@ int32_t magnetBuildTorrent(parserContext *context, const magnetLink *link, const
 /* ------------------------------------------------------------------------ */
 
 /* "&key=" then 'value' percent-encoded (all but unreserved characters). */
-static void addParameter(builder *b, const char *key, const char *value)
+static void addParameter(bencodeWriter *b, const char *key, const char *value)
 {
     static const char hex[] = "0123456789ABCDEF";
     const unsigned char *at;
 
-    add(b, "&", 1);
-    add(b, key, strlen(key));
-    add(b, "=", 1);
+    bencodeRaw(b, "&", 1);
+    bencodeRaw(b, key, strlen(key));
+    bencodeRaw(b, "=", 1);
     for (at = (const unsigned char *)value; *at != '\0'; at++) {
         if ((*at >= 'A' && *at <= 'Z') || (*at >= 'a' && *at <= 'z') ||
             (*at >= '0' && *at <= '9') || *at == '-' || *at == '.' || *at == '_' || *at == '~') {
-            add(b, at, 1);
+            bencodeRaw(b, at, 1);
         } else {
             char escaped[3];
 
             escaped[0] = '%';
             escaped[1] = hex[*at >> 4];
             escaped[2] = hex[*at & 0x0fu];
-            add(b, escaped, 3);
+            bencodeRaw(b, escaped, 3);
         }
     }
 }
@@ -357,7 +307,9 @@ int32_t magnetFromTorrent(parserContext *context, const parserTorrent *torrent, 
 {
     const parserTier *tier;
     const parserUrl  *url;
-    builder           b;
+    bencodeWriter     b;
+    uint8_t          *data;
+    uint64_t          length;
     char              text[64];
     uint32_t          i;
 
@@ -365,12 +317,11 @@ int32_t magnetFromTorrent(parserContext *context, const parserTorrent *torrent, 
         return MAGNET_EINVAL;
     }
     *uri = NULL;
-    memset(&b, 0, sizeof(b));
-    b.context = context;
-    add(&b, "magnet:?xt=urn:btih:", 20);
+    bencodeWriterInit(&b, &context->allocator);
+    bencodeRaw(&b, "magnet:?xt=urn:btih:", 20);
     for (i = 0; i < PARSER_SHA1_LENGTH; i++) {
         snprintf(text, sizeof(text), "%02x", torrent->infoHash[i]);
-        add(&b, text, 2);
+        bencodeRaw(&b, text, 2);
     }
     if (torrent->name != NULL && torrent->name[0] != '\0') {
         addParameter(&b, "dn", torrent->name);
@@ -388,13 +339,10 @@ int32_t magnetFromTorrent(parserContext *context, const parserTorrent *torrent, 
     TAILQ_FOREACH(url, &torrent->webSeeds, entries) {
         addParameter(&b, "ws", url->url);
     }
-    add(&b, "", 1);                                 /* the terminating zero */
-    if (b.failed) {
-        if (b.data != NULL) {
-            context->allocator.free(b.data);
-        }
+    bencodeRaw(&b, "", 1);                                 /* the terminating zero */
+    if (bencodeWriterTake(&b, &data, &length) != BENCODE_OK) {
         return MAGNET_ENOMEM;
     }
-    *uri = (char *)b.data;
+    *uri = (char *)data;
     return MAGNET_OK;
 }

@@ -82,7 +82,6 @@
 #define DOWNLOAD_ENDGAME_DELAY_MS   1500u   /* ...once the first is this old   */
 #define DOWNLOAD_MAX_ACTIVE_BYTES   (128u * 1024u * 1024u)
 #define DOWNLOAD_TICK_MS            1000u
-#define DOWNLOAD_RATE_TICK_MS       100u    /* refilling the speed limits      */
 #define DOWNLOAD_UPLOAD_QUEUE       256u    /* requests a peer may queue with us */
 #define DOWNLOAD_UPLOAD_READS       4u      /* block reads in flight per peer    */
 #define DOWNLOAD_UPLOAD_BUFFERED    (256u * 1024u)  /* queued to send: wait     */
@@ -213,12 +212,6 @@ typedef struct downloadPeer {
 TAILQ_HEAD(activeList, activePiece);
 TAILQ_HEAD(peerList, downloadPeer);
 
-/* A speed limit: a token bucket of bytes, refilled continuously. */
-typedef struct rateLimit {
-    uint64_t    rate;                   /* bytes per second; 0: no limit */
-    int64_t     tokens;                 /* may dip one block below zero  */
-    uint64_t    updated;                /* uv_now() of the last refill   */
-} rateLimit;
 
 struct download {
     uv_loop_t              *loop;
@@ -281,8 +274,12 @@ struct download {
     const blocklist        *blocklist;
     uint32_t                blocked;        /* addresses refused            */
 
-    rateLimit               downLimit;      /* requests we send            */
-    rateLimit               upLimit;        /* blocks we read to send      */
+    bandwidthBucket         downLimit;      /* requests we send            */
+    bandwidthBucket         upLimit;        /* blocks we read to send      */
+    bandwidthShare         *downShare;      /* of a session limit, or NULL */
+    bandwidthShare         *upShare;
+    downloadGate            gate;           /* session connection caps     */
+    uint8_t                 externalTick;   /* the owner calls downloadTick() */
     uint64_t                uploadTurns;    /* counter for uploadTurn      */
     uint64_t                pumpPasses;     /* counter for pumpPass        */
     uint64_t                lastTick;       /* uv_now() of the last 1 s tick */
@@ -351,13 +348,19 @@ static int stopped(const download *dl)
     return dl->finished || dl->ended;
 }
 
+/* Report something: level and code for programs, a message for people,
+ * and the peer, piece or web seed concerned (NULL, EVENT_NO_PIECE, NULL). */
 #if defined(__GNUC__)
-static void emit(download *dl, const char *format, ...) __attribute__((format(printf, 2, 3)));
+static void emit(download *dl, uint32_t level, uint32_t code, const struct sockaddr *peer,
+                 int64_t piece, const char *url, const char *format, ...)
+    __attribute__((format(printf, 7, 8)));
 #endif
 
-static void emit(download *dl, const char *format, ...)
+static void emit(download *dl, uint32_t level, uint32_t code, const struct sockaddr *peer,
+                 int64_t piece, const char *url, const char *format, ...)
 {
-    va_list arguments;
+    eventInfo event;
+    va_list   arguments;
 
     if (stopped(dl) || dl->events.onEvent == NULL) {
         return;
@@ -365,7 +368,13 @@ static void emit(download *dl, const char *format, ...)
     va_start(arguments, format);
     vsnprintf(dl->event, sizeof(dl->event), format, arguments);
     va_end(arguments);
-    dl->events.onEvent(dl->privateArg, dl, dl->event);
+    event.level = level;
+    event.code = code;
+    event.message = dl->event;
+    event.peer = peer;
+    event.piece = piece;
+    event.url = url;
+    dl->events.onEvent(dl->privateArg, dl, &event);
 }
 
 static void formatAddress(const struct sockaddr *address, char *out, size_t size)
@@ -433,45 +442,41 @@ static uint32_t blockLength(const activePiece *piece, uint32_t block)
     return (left < PIECE_BLOCK_LENGTH) ? left : PIECE_BLOCK_LENGTH;
 }
 
-/* Up to half a second of data may be sent at once, and at least one block. */
-static void rateSet(rateLimit *limit, uint64_t rate, uint64_t now)
+/* May another block go now? Both the download's own limit and its share of
+ * a session limit must allow it. */
+static int mayDownload(download *dl)
 {
-    uint64_t burst = rate / 2u;
-
-    limit->rate = rate;
-    limit->tokens = (int64_t)((burst < PIECE_BLOCK_LENGTH) ? PIECE_BLOCK_LENGTH : burst);
-    limit->updated = now;
+    return bandwidthAvailable(&dl->downLimit, uv_now(dl->loop)) &&
+           bandwidthShareAvailable(dl->downShare);
 }
 
-/* May another block go now? */
-static int rateAvailable(download *dl, rateLimit *limit)
+static int mayUpload(download *dl)
 {
-    uint64_t now;
-    uint64_t burst;
-
-    if (limit->rate == 0) {
-        return 1;
-    }
-    now = uv_now(dl->loop);
-    if (now > limit->updated) {
-        burst = limit->rate / 2u;
-        if (burst < PIECE_BLOCK_LENGTH) {
-            burst = PIECE_BLOCK_LENGTH;
-        }
-        limit->tokens += (int64_t)(limit->rate * (now - limit->updated) / 1000u);
-        if (limit->tokens > (int64_t)burst) {
-            limit->tokens = (int64_t)burst;
-        }
-        limit->updated = now;
-    }
-    return limit->tokens > 0;
+    return bandwidthAvailable(&dl->upLimit, uv_now(dl->loop)) &&
+           bandwidthShareAvailable(dl->upShare);
 }
 
-static void rateCharge(rateLimit *limit, uint32_t bytes)
+static void chargeDownload(download *dl, uint32_t bytes)
 {
-    if (limit->rate != 0) {
-        limit->tokens -= (int64_t)bytes;
-    }
+    bandwidthCharge(&dl->downLimit, bytes);
+    bandwidthShareCharge(dl->downShare, bytes);
+}
+
+static void chargeUpload(download *dl, uint32_t bytes)
+{
+    bandwidthCharge(&dl->upLimit, bytes);
+    bandwidthShareCharge(dl->upShare, bytes);
+}
+
+/* Is any limit in force (so that sending is shared out fairly)? */
+static int downloadLimited(const download *dl)
+{
+    return dl->downLimit.rate != 0 || bandwidthShareLimited(dl->downShare);
+}
+
+static int uploadLimited(const download *dl)
+{
+    return dl->upLimit.rate != 0 || bandwidthShareLimited(dl->upShare);
 }
 
 /* Send a message; 0 on success. */
@@ -571,7 +576,7 @@ static int sendRequest(download *dl, downloadPeer *peer, activePiece *piece, uin
     if (piece->requests[block]++ == 0) {
         piece->requestedAt[block] = uv_now(dl->loop);
     }
-    rateCharge(&dl->downLimit, blockLength(piece, block));
+    chargeDownload(dl, blockLength(piece, block));
     sendBlockMessage(peer, MESSAGE_REQUEST, piece, block);
     if (peer->state != DOWNLOAD_PEER_OPEN) {
         return -1;
@@ -689,7 +694,8 @@ static activePiece *startPiece(download *dl, downloadPeer *peer, uint32_t index)
     dl->neededCount--;
     if (dl->neededCount == 0 && !dl->endgame) {
         dl->endgame = 1;
-        emit(dl, "endgame: every remaining piece is in progress");
+        emit(dl, EVENT_LEVEL_INFO, EVENT_ENDGAME, NULL, EVENT_NO_PIECE, NULL,
+             "endgame: every remaining piece is in progress");
     }
     return piece;
 }
@@ -782,7 +788,7 @@ static int canRequest(const download *dl, const downloadPeer *peer)
 /* Keep the peer's pipeline full, as far as the download limit allows. */
 static void fillPeer(download *dl, downloadPeer *peer)
 {
-    while (canRequest(dl, peer) && rateAvailable(dl, &dl->downLimit)) {
+    while (canRequest(dl, peer) && mayDownload(dl)) {
         if (requestOne(dl, peer) <= 0) {
             return;
         }
@@ -794,7 +800,7 @@ static void fillAll(download *dl)
     downloadPeer *peer;
     int           sent;
 
-    if (dl->downLimit.rate == 0) {
+    if (!downloadLimited(dl)) {
         TAILQ_FOREACH(peer, &dl->peers, entries) {
             if (stopped(dl)) {
                 return;
@@ -807,7 +813,7 @@ static void fillAll(download *dl)
     do {
         sent = 0;
         TAILQ_FOREACH(peer, &dl->peers, entries) {
-            if (stopped(dl) || !rateAvailable(dl, &dl->downLimit)) {
+            if (stopped(dl) || !mayDownload(dl)) {
                 return;
             }
             if (canRequest(dl, peer) && requestOne(dl, peer) > 0) {
@@ -910,7 +916,7 @@ static uint32_t pumpSome(download *dl, downloadPeer *peer, uint32_t most)
     while (started < most && !stopped(dl) && dl->store != NULL &&
            peer->state == DOWNLOAD_PEER_OPEN &&
            !peer->amChoking && peer->queueCount > 0 &&
-           peer->readingCount < DOWNLOAD_UPLOAD_READS && rateAvailable(dl, &dl->upLimit)) {
+           peer->readingCount < DOWNLOAD_UPLOAD_READS && mayUpload(dl)) {
         if (peerGetState(peer->connection, &state) != PEER_OK ||
             state.sendQueued >= DOWNLOAD_UPLOAD_BUFFERED) {
             return started;                         /* onDrain will call again */
@@ -924,7 +930,7 @@ static uint32_t pumpSome(download *dl, downloadPeer *peer, uint32_t most)
             return started;
         }
         peer->reading[peer->readingCount++] = request;
-        rateCharge(&dl->upLimit, request.length);
+        chargeUpload(dl, request.length);
         peer->uploadTurn = ++dl->uploadTurns;
         started++;
         if (storageReadBlock(dl->store, request.index, request.begin, request.length, data,
@@ -949,7 +955,7 @@ static void pumpAll(download *dl)
     downloadPeer *best;
     uint64_t      pass = ++dl->pumpPasses;
 
-    while (!stopped(dl) && rateAvailable(dl, &dl->upLimit)) {
+    while (!stopped(dl) && mayUpload(dl)) {
         best = NULL;
         TAILQ_FOREACH(peer, &dl->peers, entries) {
             if (peer->pumpPass != pass && canPump(dl, peer) &&
@@ -968,7 +974,7 @@ static void pumpAll(download *dl)
 
 static void pumpUploads(download *dl, downloadPeer *peer)
 {
-    if (dl->upLimit.rate != 0) {
+    if (uploadLimited(dl)) {
         pumpAll(dl);                                /* fair shares, not first come */
     } else {
         (void)pumpSome(dl, peer, UINT32_MAX);
@@ -996,7 +1002,9 @@ static void onBlockRead(void *privateArg, storage *store, uint32_t pieceIndex, u
     }
     if (data == NULL) {
         if (found && !stopped(dl)) {
-            emit(dl, "could not read piece %u for %s: %s", (unsigned)pieceIndex, peer->where,
+            emit(dl, EVENT_LEVEL_WARNING, EVENT_PIECE_READ_FAILED,
+                 (const struct sockaddr *)&peer->address, pieceIndex, NULL,
+                 "could not read piece %u for %s: %s", (unsigned)pieceIndex, peer->where,
                  (errorMessage != NULL) ? errorMessage : storageStatusString(status));
         }
         return;
@@ -1400,7 +1408,8 @@ static void receiveExtended(download *dl, downloadPeer *peer, const messageFrame
                              &context);
     if (context.learned > 0) {
         dl->pexLearned += context.learned;
-        emit(dl, "%s: peer exchange: %u new peer%s", peer->where, (unsigned)context.learned,
+        emit(dl, EVENT_LEVEL_DEBUG, EVENT_PEX_PEERS, (const struct sockaddr *)&peer->address, EVENT_NO_PIECE, NULL,
+             "%s: peer exchange: %u new peer%s", peer->where, (unsigned)context.learned,
              (context.learned == 1u) ? "" : "s");
     }
 }
@@ -1484,7 +1493,8 @@ static void dropPeer(downloadPeer *peer, const char *reason, int exclude)
         peer->state = DOWNLOAD_PEER_CLOSED;
     }
     if (reason != NULL) {
-        emit(dl, "%s: dropped: %s", peer->where, reason);
+        emit(dl, EVENT_LEVEL_DEBUG, EVENT_PEER_DROPPED, (const struct sockaddr *)&peer->address, EVENT_NO_PIECE, NULL,
+             "%s: dropped: %s", peer->where, reason);
     }
     if (!stopped(dl)) {
         fillAll(dl);                                /* its blocks are free again */
@@ -1536,10 +1546,23 @@ static void onPeerHandshake(void *privateArg, peerConnection *connection,
         return;
     }
     if (result->status != PEER_OK) {
+        int32_t status = result->status;
+
         peerClose(connection);
         peer->connection = NULL;
-        peer->state = DOWNLOAD_PEER_CLOSED;         /* not retried */
-        emit(dl, "%s: no handshake: %s", peer->where,
+        /* A peer that refused or dropped us, or did not answer, may only be
+         * busy (a seed checking its files refuses everyone for a while): try
+         * again later, a few times. Not one that is plainly wrong. */
+        if (!peer->incoming && !peer->excluded && peer->attempts < DOWNLOAD_MAX_ATTEMPTS &&
+            status != PEER_EHASH && status != PEER_ESELF && status != PEER_EPROTO &&
+            status != PEER_ENOMEM && status != PEER_EINVAL) {
+            peer->state = DOWNLOAD_PEER_QUEUED;
+            peer->retryAt = uv_now(dl->loop) + (uint64_t)DOWNLOAD_RETRY_SECONDS * 1000u;
+        } else {
+            peer->state = DOWNLOAD_PEER_CLOSED;
+        }
+        emit(dl, EVENT_LEVEL_DEBUG, EVENT_PEER_NO_HANDSHAKE, (const struct sockaddr *)&peer->address, EVENT_NO_PIECE, NULL,
+             "%s: no handshake: %s", peer->where,
              (result->errorMessage != NULL) ? result->errorMessage
                                             : peerStatusString(result->status));
         connectMore(dl);
@@ -1603,7 +1626,8 @@ static void onPeerHandshake(void *privateArg, peerConnection *connection,
         client[i] = (c >= 0x20 && c < 0x7f) ? (char)c : '.';
     }
     client[i < 8u ? i : 8u] = '\0';
-    emit(dl, "%s: connected%s%s (peer id %s...)", peer->where,
+    emit(dl, EVENT_LEVEL_DEBUG, EVENT_PEER_CONNECTED, (const struct sockaddr *)&peer->address, EVENT_NO_PIECE, NULL,
+         "%s: connected%s%s (peer id %s...)", peer->where,
          peer->incoming ? " (incoming)" : "",
          (peer->encryption == PEER_ENCRYPTED_RC4) ? ", encrypted"
          : (peer->encryption == PEER_ENCRYPTED_HEADER) ? ", handshake encrypted" : "", client);
@@ -1676,7 +1700,8 @@ static void excludePeer(download *dl, downloadPeer *peer, const char *reason)
         dropPeer(peer, reason, 1);
     } else {
         peer->state = DOWNLOAD_PEER_CLOSED;
-        emit(dl, "%s: excluded: %s", peer->where, reason);
+        emit(dl, EVENT_LEVEL_DEBUG, EVENT_PEER_EXCLUDED, (const struct sockaddr *)&peer->address, EVENT_NO_PIECE, NULL,
+             "%s: excluded: %s", peer->where, reason);
     }
 }
 
@@ -1727,7 +1752,8 @@ static void complete(download *dl)
         return;
     }
     dl->seeding = 1;
-    emit(dl, "download complete; seeding");
+    emit(dl, EVENT_LEVEL_INFO, EVENT_COMPLETE, NULL, EVENT_NO_PIECE, NULL,
+         "download complete; seeding");
     TAILQ_FOREACH(peer, &dl->peers, entries) {
         if (stopped(dl)) {
             return;
@@ -1821,7 +1847,11 @@ static void pieceChecked(download *dl, activePiece *piece, int32_t result)
             snprintf(dl->message, sizeof(dl->message), "could not queue piece %u for writing: %s",
                      (unsigned)index, storageStatusString(status));
             finish(dl, DOWNLOAD_EIO, dl->message);
+            return;
         }
+        /* Its place among the active pieces is free: start another now,
+         * rather than at the next tick (every request may be answered). */
+        fillAll(dl);
         return;
     }
 
@@ -1829,7 +1859,9 @@ static void pieceChecked(download *dl, activePiece *piece, int32_t result)
     dl->hashFailures++;
     dl->bytesWasted += piece->piece.length;
     if (piece->fromWeb != NULL) {
-        emit(dl, "piece %u failed its SHA-1 check; downloading it again", (unsigned)index);
+        emit(dl, EVENT_LEVEL_WARNING, EVENT_PIECE_FAILED, NULL, index,
+             webSeedUrl(piece->fromWeb->seed),
+             "piece %u failed its SHA-1 check; downloading it again", (unsigned)index);
         webPieceFailed(dl, piece->fromWeb, index);
         piece->fromWeb = NULL;
         cancelPieceRequests(dl, piece);
@@ -1852,7 +1884,9 @@ static void pieceChecked(download *dl, activePiece *piece, int32_t result)
             sole = peer;
         }
     }
-    emit(dl, "piece %u failed its SHA-1 check (%u peer%s contributed); downloading it again",
+    emit(dl, EVENT_LEVEL_WARNING, EVENT_PIECE_FAILED,
+         (sole != NULL) ? (const struct sockaddr *)&sole->address : NULL, index, NULL,
+         "piece %u failed its SHA-1 check (%u peer%s contributed); downloading it again",
          (unsigned)index, (unsigned)contributors, (contributors == 1u) ? "" : "s");
 
     if (contributors > 1u && piece->failedData == NULL) {
@@ -2112,7 +2146,8 @@ static int onIncoming(void *listenerArg, peerConnection *connection, const struc
     downloadPeer *peer;
     size_t        size;
 
-    if (stopped(dl) || !dl->ready ||
+    if (dl == NULL || stopped(dl) || !dl->ready ||
+        (dl->gate.mayConnect != NULL && !dl->gate.mayConnect(dl->gate.privateArg, 1)) ||
         memcmp(infoHash, dl->torrent->infoHash, PARSER_SHA1_LENGTH) != 0 ||
         dl->open + dl->connecting >= dl->maxPeers + DOWNLOAD_INCOMING_EXTRA ||
         dl->peerCount >= DOWNLOAD_MAX_KNOWN_PEERS ||
@@ -2184,6 +2219,9 @@ static void connectMore(download *dl)
         if (peer->state != DOWNLOAD_PEER_QUEUED || peer->retryAt > now) {
             continue;
         }
+        if (dl->gate.mayConnect != NULL && !dl->gate.mayConnect(dl->gate.privateArg, 0)) {
+            return;                                 /* the session is full: next tick */
+        }
         peer->attempts++;
         options = dl->connectOptions;
         options.plaintext = peer->plaintext;
@@ -2195,7 +2233,8 @@ static void connectMore(download *dl)
         } else {
             peer->connection = NULL;
             peer->state = DOWNLOAD_PEER_CLOSED;
-            emit(dl, "%s: could not connect: %s", peer->where, peerStatusString(status));
+            emit(dl, EVENT_LEVEL_DEBUG, EVENT_PEER_CONNECT_FAILED, (const struct sockaddr *)&peer->address, EVENT_NO_PIECE,
+                 NULL, "%s: could not connect: %s", peer->where, peerStatusString(status));
             if (stopped(dl)) {
                 return;
             }
@@ -2272,7 +2311,8 @@ static void webAdd(download *dl, const char *url)
         count++;
     }
     if (webSeedBegin(dl->context, dl->torrent, url, &seed) != WEBSEED_OK) {
-        emit(dl, "web seed %s: not usable (only http and https are)", url);
+        emit(dl, EVENT_LEVEL_WARNING, EVENT_WEBSEED_UNUSABLE, NULL, EVENT_NO_PIECE, url,
+             "web seed %s: not usable (only http and https are)", url);
         return;
     }
     web = allocate(dl, sizeof(*web));
@@ -2325,13 +2365,16 @@ static void webStopAll(download *dl)
 static void webGiveUp(download *dl, dlWebSeed *web, const char *reason)
 {
     web->disabled = 1;
-    emit(dl, "web seed %s: not used any more: %s", webSeedUrl(web->seed), reason);
+    emit(dl, EVENT_LEVEL_WARNING, EVENT_WEBSEED_DISABLED, NULL, EVENT_NO_PIECE,
+         webSeedUrl(web->seed), "web seed %s: not used any more: %s", webSeedUrl(web->seed),
+         reason);
 }
 
 /* A piece it sent failed the hash check. */
 static void webPieceFailed(download *dl, dlWebSeed *web, uint32_t index)
 {
-    emit(dl, "web seed %s: sent piece %u corrupt", webSeedUrl(web->seed), (unsigned)index);
+    emit(dl, EVENT_LEVEL_WARNING, EVENT_WEBSEED_CORRUPT, NULL, index, webSeedUrl(web->seed),
+         "web seed %s: sent piece %u corrupt", webSeedUrl(web->seed), (unsigned)index);
     if (++web->badPieces >= DOWNLOAD_WEB_MAX_BAD && !web->disabled) {
         webGiveUp(dl, web, "it sent corrupt data");
     }
@@ -2410,14 +2453,17 @@ static void onWebFetched(void *privateArg, webSeed *seed, int32_t status, const 
             webGiveUp(dl, web, message);
         } else {
             web->retryAt = now + (uint64_t)wait * 1000u;
-            emit(dl, "web seed %s; trying again in %u s", message, (unsigned)wait);
+            emit(dl, EVENT_LEVEL_INFO, EVENT_WEBSEED_RETRY, NULL, EVENT_NO_PIECE,
+                 webSeedUrl(web->seed), "web seed %s; trying again in %u s", message,
+                 (unsigned)wait);
         }
         fillAll(dl);                                /* peers may take the pieces */
         return;
     }
     if (!web->worked) {
         web->worked = 1;
-        emit(dl, "web seed %s: downloading", webSeedUrl(web->seed));
+        emit(dl, EVENT_LEVEL_INFO, EVENT_WEBSEED_STARTED, NULL, EVENT_NO_PIECE,
+             webSeedUrl(web->seed), "web seed %s: downloading", webSeedUrl(web->seed));
     }
     web->failures = 0;
     web->bytes += web->runLength;
@@ -2450,7 +2496,7 @@ static void webStart(download *dl, dlWebSeed *web)
 
     if (stopped(dl) || !dl->ready || dl->store == NULL || dl->seeding || web->busy ||
         web->disabled || dl->neededCount == 0 || uv_now(dl->loop) < web->retryAt ||
-        !rateAvailable(dl, &dl->downLimit)) {
+        !mayDownload(dl)) {
         return;
     }
     if (dl->downLimit.rate != 0 && dl->downLimit.rate < maxBytes) {
@@ -2487,14 +2533,15 @@ static void webStart(download *dl, dlWebSeed *web)
     web->cursor = (start + web->count) % pieceCount;
     if (dl->neededCount == 0 && !dl->endgame) {
         dl->endgame = 1;
-        emit(dl, "endgame: every remaining piece is in progress");
+        emit(dl, EVENT_LEVEL_INFO, EVENT_ENDGAME, NULL, EVENT_NO_PIECE, NULL,
+             "endgame: every remaining piece is in progress");
     }
     web->buffer = dl->context->allocator.realloc(NULL, web->runLength);
     if (web->buffer == NULL) {
         webReleaseRun(dl, web);
         return;
     }
-    rateCharge(&dl->downLimit, web->runLength);
+    chargeDownload(dl, web->runLength);
     web->busy = 1;
     status = webSeedFetch(web->seed, web->runStart, web->runLength, web->buffer,
                           DOWNLOAD_WEB_TIMEOUT_SECONDS, onWebFetched, web);
@@ -2583,7 +2630,8 @@ static void resumeDone(uv_work_t *work, int status)
     dl->resumeSaving = 0;
     if ((status != 0 || job->result != RESUME_OK) && !dl->resumeWarned && !dl->ended) {
         dl->resumeWarned = 1;
-        emit(dl, "could not save the resume file %s: %s", dl->resumePath,
+        emit(dl, EVENT_LEVEL_WARNING, EVENT_RESUME_SAVE_FAILED, NULL, EVENT_NO_PIECE, NULL,
+             "could not save the resume file %s: %s", dl->resumePath,
              (job->result == RESUME_EIO && job->systemError != 0)
                  ? uv_strerror(job->systemError) : "error");
     }
@@ -2749,9 +2797,8 @@ static void resumeRestorePartials(download *dl)
     resumeFree(dl->context, &dl->resumeLoaded);
 }
 
-static void onTick(uv_timer_t *timer)
+static void tick(download *dl)
 {
-    download     *dl = timer->data;
     downloadPeer *peer;
     downloadPeer *next;
     uint64_t      now = uv_now(dl->loop);
@@ -2766,10 +2813,10 @@ static void onTick(uv_timer_t *timer)
     if (stopped(dl)) {
         return;
     }
-    if (dl->upLimit.rate != 0) {
+    if (uploadLimited(dl)) {
         pumpAll(dl);
     }
-    if (dl->downLimit.rate != 0) {
+    if (downloadLimited(dl)) {
         fillAll(dl);
     }
     if (stopped(dl) || now - dl->lastTick < DOWNLOAD_TICK_MS) {
@@ -2843,6 +2890,11 @@ static void onTick(uv_timer_t *timer)
     }
     fillAll(dl);
     connectMore(dl);
+}
+
+static void onTick(uv_timer_t *timer)
+{
+    tick(timer->data);
 }
 
 static void onTimerClosed(uv_handle_t *handle)
@@ -2939,7 +2991,8 @@ static void onStorageOpen(void *privateArg, storage *store, int32_t status,
     dl->lastProgress = uv_now(dl->loop);
     dl->resumeLastSave = dl->lastProgress;
     if (dl->resumeNote[0] != '\0') {
-        emit(dl, "%s", dl->resumeNote);
+        emit(dl, EVENT_LEVEL_INFO, EVENT_RESUME_LOADED, NULL, EVENT_NO_PIECE, NULL, "%s",
+             dl->resumeNote);
     }
     resumeRestorePartials(dl);
     if (stopped(dl)) {
@@ -2957,7 +3010,8 @@ static void onStorageOpen(void *privateArg, storage *store, int32_t status,
     }
     if (dl->neededCount == 0) {
         dl->seeding = 1;                            /* complete before we started */
-        emit(dl, "already complete; seeding");
+        emit(dl, EVENT_LEVEL_INFO, EVENT_COMPLETE, NULL, EVENT_NO_PIECE, NULL,
+             "already complete; seeding");
     }
     TAILQ_FOREACH(peer, &dl->peers, entries) {
         if (peer->state == DOWNLOAD_PEER_OPEN) {
@@ -2965,7 +3019,9 @@ static void onStorageOpen(void *privateArg, storage *store, int32_t status,
         }
     }
     dl->lastTick = uv_now(dl->loop);
-    uv_timer_start(&dl->timer, onTick, DOWNLOAD_RATE_TICK_MS, DOWNLOAD_RATE_TICK_MS);
+    if (!dl->externalTick) {
+        uv_timer_start(&dl->timer, onTick, DOWNLOAD_RATE_TICK_MS, DOWNLOAD_RATE_TICK_MS);
+    }
     connectMore(dl);
 }
 
@@ -3046,12 +3102,19 @@ int32_t downloadBegin(uv_loop_t *loop, parserContext *context, const parserTorre
                 TAILQ_FOREACH(web, &dl->webSeeds, entries) {
                     web->disabled = 1;
                 }
-                emit(dl, "web seeds not used: HTTP could not be started");
+                emit(dl, EVENT_LEVEL_WARNING, EVENT_WEBSEEDS_UNAVAILABLE, NULL,
+                     EVENT_NO_PIECE, NULL, "web seeds not used: HTTP could not be started");
             }
         }
     }
-    rateSet(&dl->downLimit, options->maxDownloadRate, uv_now(loop));
-    rateSet(&dl->upLimit, options->maxUploadRate, uv_now(loop));
+    bandwidthSet(&dl->downLimit, options->maxDownloadRate, uv_now(loop));
+    bandwidthSet(&dl->upLimit, options->maxUploadRate, uv_now(loop));
+    dl->downShare = options->downShare;
+    dl->upShare = options->upShare;
+    dl->externalTick = options->externalTick;
+    if (options->gate != NULL) {
+        dl->gate = *options->gate;
+    }
 
     if (uv_random(NULL, NULL, &seed, sizeof(seed), 0, NULL) != 0) {
         seed = 0;
@@ -3293,12 +3356,34 @@ void downloadSetRateLimits(download *dl, uint64_t maxDownloadRate, uint64_t maxU
     if (dl == NULL || stopped(dl)) {
         return;
     }
-    rateSet(&dl->downLimit, maxDownloadRate, uv_now(dl->loop));
-    rateSet(&dl->upLimit, maxUploadRate, uv_now(dl->loop));
+    bandwidthSet(&dl->downLimit, maxDownloadRate, uv_now(dl->loop));
+    bandwidthSet(&dl->upLimit, maxUploadRate, uv_now(dl->loop));
     fillAll(dl);
     if (!stopped(dl)) {
         pumpAll(dl);
     }
+}
+
+int downloadAcceptIncoming(download *dl, peerConnection *connection,
+                           const struct sockaddr *address,
+                           const uint8_t infoHash[PARSER_SHA1_LENGTH],
+                           peerConnectOptions *options, peerCallbacks *callbacks,
+                           void **privateArg)
+{
+    return onIncoming(dl, connection, address, infoHash, options, callbacks, privateArg);
+}
+
+void downloadTick(download *dl)
+{
+    if (dl != NULL && dl->ready && !stopped(dl)) {
+        tick(dl);
+    }
+}
+
+void downloadConnections(const download *dl, uint32_t *open, uint32_t *connecting)
+{
+    *open = (dl != NULL) ? dl->open : 0;
+    *connecting = (dl != NULL) ? dl->connecting : 0;
 }
 
 uint16_t downloadListenPort(const download *dl)

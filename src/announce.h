@@ -55,6 +55,8 @@ typedef struct announceStats {
     uint64_t    uploaded;
     uint64_t    downloaded;
     uint64_t    left;
+    uint16_t    port;           /* port peers can reach us on; 0: the tracker
+                                   module's (trackerInit())                 */
 } announceStats;
 
 typedef struct announceEvents {

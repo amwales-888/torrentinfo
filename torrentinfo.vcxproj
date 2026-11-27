@@ -1,6 +1,6 @@
 ﻿<?xml version="1.0" encoding="utf-8"?>
 <!--
-  torrentinfo: the command-line program (main.c), linked against libtorrentinfo.
+  torrentinfo: the command-line program (main.c), linked against the static libaTorrent.
   vcpkg links libuv and OpenSSL and copies their DLLs next to the .exe.
 -->
 <Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
@@ -101,7 +101,7 @@
     <Manifest Include="torrentinfo.manifest" />
   </ItemGroup>
   <ItemGroup>
-    <ProjectReference Include="libtorrentinfo.vcxproj">
+    <ProjectReference Include="libaTorrent.vcxproj">
       <Project>{D3ADCE68-1D6E-4B93-800E-54FCF47C8832}</Project>
     </ProjectReference>
   </ItemGroup>

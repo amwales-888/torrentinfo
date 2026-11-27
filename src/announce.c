@@ -101,6 +101,7 @@ static void startAnnounce(announce *a, announceTracker *tracker, uint32_t event,
     params.uploaded = stats.uploaded;
     params.downloaded = stats.downloaded;
     params.left = stats.left;
+    params.port = stats.port;
     tracker->lastAt = uv_now(a->loop);
     status = trackerAnnounce(a->infoHash, tracker->url, &params, &tracker->id, timeout,
                              onTrackerDone, tracker);

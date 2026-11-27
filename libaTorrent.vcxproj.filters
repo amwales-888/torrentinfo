@@ -14,6 +14,33 @@
     </Filter>
   </ItemGroup>
   <ItemGroup>
+    <ClCompile Include="src\aTorrent.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\bandwidth.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\bencode.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\datafile.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\event.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\selection.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\session.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\settings.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\torrent.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="src\platform.c">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -85,7 +112,34 @@
     </ClCompile>
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="src\aTorrent.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="src\queue.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\bandwidth.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\bencode.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\datafile.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\event.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\selection.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\session.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\settings.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\torrent.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="src\platform.h">
@@ -159,8 +213,6 @@
     </ClInclude>
   </ItemGroup>
   <ItemGroup>
-    <None Include="vcpkg.json">
-      <Filter>Resource Files</Filter>
-    </None>
+    <None Include="vcpkg.json" />
   </ItemGroup>
 </Project>

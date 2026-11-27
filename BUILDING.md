@@ -1,8 +1,21 @@
-# Building torrentinfo
+# Building libaTorrent and torrentinfo
 
-The library and the `torrentinfo` program build on Linux, FreeBSD and Windows
-from the same sources, which are all in `src/`, and there is an
-**experimental, untested** macOS port (see below). Build output goes in
+The library, **libaTorrent**, and the `torrentinfo` program build on Linux,
+FreeBSD and Windows from the same sources, which are all in `src/` (unit
+tests in `tests/`), and there is an **experimental, untested** macOS port
+(see below). Every build makes:
+
+| | Linux, FreeBSD | macOS | Windows |
+|---|---|---|---|
+| Static library | `libaTorrent.a` | `libaTorrent.a` | `libaTorrent.lib` |
+| Shared library | `libaTorrent.so` → `.so.0` → `.so.0.1.0` | `libaTorrent.dylib` → `libaTorrent.0.dylib` | `libaTorrent.dll` (import library `libaTorrent.dll.lib`) |
+| Program | `torrentinfo` | `torrentinfo` | `torrentinfo.exe` |
+| Unit tests | `check` (`make check`) | `check` (`make check`) | `check.exe` |
+
+The shared libraries export only the `aTorrent…` functions of
+`src/aTorrent.h` (see *Using libaTorrent in another program* below).
+
+Build output goes in
 `build/` (Linux in `build/linux`, FreeBSD in `build/freebsd`, macOS in
 `build/macos`, Visual Studio in `build/x64` and `build/obj`, so they can sit
 side by side, for example on a shared disk).
@@ -27,7 +40,9 @@ Dependencies: **libuv** and **OpenSSL 3**.
 sudo apt install build-essential pkg-config libuv1-dev libssl-dev   # Debian/Ubuntu
 make -f Makefile-Linux            # build/linux/release/torrentinfo (and ./torrentinfo link)
 make -f Makefile-Linux debug      # AddressSanitizer + UBSan build in build/linux/debug
-make -f Makefile-Linux install PREFIX=$HOME/.local
+make -f Makefile-Linux check      # build and run the unit tests (add debug: under the sanitizers)
+make -f Makefile-Linux lib        # only the libraries
+make -f Makefile-Linux install PREFIX=$HOME/.local   # bin, lib and include/aTorrent
 make -f Makefile-Linux clean      # removes build/linux only
 ```
 
@@ -45,7 +60,8 @@ below); libuv comes from packages. The compiler is the system's `cc`
 pkg install libuv pkgconf                 # as root
 make -f Makefile-FreeBSD                  # build/freebsd/release/torrentinfo (and ./torrentinfo link)
 make -f Makefile-FreeBSD debug            # AddressSanitizer + UBSan build in build/freebsd/debug
-make -f Makefile-FreeBSD install          # as root: /usr/local/bin, /usr/local/lib, /usr/local/include/torrentinfo
+make -f Makefile-FreeBSD check            # build and run the unit tests
+make -f Makefile-FreeBSD install          # as root: /usr/local/bin, /usr/local/lib, /usr/local/include/aTorrent
 make -f Makefile-FreeBSD install PREFIX=$HOME/.local
 make -f Makefile-FreeBSD clean            # removes build/freebsd only
 ```
@@ -111,6 +127,7 @@ xcode-select --install                       # once, if not done already
 brew install libuv openssl@3 pkg-config
 make -f Makefile-macOS                       # build/macos/release/torrentinfo (and ./torrentinfo link)
 make -f Makefile-macOS debug                 # AddressSanitizer + UBSan build in build/macos/debug
+make -f Makefile-macOS check                 # build and run the unit tests
 make -f Makefile-macOS install PREFIX=$HOME/.local
 make -f Makefile-macOS clean                 # removes build/macos only
 ```
@@ -194,10 +211,22 @@ Studio 2026 includes vcpkg.
 1. Open `torrentinfo.sln`.
 2. Choose **Release | x64** (or Debug) and **Build > Build Solution**.
 
+The solution has four projects: `libaTorrent` (the static library),
+`libaTorrentDll` (the DLL), `torrentinfo` (the program, linked with the
+static library) and `check` (the unit tests).
+
 The first build downloads and compiles libuv and OpenSSL into
 `vcpkg_installed\`, which takes several minutes; later builds reuse them.
-Output goes to `build\x64\Release\torrentinfo.exe`, with the libuv and OpenSSL
-DLLs copied next to it.
+Output goes to `build\x64\Release\`: `torrentinfo.exe` and `check.exe`, with
+the libuv and OpenSSL DLLs copied next to them, `libaTorrent.lib`, and
+`libaTorrent.dll` with its import library `libaTorrent.dll.lib`.
+
+To run the unit tests, give them an empty folder to work in:
+
+```powershell
+mkdir $env:TEMP\atorrent-check
+.\build\x64\Release\check.exe $env:TEMP\atorrent-check
+```
 
 From the command line (Developer PowerShell):
 
@@ -483,13 +512,48 @@ project's *Properties > Debugging > Command Arguments*.
 - **File names Windows cannot use** are adjusted when a torrent is saved:
   `< > : " | ? *` and control characters become `_`, a trailing `.` or space
   becomes `_`, and reserved names such as `CON` or `LPT1` get a `_` prefix.
-- **Using the library in your own project:** add `libtorrentinfo.vcxproj` as
-  a project reference, add `src` to *C/C++ > Additional Include
+- **Using the library in your own project:** add `libaTorrent.vcxproj` (static)
+  or `libaTorrentDll.vcxproj` (DLL; then define `ATORRENT_DLL`) as a
+  project reference, add `src` to *C/C++ > Additional Include
   Directories*, enable vcpkg manifest mode, define
   `WIN32_LEAN_AND_MEAN`, and link the Windows libraries listed in
-  `torrentinfo.vcxproj` (*Linker > Input*).
+  `torrentinfo.vcxproj` (*Linker > Input*). See also below.
 - **Other architectures:** only x64 is configured. To add ARM64, add an
   `ARM64` platform in *Build > Configuration Manager*; the code and vcpkg
   ports support it.
 - Visual Studio 2026 can save the solution in the newer `.slnx` format
   (*File > Save As*) if you prefer it.
+
+## Using libaTorrent in another program
+
+Include `aTorrent.h` and call the `aTorrent…` functions; they are the
+library's public interface, marked `ATORRENT_API`, and the only names the
+shared libraries export. Today that is the version (`aTorrentVersion`,
+`aTorrentVersionString`) and the names of event levels and codes; the
+session API (adding, pausing and removing torrents, limits, status and
+events) is being added, as DAEMON.md describes.
+
+```c
+#include <stdio.h>
+#include <aTorrent.h>
+
+int main(void)
+{
+    printf("libaTorrent %s\n", aTorrentVersionString());
+    return 0;
+}
+```
+
+| | Compile and link |
+|---|---|
+| Linux, FreeBSD (shared) | `cc -I/usr/local/include/aTorrent app.c -L/usr/local/lib -laTorrent` |
+| Linux, FreeBSD (static) | `cc -I/usr/local/include/aTorrent app.c /usr/local/lib/libaTorrent.a $(pkg-config --libs libuv openssl)` |
+| macOS (shared) | `cc -I/usr/local/include/aTorrent app.c -L/usr/local/lib -laTorrent` |
+| Windows (DLL) | define `ATORRENT_DLL`, link `libaTorrent.dll.lib`, ship `libaTorrent.dll` with the libuv and OpenSSL DLLs |
+| Windows (static) | link `libaTorrent.lib` and the libraries `torrentinfo.vcxproj` lists |
+
+Until the session API is in place, programs that need more than the public
+interface (as `torrentinfo` itself does) link the **static** library and
+use the module headers installed beside `aTorrent.h`. Those names are
+internal: they are hidden in the shared libraries and may change between
+versions.

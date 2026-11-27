@@ -13,7 +13,7 @@ torrentinfo -t [-T seconds] [-C certs.pem] [-I interface] file.torrent
 torrentinfo -P [-T seconds] [-C certs.pem] [-I interface] file.torrent
 torrentinfo -D [-S] [-L port] [-N] [-X] [-W] [-R] [-E mode] [-d speed] [-u speed] [-f list] [-F pattern]...
                [-O folder] [-i piece] [-T seconds] [-C certs.pem] [-I interface]
-               file.torrent | magnet-link
+               file.torrent | magnet-link ...
 torrentinfo -V [-O folder] [-f list] [-F pattern]... file.torrent
 torrentinfo -m file.torrent
 ```
@@ -61,6 +61,11 @@ The program works in one of six ways, chosen by the first option.
 : A progress line appears every two seconds, showing how far along the
   download is, the download and upload speeds, and how many peers are
   connected.
+: Give several torrents (or magnet links, or both) to download them all at
+  once. They share one port, the DHT and the speed limits; each line of
+  output then starts with the torrent's number (`[1]`, `[2]`, ...), in the
+  order given. The program ends when every torrent is done (with `-S`,
+  when you press Ctrl-C). `-f`, `-F` and `-i` work with one torrent only.
 
 **Magnet links**
 : Instead of a torrent file, `-D` accepts a *magnet link*, the
@@ -180,12 +185,14 @@ The program works in one of six ways, chosen by the first option.
 `-d speed`
 : Download no faster than this. Give it in KiB per second (`-d 500`) or
   with a unit: `500k`, `1.5M`, `2G`. `0` means no limit, the default. The
-  limit is for the whole download, shared by all the peers.
+  limit is for everything the program downloads, shared by all the peers;
+  with several torrents, those that are downloading share it equally.
 
 `-u speed`
 : Upload no faster than this (same units). The allowance is shared evenly
-  between the peers you are uploading to. Useful to leave a seed running
-  without slowing down the rest of your connection.
+  between the torrents uploading and between the peers each uploads to.
+  Useful to leave a seed running without slowing down the rest of your
+  connection.
 
 `-i piece`
 : Download just one piece, given by its number (starting at 0). Mostly
@@ -228,7 +235,8 @@ The program works in one of six ways, chosen by the first option.
 
 Press **Ctrl-C** to stop a download or end seeding. The program tells the
 trackers that you are leaving, which takes a few seconds at most, and prints
-a summary. Press Ctrl-C a second time to quit without waiting.
+a summary (one per torrent). Press Ctrl-C a second time to quit without
+waiting.
 
 Nothing is lost by stopping: pieces already saved are kept, and running the
 same command again continues the download.
@@ -530,6 +538,13 @@ Then share it by seeding from the folder that holds the files:
 
 ```
 torrentinfo -D -S -O . photos.torrent
+```
+
+Download two torrents and a magnet link at once, at no more than 2 MiB/s
+in all:
+
+```
+torrentinfo -D -d 2M -O ~/Downloads ubuntu.torrent debian.torrent "magnet:?xt=urn:btih:..."
 ```
 
 ## SEE ALSO

@@ -23,6 +23,7 @@
 #include <string.h>
 
 #include "dht.h"
+#include "bencode.h"
 #include "queue.h"
 
 #ifndef _WIN32
@@ -275,54 +276,6 @@ static void fromCompact(const uint8_t in[6], struct sockaddr_in *address)
 }
 
 /* ------------------------------------------------------------------------ */
-/* Bencode writing                                                          */
-/* ------------------------------------------------------------------------ */
-
-typedef struct writer {
-    uint8_t *out;
-    size_t   size;
-    size_t   used;
-    int      failed;
-} writer;
-
-static void put(writer *w, const void *data, size_t length)
-{
-    if (w->failed || length > w->size - w->used) {
-        w->failed = 1;
-        return;
-    }
-    memcpy(w->out + w->used, data, length);
-    w->used += length;
-}
-
-static void putText(writer *w, const char *text)
-{
-    put(w, text, strlen(text));
-}
-
-static void putBytes(writer *w, const void *data, size_t length)
-{
-    char prefix[24];
-
-    snprintf(prefix, sizeof(prefix), "%lu:", (unsigned long)length);
-    putText(w, prefix);
-    put(w, data, length);
-}
-
-static void putKey(writer *w, const char *key)
-{
-    putBytes(w, key, strlen(key));
-}
-
-static void putInteger(writer *w, int64_t value)
-{
-    char text[32];
-
-    snprintf(text, sizeof(text), "i%llde", (long long)value);
-    putText(w, text);
-}
-
-/* ------------------------------------------------------------------------ */
 /* Sending                                                                  */
 /* ------------------------------------------------------------------------ */
 
@@ -344,10 +297,11 @@ static int sendQuery(dht *d, const struct sockaddr_in *to, uint32_t kind, lookup
                      uint16_t port)
 {
     uint8_t  packet[DHT_PACKET];
-    writer   w = { packet, sizeof(packet), 0, 0 };
+    bencodeWriter w;
     uint8_t  tid[2];
     uint32_t slot;
 
+    bencodeWriterInitFixed(&w, packet, sizeof(packet));
     if (!usableAddress(to)) {
         return -1;
     }
@@ -361,35 +315,41 @@ static int sendQuery(dht *d, const struct sockaddr_in *to, uint32_t kind, lookup
     tid[1] = (uint8_t)(d->nextTid & 0xffu);
 
     /* Keys sorted: a, q, t, v, y; and within a. */
-    putText(&w, "d1:ad2:id");
-    putBytes(&w, d->id, DHT_ID_LENGTH);
+    bencodeDictBegin(&w);
+    bencodeText(&w, "a");
+    bencodeDictBegin(&w);
+    bencodeText(&w, "id");
+    bencodeString(&w, d->id, DHT_ID_LENGTH);
     if (kind == QUERY_ANNOUNCE) {
-        putKey(&w, "implied_port");
-        putInteger(&w, 0);
-        putKey(&w, "info_hash");
-        putBytes(&w, target, DHT_ID_LENGTH);
-        putKey(&w, "port");
-        putInteger(&w, port);
-        putKey(&w, "token");
-        putBytes(&w, token, tokenLength);
+        bencodeText(&w, "implied_port");
+        bencodeInteger(&w, 0);
+        bencodeText(&w, "info_hash");
+        bencodeString(&w, target, DHT_ID_LENGTH);
+        bencodeText(&w, "port");
+        bencodeInteger(&w, port);
+        bencodeText(&w, "token");
+        bencodeString(&w, token, tokenLength);
     } else if (kind == QUERY_GET_PEERS) {
-        putKey(&w, "info_hash");
-        putBytes(&w, target, DHT_ID_LENGTH);
+        bencodeText(&w, "info_hash");
+        bencodeString(&w, target, DHT_ID_LENGTH);
     } else if (kind == QUERY_FIND_NODE) {
-        putKey(&w, "target");
-        putBytes(&w, target, DHT_ID_LENGTH);
+        bencodeText(&w, "target");
+        bencodeString(&w, target, DHT_ID_LENGTH);
     }
-    putText(&w, "e1:q");
-    putKey(&w, (kind == QUERY_PING)        ? "ping"
-             : (kind == QUERY_FIND_NODE)   ? "find_node"
-             : (kind == QUERY_GET_PEERS)   ? "get_peers"
-                                           : "announce_peer");
-    putText(&w, "1:t");
-    putBytes(&w, tid, 2);
-    putText(&w, "1:v");
-    putBytes(&w, DHT_VERSION, 4);
-    putText(&w, "1:y1:qe");
-    if (w.failed) {
+    bencodeEnd(&w);
+    bencodeText(&w, "q");
+    bencodeText(&w, (kind == QUERY_PING)        ? "ping"
+                  : (kind == QUERY_FIND_NODE)   ? "find_node"
+                  : (kind == QUERY_GET_PEERS)   ? "get_peers"
+                                                : "announce_peer");
+    bencodeText(&w, "t");
+    bencodeString(&w, tid, 2);
+    bencodeText(&w, "v");
+    bencodeString(&w, DHT_VERSION, 4);
+    bencodeText(&w, "y");
+    bencodeText(&w, "q");
+    bencodeEnd(&w);
+    if (w.error != BENCODE_OK) {
         return -1;
     }
     d->pending[slot].used = 1;
@@ -398,7 +358,7 @@ static int sendQuery(dht *d, const struct sockaddr_in *to, uint32_t kind, lookup
     d->pending[slot].to = *to;
     d->pending[slot].sentAt = uv_now(d->loop);
     d->pending[slot].owner = owner;
-    sendPacket(d, to, packet, w.used);
+    sendPacket(d, to, packet, (size_t)w.length);
     return 0;
 }
 
@@ -924,11 +884,35 @@ static storedHash *findStored(dht *d, const uint8_t *infoHash, int create)
     return oldest;
 }
 
+/* A KRPC error reply: d1:eli<code>e<message>e1:t<tid>1:y1:ee */
+static void sendError(dht *d, const krpc *message, const struct sockaddr_in *from,
+                      int64_t code, const char *text)
+{
+    uint8_t       packet[DHT_PACKET];
+    bencodeWriter w;
+
+    bencodeWriterInitFixed(&w, packet, sizeof(packet));
+    bencodeDictBegin(&w);
+    bencodeText(&w, "e");
+    bencodeListBegin(&w);
+    bencodeInteger(&w, code);
+    bencodeText(&w, text);
+    bencodeEnd(&w);
+    bencodeText(&w, "t");
+    bencodeString(&w, message->tid, (size_t)message->tidLength);
+    bencodeText(&w, "y");
+    bencodeText(&w, "e");
+    bencodeEnd(&w);
+    if (w.error == BENCODE_OK) {
+        sendPacket(d, from, packet, (size_t)w.length);
+    }
+}
+
 /* Answer a query. */
 static void answerQuery(dht *d, const krpc *message, const struct sockaddr_in *from)
 {
     uint8_t     packet[DHT_PACKET];
-    writer      w = { packet, sizeof(packet), 0, 0 };
+    bencodeWriter w;
     dhtNode    *nodes[DHT_BUCKET_SIZE];
     uint8_t     token[8];
     uint8_t     compact[26];
@@ -940,6 +924,8 @@ static void answerQuery(dht *d, const krpc *message, const struct sockaddr_in *f
     int         isGet = strcmp(message->query, "get_peers") == 0;
     int         isAnnounce = strcmp(message->query, "announce_peer") == 0;
 
+    bencodeWriterInitFixed(&w, packet, sizeof(packet));
+
     if (isAnnounce) {
         storedHash *entry;
         uint8_t     current[8];
@@ -950,12 +936,7 @@ static void answerQuery(dht *d, const krpc *message, const struct sockaddr_in *f
         makeToken(d, 1, from, previous);
         if (message->infoHash == NULL || message->token == NULL || message->tokenLength != 8 ||
             (memcmp(message->token, current, 8) != 0 && memcmp(message->token, previous, 8) != 0)) {
-            putText(&w, "d1:eli203e9:bad tokene1:t");
-            putBytes(&w, message->tid, (size_t)message->tidLength);
-            putText(&w, "1:y1:ee");
-            if (!w.failed) {
-                sendPacket(d, from, packet, w.used);
-            }
+            sendError(d, message, from, 203, "bad token");
             return;
         }
         port = (message->impliedPort != 0) ? ntohs(from->sin_port) : (uint16_t)message->port;
@@ -979,12 +960,7 @@ static void answerQuery(dht *d, const krpc *message, const struct sockaddr_in *f
             entry->lastUsed = now;
         }
     } else if (!isPing && !isFind && !isGet) {
-        putText(&w, "d1:eli204e14:Method Unknowne1:t");
-        putBytes(&w, message->tid, (size_t)message->tidLength);
-        putText(&w, "1:y1:ee");
-        if (!w.failed) {
-            sendPacket(d, from, packet, w.used);
-        }
+        sendError(d, message, from, 204, "Method Unknown");
         return;
     }
     if ((isFind && message->target == NULL) || (isGet && message->infoHash == NULL)) {
@@ -992,8 +968,11 @@ static void answerQuery(dht *d, const krpc *message, const struct sockaddr_in *f
     }
 
     /* Response: keys sorted id, nodes, token, values. */
-    putText(&w, "d1:rd2:id");
-    putBytes(&w, d->id, DHT_ID_LENGTH);
+    bencodeDictBegin(&w);
+    bencodeText(&w, "r");
+    bencodeDictBegin(&w);
+    bencodeText(&w, "id");
+    bencodeString(&w, d->id, DHT_ID_LENGTH);
     if (isFind || isGet) {
         storedHash *entry = isGet ? findStored(d, message->infoHash, 0) : NULL;
         uint32_t    fresh = 0;
@@ -1006,48 +985,46 @@ static void answerQuery(dht *d, const krpc *message, const struct sockaddr_in *f
         if (fresh == 0) {
             count = closestNodes(d, isFind ? message->target : message->infoHash, from, nodes,
                                  DHT_BUCKET_SIZE);
-            putKey(&w, "nodes");
-            {
-                char prefix[24];
-
-                snprintf(prefix, sizeof(prefix), "%lu:", (unsigned long)(count * 26u));
-                putText(&w, prefix);
-            }
+            bencodeText(&w, "nodes");
+            bencodeStringHeader(&w, count * 26u);
             for (i = 0; i < count; i++) {
                 memcpy(compact, nodes[i]->id, DHT_ID_LENGTH);
                 compactAddress(&nodes[i]->address, compact + DHT_ID_LENGTH);
-                put(&w, compact, 26);
+                bencodeRaw(&w, compact, 26);
             }
         }
         if (isGet) {
             makeToken(d, 0, from, token);
-            putKey(&w, "token");
-            putBytes(&w, token, 8);
+            bencodeText(&w, "token");
+            bencodeString(&w, token, 8);
         }
         if (fresh > 0) {
             uint32_t sent = 0;
 
-            putKey(&w, "values");
-            putText(&w, "l");
+            bencodeText(&w, "values");
+            bencodeListBegin(&w);
             for (i = 0; i < entry->count && sent < DHT_MAX_VALUES; i++) {
                 if (now - entry->peers[i].at < (uint64_t)DHT_STORE_SECONDS * 1000u) {
                     memcpy(compact, entry->peers[i].ip, 4);
                     compact[4] = (uint8_t)(entry->peers[i].port >> 8);
                     compact[5] = (uint8_t)(entry->peers[i].port & 0xffu);
-                    putBytes(&w, compact, 6);
+                    bencodeString(&w, compact, 6);
                     sent++;
                 }
             }
-            putText(&w, "e");
+            bencodeEnd(&w);
         }
     }
-    putText(&w, "e1:t");
-    putBytes(&w, message->tid, (size_t)message->tidLength);
-    putText(&w, "1:v");
-    putBytes(&w, DHT_VERSION, 4);
-    putText(&w, "1:y1:re");
-    if (!w.failed) {
-        sendPacket(d, from, packet, w.used);
+    bencodeEnd(&w);
+    bencodeText(&w, "t");
+    bencodeString(&w, message->tid, (size_t)message->tidLength);
+    bencodeText(&w, "v");
+    bencodeString(&w, DHT_VERSION, 4);
+    bencodeText(&w, "y");
+    bencodeText(&w, "r");
+    bencodeEnd(&w);
+    if (w.error == BENCODE_OK) {
+        sendPacket(d, from, packet, (size_t)w.length);
     }
 }
 
@@ -1430,39 +1407,39 @@ static void loadState(dht *d, const uint8_t *data, size_t length)
 
 int32_t dhtSaveState(const dht *d, uint8_t *out, size_t size, size_t *length)
 {
-    writer   w = { out, size, 0, 0 };
+    bencodeWriter w;
     uint8_t  compact[26];
     uint32_t count = 0;
     uint32_t i;
-    char     prefix[24];
 
     if (d == NULL || out == NULL || length == NULL) {
         return DHT_EINVAL;
     }
+    bencodeWriterInitFixed(&w, out, size);
     for (i = 0; i < DHT_BUCKETS * DHT_BUCKET_SIZE; i++) {
         count += (d->table[i].used && d->table[i].lastReply != 0) ? 1u : 0u;
     }
     if (count > 256u) {
         count = 256u;
     }
-    putText(&w, "d2:id");
-    putBytes(&w, d->id, DHT_ID_LENGTH);
-    putText(&w, "5:nodes");
-    snprintf(prefix, sizeof(prefix), "%lu:", (unsigned long)(count * 26u));
-    putText(&w, prefix);
+    bencodeDictBegin(&w);
+    bencodeText(&w, "id");
+    bencodeString(&w, d->id, DHT_ID_LENGTH);
+    bencodeText(&w, "nodes");
+    bencodeStringHeader(&w, count * 26u);
     for (i = 0; i < DHT_BUCKETS * DHT_BUCKET_SIZE && count > 0; i++) {
         if (d->table[i].used && d->table[i].lastReply != 0) {
             memcpy(compact, d->table[i].id, DHT_ID_LENGTH);
             compactAddress(&d->table[i].address, compact + DHT_ID_LENGTH);
-            put(&w, compact, 26);
+            bencodeRaw(&w, compact, 26);
             count--;
         }
     }
-    putText(&w, "e");
-    if (w.failed) {
+    bencodeEnd(&w);
+    if (w.error != BENCODE_OK) {
         return DHT_EINVAL;
     }
-    *length = w.used;
+    *length = (size_t)w.length;
     return DHT_OK;
 }
 

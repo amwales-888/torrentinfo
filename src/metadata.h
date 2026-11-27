@@ -20,6 +20,7 @@
 #include <uv.h>
 
 #include "blocklist.h"
+#include "event.h"
 #include "parser.h"
 #include "peer.h"
 
@@ -61,7 +62,7 @@ typedef struct metadataProgress {
 
 typedef struct metadataEvents {
     /* Something worth reporting (a peer without metadata, a bad copy). */
-    void (*onEvent)(void *privateArg, metadataFetch *fetch, const char *message);
+    void (*onEvent)(void *privateArg, metadataFetch *fetch, const eventInfo *event);
     /* Done: 'info' (valid during the call only) is the info dictionary,
      * whose SHA-1 is the info hash. Runs once; the connections are closed
      * afterwards. Call metadataEnd() (it may be called from here). */

@@ -15,10 +15,10 @@
 #include <string.h>
 
 #include "encoder.h"
+#include "bencode.h"
 #include "platform.h"   /* file access on Linux and Windows */
 
 #define ENCODER_STATE_MAGIC             0x454E4344u     /* "ENCD" */
-#define ENCODER_WRITER_MIN_CAPACITY     256u
 
 /* Evaluate an expression; return its result early if it is not ENCODER_OK. */
 #define ENCODER_TRY(expression)                                 \
@@ -29,13 +29,6 @@
         }                                                       \
     } while (0)
 
-typedef struct encoderWriter {
-    parserContext *context;
-    uint8_t       *data;
-    uint64_t       length;
-    uint64_t       capacity;
-    int32_t        error;       /* First error seen; later writes are ignored */
-} encoderWriter;
 
 /* ======================================================================== */
 /* Helpers                                                                  */
@@ -129,115 +122,18 @@ static uint64_t countPieces(uint64_t total, uint64_t pieceLength)
 }
 
 /* ======================================================================== */
-/* Bencode writer                                                           */
+/* Bencode helpers                                                          */
 /* ======================================================================== */
 
-static void writerReserve(encoderWriter *writer, uint64_t extra)
-{
-    uint64_t needed;
-    uint64_t capacity;
-    uint8_t *data;
-
-    if (writer->error != ENCODER_OK) {
-        return;
-    }
-    if (extra > UINT64_MAX - writer->length) {
-        writer->error = PARSER_ERROR_OVERFLOW;
-        return;
-    }
-    needed = writer->length + extra;
-    if (needed <= writer->capacity) {
-        return;
-    }
-
-    capacity = (writer->capacity != 0) ? writer->capacity : ENCODER_WRITER_MIN_CAPACITY;
-    while (capacity < needed) {
-        if (capacity > UINT64_MAX / 2u) {
-            capacity = needed;
-            break;
-        }
-        capacity *= 2u;
-    }
-    if (capacity > (uint64_t)(SIZE_MAX / 2u)) {
-        writer->error = PARSER_ERROR_NO_MEMORY;
-        return;
-    }
-
-    data = writer->context->allocator.realloc(writer->data, (size_t)capacity);
-    if (data == NULL) {
-        writer->error = PARSER_ERROR_NO_MEMORY;     /* old buffer is still valid */
-        return;
-    }
-    writer->data = data;
-    writer->capacity = capacity;
-}
-
-static void writeBytes(encoderWriter *writer, const void *bytes, uint64_t length)
-{
-    writerReserve(writer, length);
-    if (writer->error != ENCODER_OK) {
-        return;
-    }
-    if (length > 0) {
-        memcpy(writer->data + writer->length, bytes, (size_t)length);
-    }
-    writer->length += length;
-}
-
-static void writeByte(encoderWriter *writer, uint8_t value)
-{
-    writeBytes(writer, &value, 1u);
-}
-
-static void writeUnsigned(encoderWriter *writer, uint64_t value)
-{
-    uint8_t  digits[20];
-    uint32_t count = 0;
-
-    do {
-        digits[sizeof(digits) - 1u - count] = (uint8_t)('0' + (value % 10u));
-        value /= 10u;
-        count++;
-    } while (value != 0);
-
-    writeBytes(writer, digits + sizeof(digits) - count, count);
-}
-
-/* i<value>e */
-static void writeInteger(encoderWriter *writer, int64_t value)
-{
-    writeByte(writer, 'i');
-    if (value < 0) {
-        writeByte(writer, '-');
-        writeUnsigned(writer, (uint64_t)(-(value + 1)) + 1u);  /* safe for INT64_MIN */
-    } else {
-        writeUnsigned(writer, (uint64_t)value);
-    }
-    writeByte(writer, 'e');
-}
-
-/* <length>:<bytes> */
-static void writeString(encoderWriter *writer, const uint8_t *data, uint64_t length)
-{
-    writeUnsigned(writer, length);
-    writeByte(writer, ':');
-    writeBytes(writer, data, length);
-}
-
-static void writeText(encoderWriter *writer, const char *text)
-{
-    writeString(writer, (const uint8_t *)text, strlen(text));
-}
-
-static void writeUrlList(encoderWriter *writer, const struct parserUrlList *list)
+static void writeUrlList(bencodeWriter *writer, const struct parserUrlList *list)
 {
     const parserUrl *url;
 
-    writeByte(writer, 'l');
+    bencodeListBegin(writer);
     TAILQ_FOREACH(url, list, entries) {
-        writeText(writer, url->url);
+        bencodeText(writer, url->url);
     }
-    writeByte(writer, 'e');
+    bencodeEnd(writer);
 }
 
 /* ======================================================================== */
@@ -276,100 +172,100 @@ static int32_t validateTorrent(const parserTorrent *torrent)
 }
 
 /* info: files | length, name, piece length, pieces, private */
-static void encodeInfo(encoderWriter *writer, const parserTorrent *torrent)
+static void encodeInfo(bencodeWriter *writer, const parserTorrent *torrent)
 {
     const parserFile          *file;
     const parserPathComponent *component;
 
-    writeByte(writer, 'd');
+    bencodeDictBegin(writer);
 
     if (torrent->isMultiFile) {
-        writeText(writer, "files");
-        writeByte(writer, 'l');
+        bencodeText(writer, "files");
+        bencodeListBegin(writer);
         TAILQ_FOREACH(file, &torrent->files, entries) {
             /* attr, length, path */
-            writeByte(writer, 'd');
+            bencodeDictBegin(writer);
             if (file->isPadding) {
-                writeText(writer, "attr");
-                writeText(writer, "p");
+                bencodeText(writer, "attr");
+                bencodeText(writer, "p");
             }
-            writeText(writer, "length");
-            writeInteger(writer, (int64_t)file->length);
-            writeText(writer, "path");
-            writeByte(writer, 'l');
+            bencodeText(writer, "length");
+            bencodeInteger(writer, (int64_t)file->length);
+            bencodeText(writer, "path");
+            bencodeListBegin(writer);
             TAILQ_FOREACH(component, &file->path, entries) {
-                writeText(writer, component->name);
+                bencodeText(writer, component->name);
             }
-            writeByte(writer, 'e');
-            writeByte(writer, 'e');
+            bencodeEnd(writer);
+            bencodeEnd(writer);
         }
-        writeByte(writer, 'e');
+        bencodeEnd(writer);
     } else {
-        writeText(writer, "length");
-        writeInteger(writer, (int64_t)TAILQ_FIRST(&torrent->files)->length);
+        bencodeText(writer, "length");
+        bencodeInteger(writer, (int64_t)TAILQ_FIRST(&torrent->files)->length);
     }
 
-    writeText(writer, "name");
-    writeText(writer, torrent->name);
-    writeText(writer, "piece length");
-    writeInteger(writer, (int64_t)torrent->pieceLength);
-    writeText(writer, "pieces");
-    writeString(writer, torrent->pieces,
+    bencodeText(writer, "name");
+    bencodeText(writer, torrent->name);
+    bencodeText(writer, "piece length");
+    bencodeInteger(writer, (int64_t)torrent->pieceLength);
+    bencodeText(writer, "pieces");
+    bencodeString(writer, torrent->pieces,
                 (uint64_t)torrent->pieceCount * PARSER_SHA1_LENGTH);
     if (torrent->isPrivate) {
-        writeText(writer, "private");
-        writeInteger(writer, 1);
+        bencodeText(writer, "private");
+        bencodeInteger(writer, 1);
     }
 
-    writeByte(writer, 'e');
+    bencodeEnd(writer);
 }
 
 /* root: announce, announce-list, comment, created by, creation date,
  *       encoding, info, url-list */
-static void encodeTorrent(encoderWriter *writer, const parserTorrent *torrent)
+static void encodeTorrent(bencodeWriter *writer, const parserTorrent *torrent)
 {
     const parserTier *tier;
 
-    writeByte(writer, 'd');
+    bencodeDictBegin(writer);
 
     if (torrent->announce != NULL) {
-        writeText(writer, "announce");
-        writeText(writer, torrent->announce);
+        bencodeText(writer, "announce");
+        bencodeText(writer, torrent->announce);
     }
     if (!TAILQ_EMPTY(&torrent->announceList)) {
-        writeText(writer, "announce-list");
-        writeByte(writer, 'l');
+        bencodeText(writer, "announce-list");
+        bencodeListBegin(writer);
         TAILQ_FOREACH(tier, &torrent->announceList, entries) {
             writeUrlList(writer, &tier->urls);
         }
-        writeByte(writer, 'e');
+        bencodeEnd(writer);
     }
     if (torrent->comment != NULL) {
-        writeText(writer, "comment");
-        writeText(writer, torrent->comment);
+        bencodeText(writer, "comment");
+        bencodeText(writer, torrent->comment);
     }
     if (torrent->createdBy != NULL) {
-        writeText(writer, "created by");
-        writeText(writer, torrent->createdBy);
+        bencodeText(writer, "created by");
+        bencodeText(writer, torrent->createdBy);
     }
     if (torrent->hasCreationDate) {
-        writeText(writer, "creation date");
-        writeInteger(writer, torrent->creationDate);
+        bencodeText(writer, "creation date");
+        bencodeInteger(writer, torrent->creationDate);
     }
     if (torrent->encoding != NULL) {
-        writeText(writer, "encoding");
-        writeText(writer, torrent->encoding);
+        bencodeText(writer, "encoding");
+        bencodeText(writer, torrent->encoding);
     }
 
-    writeText(writer, "info");
+    bencodeText(writer, "info");
     encodeInfo(writer, torrent);
 
     if (!TAILQ_EMPTY(&torrent->webSeeds)) {
-        writeText(writer, "url-list");
+        bencodeText(writer, "url-list");
         writeUrlList(writer, &torrent->webSeeds);
     }
 
-    writeByte(writer, 'e');
+    bencodeEnd(writer);
 }
 
 /* ======================================================================== */
@@ -679,17 +575,16 @@ static void hashWork(uv_work_t *work)
 /* The info hash is the SHA-1 of the bencoded info dictionary. */
 static int32_t computeInfoHash(parserContext *context, parserTorrent *torrent)
 {
-    encoderWriter writer;
+    bencodeWriter writer;
 
-    memset(&writer, 0, sizeof(writer));
-    writer.context = context;
+    bencodeWriterInit(&writer, &context->allocator);
     encodeInfo(&writer, torrent);
-    if (writer.error != ENCODER_OK) {
-        release(context, writer.data);
+    if (writer.error != BENCODE_OK) {
+        bencodeWriterFree(&writer);
         return writer.error;
     }
     parserSha1(writer.data, writer.length, torrent->infoHash);
-    release(context, writer.data);
+    bencodeWriterFree(&writer);
     return ENCODER_OK;
 }
 
@@ -797,7 +692,7 @@ static void statDone(uv_work_t *work, int status)
 int32_t encoderEncode(parserContext *context, const parserTorrent *torrent,
                       uint8_t **buffer, uint64_t *length)
 {
-    encoderWriter writer;
+    bencodeWriter writer;
 
     if (buffer == NULL || length == NULL) {
         return PARSER_ERROR_INVALID_ARGUMENT;
@@ -812,17 +707,9 @@ int32_t encoderEncode(parserContext *context, const parserTorrent *torrent,
     }
     ENCODER_TRY(validateTorrent(torrent));
 
-    memset(&writer, 0, sizeof(writer));
-    writer.context = context;
+    bencodeWriterInit(&writer, &context->allocator);
     encodeTorrent(&writer, torrent);
-    if (writer.error != ENCODER_OK) {
-        release(context, writer.data);
-        return writer.error;
-    }
-
-    *buffer = writer.data;
-    *length = writer.length;
-    return ENCODER_OK;
+    return bencodeWriterTake(&writer, buffer, length);
 }
 
 void encoderFreeBuffer(parserContext *context, uint8_t *buffer)

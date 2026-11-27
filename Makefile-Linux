@@ -1,10 +1,12 @@
-# Makefile-Linux - torrentinfo for Linux (GNU make)
+# Makefile-Linux - libaTorrent and the torrentinfo program for Linux (GNU make)
 #
-#   make -f Makefile-Linux             build the library and the torrentinfo program
+#   make -f Makefile-Linux             build the libraries and the torrentinfo program
 #   make -f Makefile-Linux debug       build with AddressSanitizer and UBSan in
 #                                      build/linux/debug
-#   make -f Makefile-Linux lib         build only libtorrentinfo.a
-#   make -f Makefile-Linux install     install program, library and headers under
+#   make -f Makefile-Linux lib         build only libaTorrent.a and libaTorrent.so
+#   make -f Makefile-Linux check       build and run the unit tests (with debug:
+#                                      under the sanitizers)
+#   make -f Makefile-Linux install     install program, libraries and headers under
 #                                      $(PREFIX)
 #   make -f Makefile-Linux uninstall   remove what 'install' installed
 #   make -f Makefile-Linux clean       remove the Linux build output (build/linux);
@@ -26,16 +28,27 @@ DESTDIR    ?=
 
 BINDIR     := $(PREFIX)/bin
 LIBDIR     := $(PREFIX)/lib
-INCLUDEDIR := $(PREFIX)/include/torrentinfo
+INCLUDEDIR := $(PREFIX)/include/aTorrent
+
+# The library's version; the shared library's soname changes with MAJOR.
+VERSION_MAJOR := 0
+VERSION       := 0.1.0
 
 PROGRAM    := torrentinfo
-LIBRARY    := libtorrentinfo.a
+LIBRARY    := libaTorrent.a
+SONAME     := libaTorrent.so.$(VERSION_MAJOR)
+SHARED     := libaTorrent.so.$(VERSION)
+SHAREDLINK := libaTorrent.so
+CHECK      := check
 
 SRCDIR      := src
 
-LIB_SOURCES := platform.c net.c extension.c parser.c encoder.c http.c udp.c tracker.c message.c peer.c piece.c storage.c download.c announce.c portmap.c magnet.c metadata.c dht.c blocklist.c config.c crypto.c webseed.c resume.c
+LIB_SOURCES := aTorrent.c bandwidth.c bencode.c datafile.c event.c selection.c session.c settings.c torrent.c platform.c net.c extension.c parser.c encoder.c http.c udp.c tracker.c message.c peer.c piece.c storage.c download.c announce.c portmap.c magnet.c metadata.c dht.c blocklist.c config.c crypto.c webseed.c resume.c
 APP_SOURCES := main.c
-HEADERS     := queue.h platform.h net.h extension.h parser.h encoder.h http.h udp.h tracker.h message.h peer.h piece.h storage.h download.h announce.h portmap.h magnet.h metadata.h dht.h blocklist.h config.h crypto.h webseed.h resume.h
+CHECK_SOURCES := check.c check_bencode.c check_datafile.c check_dht.c check_selection.c \
+                 check_settings.c check_bandwidth.c check_session.c
+TESTDIR     := tests
+HEADERS     := aTorrent.h queue.h bandwidth.h bencode.h datafile.h event.h selection.h session.h settings.h torrent.h platform.h net.h extension.h parser.h encoder.h http.h udp.h tracker.h message.h peer.h piece.h storage.h download.h announce.h portmap.h magnet.h metadata.h dht.h blocklist.h config.h crypto.h webseed.h resume.h
 
 PKGS := libuv openssl
 
@@ -54,6 +67,10 @@ CPPFLAGS += -D_POSIX_C_SOURCE=200809L
 CFLAGS   ?= -O2 -g
 CFLAGS   += -std=c99 -Wall -Wextra -Wpedantic -Wshadow -Wconversion
 CFLAGS   += -MMD -MP $(PKG_CFLAGS)
+# One set of objects serves both libraries: position-independent for the
+# shared one, and with only ATORRENT_API names exported from it (hidden
+# names still link normally from the static library).
+LIBFLAGS := -fPIC -fvisibility=hidden
 LDLIBS   += $(PKG_LIBS)
 
 # Sources are in src/. Linux output goes under build/linux (release builds in
@@ -62,15 +79,16 @@ LDLIBS   += $(PKG_LIBS)
 # (build/freebsd).
 BUILDROOT := build/linux
 BUILD := $(BUILDROOT)/release
-ifeq ($(MAKECMDGOALS),debug)
+ifneq ($(filter debug,$(MAKECMDGOALS)),)
   BUILD   := $(BUILDROOT)/debug
   CFLAGS  += -O1 -fno-omit-frame-pointer -fsanitize=address,undefined
   LDFLAGS += -fsanitize=address,undefined
 endif
 
-LIB_OBJECTS := $(LIB_SOURCES:%.c=$(BUILD)/%.o)
-APP_OBJECTS := $(APP_SOURCES:%.c=$(BUILD)/%.o)
-DEPENDS     := $(LIB_OBJECTS:.o=.d) $(APP_OBJECTS:.o=.d)
+LIB_OBJECTS   := $(LIB_SOURCES:%.c=$(BUILD)/%.o)
+APP_OBJECTS   := $(APP_SOURCES:%.c=$(BUILD)/%.o)
+CHECK_OBJECTS := $(CHECK_SOURCES:%.c=$(BUILD)/tests/%.o)
+DEPENDS       := $(LIB_OBJECTS:.o=.d) $(APP_OBJECTS:.o=.d) $(CHECK_OBJECTS:.o=.d)
 
 # Quiet output; 'make V=1' shows full commands.
 ifeq ($(V),1)
@@ -85,41 +103,65 @@ endif
 # Targets
 # ---------------------------------------------------------------------------
 
-.PHONY: all debug lib install uninstall clean
+.PHONY: all debug lib check install uninstall clean
 
-all: $(BUILD)/$(PROGRAM)
+all: $(BUILD)/$(PROGRAM) $(BUILD)/$(SHARED)
 	$(Q)ln -sf $(BUILD)/$(PROGRAM) $(PROGRAM)
 
 debug: $(BUILD)/$(PROGRAM)
 	@echo "Debug build: $(BUILD)/$(PROGRAM)"
 
-lib: $(BUILD)/$(LIBRARY)
+lib: $(BUILD)/$(LIBRARY) $(BUILD)/$(SHARED)
+
+# The unit tests, run in a scratch directory under the build directory.
+check: $(BUILD)/$(CHECK)
+	$(Q)rm -rf $(BUILD)/check-scratch && mkdir -p $(BUILD)/check-scratch
+	$(Q)$(BUILD)/$(CHECK) $(CURDIR)/$(BUILD)/check-scratch
 
 $(BUILD)/$(PROGRAM): $(APP_OBJECTS) $(BUILD)/$(LIBRARY)
 	$(call say,LINK,$@)
 	$(Q)$(CC) $(LDFLAGS) -o $@ $(APP_OBJECTS) $(BUILD)/$(LIBRARY) $(LDLIBS)
+
+$(BUILD)/$(CHECK): $(CHECK_OBJECTS) $(BUILD)/$(LIBRARY)
+	$(call say,LINK,$@)
+	$(Q)$(CC) $(LDFLAGS) -o $@ $(CHECK_OBJECTS) $(BUILD)/$(LIBRARY) $(LDLIBS)
 
 $(BUILD)/$(LIBRARY): $(LIB_OBJECTS)
 	$(call say,AR,$@)
 	$(Q)rm -f $@
 	$(Q)$(AR) rcs $@ $^
 
+$(BUILD)/$(SHARED): $(LIB_OBJECTS)
+	$(call say,LINK,$@)
+	$(Q)$(CC) $(LDFLAGS) -shared -Wl,-soname,$(SONAME) -o $@ $^ $(LDLIBS)
+	$(Q)ln -sf $(SHARED) $(BUILD)/$(SONAME)
+	$(Q)ln -sf $(SONAME) $(BUILD)/$(SHAREDLINK)
+
 $(BUILD)/%.o: $(SRCDIR)/%.c | $(BUILD)
 	$(call say,CC,$<)
-	$(Q)$(CC) $(CPPFLAGS) $(CFLAGS) -c -o $@ $<
+	$(Q)$(CC) $(CPPFLAGS) $(CFLAGS) $(LIBFLAGS) -c -o $@ $<
 
-$(BUILD):
+$(BUILD)/tests/%.o: $(TESTDIR)/%.c | $(BUILD)/tests
+	$(call say,CC,$<)
+	$(Q)$(CC) $(CPPFLAGS) -I$(SRCDIR) $(CFLAGS) -c -o $@ $<
+
+$(BUILD) $(BUILD)/tests:
 	$(Q)mkdir -p $@
 
 install: all
 	install -d $(DESTDIR)$(BINDIR) $(DESTDIR)$(LIBDIR) $(DESTDIR)$(INCLUDEDIR)
 	install -m 755 $(BUILD)/$(PROGRAM) $(DESTDIR)$(BINDIR)/$(PROGRAM)
 	install -m 644 $(BUILD)/$(LIBRARY) $(DESTDIR)$(LIBDIR)/$(LIBRARY)
+	install -m 755 $(BUILD)/$(SHARED) $(DESTDIR)$(LIBDIR)/$(SHARED)
+	ln -sf $(SHARED) $(DESTDIR)$(LIBDIR)/$(SONAME)
+	ln -sf $(SONAME) $(DESTDIR)$(LIBDIR)/$(SHAREDLINK)
 	install -m 644 $(addprefix $(SRCDIR)/,$(HEADERS)) $(DESTDIR)$(INCLUDEDIR)/
 
 uninstall:
 	rm -f $(DESTDIR)$(BINDIR)/$(PROGRAM)
 	rm -f $(DESTDIR)$(LIBDIR)/$(LIBRARY)
+	rm -f $(DESTDIR)$(LIBDIR)/$(SHARED) $(DESTDIR)$(LIBDIR)/$(SONAME) \
+	      $(DESTDIR)$(LIBDIR)/$(SHAREDLINK)
 	rm -f $(addprefix $(DESTDIR)$(INCLUDEDIR)/,$(HEADERS))
 	-rmdir $(DESTDIR)$(INCLUDEDIR) 2>/dev/null
 
